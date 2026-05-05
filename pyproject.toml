@@ -12,6 +12,7 @@ dependencies = [
     "zarr >= 3.0",
     "imageio >= 2.28",
     "imageio-ffmpeg >= 0.4",
+    "matplotlib >= 3.7",
     "tqdm >= 4.0",
 ]
 
