@@ -1,0 +1,94 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ── Build / packaging ─────────────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+MANIFEST
+pip-wheel-metadata/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env/
+ENV/
+
+# ── Environment variables ─────────────────────────────────────────────────────
+.env
+.env.*
+
+# ── Testing & coverage ────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# ── Type checking / linting caches ───────────────────────────────────────────
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── IDEs ──────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# ── Profiling ─────────────────────────────────────────────────────────────────
+*.prof
+*.lprof
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Data files (large, generated) ────────────────────────────────────────────
+# Zarr stores created by the pipeline (can be gigabytes)
+*.zarr/
+*.zarr
+
+# Raw / processed imaging data
+*.avi
+*.mp4
+*.tiff
+*.tif
+*.tif.gz
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.mmap
+*.dat
+*.bin
+
+# ── Pipeline output directories ───────────────────────────────────────────────
+output/
+results/
+tmp/
+temp/
+
+# ── CaImAn reference source (algorithmic reference only, not part of this pkg) ─
+CaImAn-main/
