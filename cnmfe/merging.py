@@ -13,6 +13,7 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.csgraph import connected_components
 
+from cnmfe.spatial import threshold_footprint
 from cnmfe.temporal import deconvolve, estimate_ar_params
 
 
@@ -22,13 +23,25 @@ def merge_components(
     thr_corr: float = 0.85,
     thr_overlap: float = 0.5,
     ar_order: int = 1,
+    sigma: float | None = None,
+    dims: tuple[int, int] | None = None,
+    centre_dist_factor: float = 2.0,
+    max_thr: float = 0.1,
 ) -> tuple[sp.csc_matrix, np.ndarray, int]:
     """Merge spatially overlapping and temporally correlated components.
 
-    Two components i, j are merged if:
-        Jaccard(i, j) > thr_overlap   AND   |Pearson(C[i], C[j])| > thr_corr
+    Two components i, j are merged if their traces are correlated AND they
+    either share spatial support OR have centres of mass within a few pixels:
 
-    Merged spatial footprint: sum of individual footprints, re-normalised.
+        |Pearson(C[i], C[j])| > thr_corr  AND
+        ( Jaccard(i, j) > thr_overlap  OR  centre_dist(i, j) < centre_dist_factor * sigma )
+
+    The centre-distance fallback catches duplicate detections of the same
+    neuron whose footprints have been thresholded at different peak pixels —
+    their Jaccard can be near zero even though they refer to the same neuron.
+
+    Merged spatial footprint: sum of individual footprints, then re-thresholded
+    via threshold_footprint() to keep the fused blob compact.
     Merged temporal trace: mean of individual traces, then re-deconvolved.
 
     Args:
@@ -37,6 +50,12 @@ def merge_components(
         thr_corr: Minimum Pearson correlation between traces to trigger merge.
         thr_overlap: Minimum Jaccard overlap between footprints.
         ar_order: AR model order for re-deconvolution after merge.
+        sigma: Neuron radius (px). Required to enable the centre-distance
+               fallback; if None or dims is None, only Jaccard is used.
+        dims: (H, W) image dimensions; required for centre-of-mass and for
+              re-thresholding merged footprints.
+        centre_dist_factor: Centre-distance threshold = factor * sigma.
+        max_thr: Threshold passed to threshold_footprint for merged blobs.
 
     Returns:
         A_merged: (H*W, K_new) sparse footprints.
@@ -56,6 +75,23 @@ def merge_components(
     jaccard = O / denom                  # (K, K)
     np.fill_diagonal(jaccard, 0.0)
 
+    # --- Centre-of-mass distance (fallback for duplicates with disjoint supports) ---
+    centre_close = np.zeros_like(jaccard, dtype=bool)
+    if sigma is not None and dims is not None:
+        H, W = dims
+        rows = np.arange(H * W) // W
+        cols = np.arange(H * W) % W
+        col_sums = np.asarray(A.sum(axis=0)).ravel()
+        col_sums = np.maximum(col_sums, 1e-10)
+        weighted_rows = np.asarray(A.multiply(rows[:, np.newaxis]).sum(axis=0)).ravel()
+        weighted_cols = np.asarray(A.multiply(cols[:, np.newaxis]).sum(axis=0)).ravel()
+        cy = weighted_rows / col_sums
+        cx = weighted_cols / col_sums
+        d2 = (cy[:, np.newaxis] - cy[np.newaxis, :]) ** 2 + \
+             (cx[:, np.newaxis] - cx[np.newaxis, :]) ** 2
+        centre_close = d2 < (centre_dist_factor * sigma) ** 2
+        np.fill_diagonal(centre_close, False)
+
     # --- Temporal correlation ---
     C_std = C - C.mean(axis=1, keepdims=True)
     C_norm = np.sqrt((C_std ** 2).sum(axis=1, keepdims=True))
@@ -64,8 +100,9 @@ def merge_components(
     R = C_normed @ C_normed.T            # (K, K) Pearson matrix
     np.fill_diagonal(R, 0.0)
 
-    # --- Merge graph ---
-    merge_mask = (jaccard > thr_overlap) & (np.abs(R) > thr_corr)
+    # --- Merge graph: temporally correlated AND (spatially overlapping OR centres close) ---
+    spatial_link = (jaccard > thr_overlap) | centre_close
+    merge_mask = spatial_link & (np.abs(R) > thr_corr)
     # Symmetrize and treat as undirected graph
     merge_graph = sp.csr_matrix(merge_mask.astype(np.float32))
     n_comp, labels = connected_components(merge_graph, directed=False)
@@ -82,9 +119,12 @@ def merge_components(
             continue
 
         n_merged += 1
-        # Merge: sum spatial, mean temporal, then re-deconvolve
-        A_merged_col = A[:, members].sum(axis=1)
-        A_merged_sparse = sp.csc_matrix(A_merged_col)
+        # Merge: sum spatial, optionally re-threshold to keep the blob compact,
+        # mean temporal, then re-deconvolve.
+        A_merged_flat = np.asarray(A[:, members].sum(axis=1)).ravel().astype(np.float32)
+        if dims is not None:
+            A_merged_flat = threshold_footprint(A_merged_flat, dims, max_thr=max_thr)
+        A_merged_sparse = sp.csc_matrix(A_merged_flat.reshape(-1, 1))
 
         C_merged_row = C[members].mean(axis=0)
         try:

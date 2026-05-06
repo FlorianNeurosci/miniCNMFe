@@ -45,6 +45,10 @@ class CNMFeParams:
     min_pixel: int = 3        # Minimum nonzero pixels in a valid footprint
     border_px: int = 5        # Ignore seeds within this many border pixels
     max_neurons: int | None = None  # Stop early (None = no limit)
+    init_min_corr_neuron: float = 0.8         # "Neuron pixel" threshold inside extract_spatial_temporal
+    init_max_corr_bg: float = 0.4             # "Background pixel" threshold inside extract_spatial_temporal
+    seed_suppress_factor: float = 2.0         # Suppression disk radius after extraction = factor * sigma
+    circular_max_dist_factor: float = 2.5     # circular_constraint cutoff = factor * estimated_radius
 
     # --- Background (ring model) ---
     ring_size_factor: float = 1.5  # ring radius = ring_size_factor * (2*sigma+1)
@@ -61,6 +65,7 @@ class CNMFeParams:
     # --- Merging ---
     merge_thr_corr: float = 0.85
     merge_thr_overlap: float = 0.5  # Min Jaccard spatial overlap to consider merging
+    merge_centre_dist_factor: float = 2.0  # Centre-distance fallback = factor * sigma (in pixels)
 
     # --- Main loop ---
     n_iter_main: int = 2  # Full spatial + temporal + merge cycles
@@ -162,6 +167,10 @@ class CNMFe:
             ar_order=p.ar_order,
             n_jobs=p.n_jobs,
             device=p.device,
+            min_corr_neuron=p.init_min_corr_neuron,
+            max_corr_bg=p.init_max_corr_bg,
+            seed_suppress_factor=p.seed_suppress_factor,
+            circular_max_dist_factor=p.circular_max_dist_factor,
         )
         print(f"  Found {A.shape[1]} initial components.")
 
@@ -189,6 +198,22 @@ class CNMFe:
         for iteration in range(p.n_iter_main):
             print(f"Refinement iteration {iteration + 1}/{p.n_iter_main}...")
 
+            # Early merge: catch duplicates from greedy init while their footprints
+            # still overlap, before threshold_footprint() in update_spatial separates them.
+            if iteration == 0 and A.shape[1] >= 2:
+                print("  Pre-merging duplicate seeds...")
+                A, C, n_pre_merged = merge_components(
+                    A, C_raw,
+                    thr_corr=p.merge_thr_corr,
+                    thr_overlap=p.merge_thr_overlap,
+                    ar_order=p.ar_order,
+                    sigma=p.sigma,
+                    dims=dims,
+                    centre_dist_factor=p.merge_centre_dist_factor,
+                )
+                if n_pre_merged:
+                    print(f"  {A.shape[1]} components ({n_pre_merged} pre-merged).")
+
             Y_bg = subtract_background(Y_flat, W_mat, b0)  # (H*W, T)
 
             print("  Updating spatial footprints...")
@@ -212,7 +237,15 @@ class CNMFe:
             )
 
             print("  Merging correlated components...")
-            A, C, n_merged = merge_components(A, C, thr_corr=p.merge_thr_corr, thr_overlap=p.merge_thr_overlap)
+            A, C, n_merged = merge_components(
+                A, C,
+                thr_corr=p.merge_thr_corr,
+                thr_overlap=p.merge_thr_overlap,
+                ar_order=p.ar_order,
+                sigma=p.sigma,
+                dims=dims,
+                centre_dist_factor=p.merge_centre_dist_factor,
+            )
             if n_merged:
                 C, S = update_temporal(
                     Y_bg, A, C, sn_flat, p.ar_order, 1,

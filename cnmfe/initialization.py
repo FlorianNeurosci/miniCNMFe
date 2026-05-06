@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 # Spatial constraint helpers
 # ---------------------------------------------------------------------------
 
-def circular_constraint(ai: np.ndarray, max_dist_factor: float = 1.0) -> np.ndarray:
+def circular_constraint(ai: np.ndarray, max_dist_factor: float = 2.5) -> np.ndarray:
     """Zero pixels far from the component's centre of mass.
 
     Enforces a roughly circular shape by removing pixels that are more than
@@ -46,10 +46,10 @@ def circular_constraint(ai: np.ndarray, max_dist_factor: float = 1.0) -> np.ndar
     cy = (rows * ai).sum() / total
     cx = (cols * ai).sum() / total
     area = (ai > 0).sum()
-    radius = np.sqrt(area / np.pi) * max_dist_factor
+    radius = np.sqrt(area / np.pi)
 
     dist = np.sqrt((rows - cy) ** 2 + (cols - cx) ** 2)
-    ai[dist > radius * 2] = 0.0
+    ai[dist > radius * max_dist_factor] = 0.0
     return ai
 
 
@@ -112,8 +112,9 @@ def extract_spatial_temporal(
     data_raw: np.ndarray,
     seed_rc: tuple[int, int],
     patch_radius: int,
-    min_corr_neuron: float = 0.9,
-    max_corr_bg: float = 0.3,
+    min_corr_neuron: float = 0.8,
+    max_corr_bg: float = 0.4,
+    circular_max_dist_factor: float = 2.5,
 ) -> tuple[np.ndarray, np.ndarray, bool]:
     """Extract spatial footprint and temporal trace for one neuron.
 
@@ -178,7 +179,7 @@ def extract_spatial_temporal(
 
     ai_flat = coef[0].clip(0)                     # spatial footprint (non-negative)
     ai = ai_flat.reshape(ph, pw).astype(np.float32)
-    ai = circular_constraint(ai)
+    ai = circular_constraint(ai, max_dist_factor=circular_max_dist_factor)
     ai = connectivity_constraint(ai)
 
     if ai.sum() == 0 or (ai > 0).sum() < 1:
@@ -208,6 +209,10 @@ def greedy_corr_pnr(
     ar_order: int = 1,
     n_jobs: int = 1,
     device: str = "cpu",
+    min_corr_neuron: float = 0.8,
+    max_corr_bg: float = 0.4,
+    seed_suppress_factor: float = 2.0,
+    circular_max_dist_factor: float = 2.5,
 ) -> tuple[sp.csc_matrix, np.ndarray, np.ndarray, np.ndarray]:
     """Find initial neurons using a greedy CORR-PNR strategy.
 
@@ -302,7 +307,10 @@ def greedy_corr_pnr(
             row, col = int(seed[0]), int(seed[1])
 
             ai, ci, success = extract_spatial_temporal(
-                data_filtered, data_raw, (row, col), patch_radius
+                data_filtered, data_raw, (row, col), patch_radius,
+                min_corr_neuron=min_corr_neuron,
+                max_corr_bg=max_corr_bg,
+                circular_max_dist_factor=circular_max_dist_factor,
             )
 
             if not success or (ai > 0).sum() < min_pixel:
@@ -357,7 +365,9 @@ def greedy_corr_pnr(
 
             # After the update, suppress cn/pnr near every found centre so the
             # same neuron cannot be re-detected from a neighbouring pixel.
-            suppress_r = max(2, int(sigma))
+            # Must cover the neuron's actual support (FWHM ≈ 2*sigma) so the
+            # residual halo cannot seed a duplicate just outside the disk.
+            suppress_r = max(int(seed_suppress_factor * sigma), int(2 * sigma + 1))
             rr_grid, cc_grid = np.ogrid[:H, :W]
             for (fr, fc) in centers_list:
                 mask = (rr_grid - fr) ** 2 + (cc_grid - fc) ** 2 <= suppress_r ** 2
@@ -370,6 +380,10 @@ def greedy_corr_pnr(
                 cn[-border_px:] = 0
                 cn[:, :border_px] = 0
                 cn[:, -border_px:] = 0
+                pnr[:border_px] = 0
+                pnr[-border_px:] = 0
+                pnr[:, :border_px] = 0
+                pnr[:, -border_px:] = 0
 
             found = True
             break  # Found one neuron; recompute seeds
