@@ -87,7 +87,7 @@ class TestUpdateTemporal:
         C = d["C_true"].copy()
         sn = np.ones(H * W, dtype=np.float32) * d["sn_true"]
 
-        C_new, S_new = update_temporal(Y_flat, A, C, sn, ar_order=1, n_iter=1)
+        C_new, S_new, _, _ = update_temporal(Y_flat, A, C, sn, ar_order=1, n_iter=1)
         assert C_new.shape == (K, T)
         assert S_new.shape == (K, T)
 
@@ -101,7 +101,7 @@ class TestUpdateTemporal:
         C_init = d["C_true"].copy()
         sn = np.ones(H * W, dtype=np.float32) * d["sn_true"]
 
-        C_new, _ = update_temporal(Y_flat, A, C_init, sn, ar_order=1, n_iter=2)
+        C_new, _, _, _ = update_temporal(Y_flat, A, C_init, sn, ar_order=1, n_iter=2)
 
         # At least one component should have r > 0.5
         correlations = [

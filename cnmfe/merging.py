@@ -14,7 +14,6 @@ import scipy.sparse as sp
 from scipy.sparse.csgraph import connected_components
 
 from cnmfe.spatial import threshold_footprint
-from cnmfe.temporal import deconvolve, estimate_ar_params
 
 
 def merge_components(
@@ -27,7 +26,7 @@ def merge_components(
     dims: tuple[int, int] | None = None,
     centre_dist_factor: float = 2.0,
     max_thr: float = 0.1,
-) -> tuple[sp.csc_matrix, np.ndarray, int]:
+) -> tuple[sp.csc_matrix, np.ndarray, int, list[np.ndarray]]:
     """Merge spatially overlapping and temporally correlated components.
 
     Two components i, j are merged if their traces are correlated AND they
@@ -42,14 +41,17 @@ def merge_components(
 
     Merged spatial footprint: sum of individual footprints, then re-thresholded
     via threshold_footprint() to keep the fused blob compact.
-    Merged temporal trace: mean of individual traces, then re-deconvolved.
+    Merged temporal trace: mean of individual traces (clipped non-negative).
+    Re-deconvolution is intentionally deferred to the caller's next
+    update_temporal pass, which uses the persistent per-component AR cache —
+    re-estimating g here would re-introduce the fudge_factor drift.
 
     Args:
         A: (H*W, K) sparse spatial footprints.
         C: (K, T) temporal traces.
         thr_corr: Minimum Pearson correlation between traces to trigger merge.
         thr_overlap: Minimum Jaccard overlap between footprints.
-        ar_order: AR model order for re-deconvolution after merge.
+        ar_order: AR model order (kept for API compat — no longer used internally).
         sigma: Neuron radius (px). Required to enable the centre-distance
                fallback; if None or dims is None, only Jaccard is used.
         dims: (H, W) image dimensions; required for centre-of-mass and for
@@ -61,10 +63,16 @@ def merge_components(
         A_merged: (H*W, K_new) sparse footprints.
         C_merged: (K_new, T) calcium traces.
         n_merged: Number of merge events (groups merged > 1 component).
+        members_per_group: list of length K_new; members_per_group[j] is an
+            int array of original component indices that fused into output j.
+            Singletons have len 1; merges have len > 1. Lets the caller update
+            any per-component cache (e.g. AR coefficients).
     """
+    del ar_order  # unused — re-deconvolution deferred to update_temporal
     K, T = C.shape
     if K <= 1:
-        return A, C, 0
+        members_per_group = [np.array([k], dtype=np.int32) for k in range(K)]
+        return A, C, 0, members_per_group
 
     # --- Spatial overlap (Jaccard) ---
     O = (A.T @ A).toarray()              # (K, K) — dot product of footprints
@@ -110,32 +118,30 @@ def merge_components(
     n_merged = 0
     A_new_cols: list[sp.csc_matrix] = []
     C_new_rows: list[np.ndarray] = []
+    members_per_group: list[np.ndarray] = []
 
     for comp_id in range(n_comp):
         members = np.where(labels == comp_id)[0]
+        members_per_group.append(members.astype(np.int32))
         if len(members) == 1:
             A_new_cols.append(A.getcol(members[0]).tocsc())
             C_new_rows.append(C[members[0]])
             continue
 
         n_merged += 1
-        # Merge: sum spatial, optionally re-threshold to keep the blob compact,
-        # mean temporal, then re-deconvolve.
+        # Merge: sum spatial, re-threshold to keep the blob compact, mean
+        # temporal (clipped non-negative). The caller's next update_temporal
+        # will deconvolve the merged trace with the cached AR coefficient.
         A_merged_flat = np.asarray(A[:, members].sum(axis=1)).ravel().astype(np.float32)
         if dims is not None:
             A_merged_flat = threshold_footprint(A_merged_flat, dims, max_thr=max_thr)
         A_merged_sparse = sp.csc_matrix(A_merged_flat.reshape(-1, 1))
 
-        C_merged_row = C[members].mean(axis=0)
-        try:
-            g, sn = estimate_ar_params(C_merged_row, p=ar_order)
-            c_clean, _, _ = deconvolve(C_merged_row, g, sn)
-        except Exception:
-            c_clean = C_merged_row.clip(0)
+        C_merged_row = C[members].mean(axis=0).clip(0).astype(np.float32)
 
         A_new_cols.append(A_merged_sparse)
-        C_new_rows.append(c_clean.astype(np.float32))
+        C_new_rows.append(C_merged_row)
 
     A_out = sp.hstack(A_new_cols, format="csc") if A_new_cols else sp.csc_matrix(A.shape)
     C_out = np.vstack(C_new_rows) if C_new_rows else np.empty((0, T), dtype=np.float32)
-    return A_out, C_out, n_merged
+    return A_out, C_out, n_merged, members_per_group

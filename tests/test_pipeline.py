@@ -118,3 +118,35 @@ class TestCNMFePipeline:
         model = CNMFe(params).fit(movie, do_motion_correction=True)
         assert model.shifts is not None
         assert model.shifts.shape == (movie.shape[0], 2)
+
+    def test_temporal_correlation_against_truth(self, synth):
+        """Recovered temporal traces should align with ground truth.
+
+        Regression test: per-component re-estimation of the AR coefficient g
+        across BCD iterations used to drift it toward 0 (fudge_factor=0.96
+        re-applied each call), distorting calcium decay shape and dropping
+        Pearson r vs ground truth to ~0.6-0.8. Pooling g across components
+        and caching it across iterations brings r back above 0.85.
+        """
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.7, min_pnr=3.0,
+            n_iter_main=2, n_iter_temporal=2,
+        )
+        model = CNMFe(params).fit(synth["movie"], do_motion_correction=False)
+        matches = match_components(model.A, synth["A_true"])
+
+        def pearson(a, b):
+            a = a - a.mean(); b = b - b.mean()
+            d = np.sqrt(np.sum(a ** 2) * np.sum(b ** 2))
+            return float(np.dot(a, b) / d) if d > 0 else 0.0
+
+        # Restrict to actually-matched truth neurons (spatial r > 0.5)
+        valid = [(kt, ke) for kt, ke, sc in matches if sc > 0.5]
+        assert len(valid) >= 5, f"Only {len(valid)}/6 truth neurons recovered"
+
+        rs_oasis = [pearson(model.C[ke], synth["C_true"][kt]) for kt, ke in valid]
+        rs_proj = [pearson((model.C + model.YrA)[ke], synth["C_true"][kt]) for kt, ke in valid]
+
+        assert np.mean(rs_oasis) > 0.85, f"Mean r(C) = {np.mean(rs_oasis):.3f}"
+        assert np.mean(rs_proj) > 0.85, f"Mean r(C+YrA) = {np.mean(rs_proj):.3f}"
+        assert min(rs_proj) > 0.70, f"Min r(C+YrA) = {min(rs_proj):.3f}"

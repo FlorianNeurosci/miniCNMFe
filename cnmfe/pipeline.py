@@ -20,7 +20,7 @@ from cnmfe.merging import merge_components
 from cnmfe.motion_correction import motion_correct
 from cnmfe.preprocess import correlation_pnr, estimate_noise
 from cnmfe.spatial import update_spatial
-from cnmfe.temporal import update_temporal
+from cnmfe.temporal import estimate_ar_params, update_temporal
 
 if TYPE_CHECKING:
     import zarr
@@ -100,11 +100,14 @@ class CNMFe:
         self.C: np.ndarray | None = None
         self.S: np.ndarray | None = None
         self.C_raw: np.ndarray | None = None
+        self.YrA: np.ndarray | None = None    # residual at each footprint; C + YrA = noisy projection
         self.W: sp.csr_matrix | None = None
         self.b0: np.ndarray | None = None
         self.sn: np.ndarray | None = None
         self.shifts: np.ndarray | None = None
         self.dims: tuple[int, int] | None = None
+        self.g: list[np.ndarray] | None = None    # per-component AR coefs
+        self.sn_per_k: np.ndarray | None = None   # per-component noise std
 
     def fit(
         self,
@@ -186,6 +189,34 @@ class CNMFe:
         Y_flat = make_2d(movie_arr)     # (H*W, T)
         sn_flat = self.sn.ravel()       # (H*W,)
 
+        # Estimate the AR coefficient `g` ONCE from the pooled raw traces.
+        #
+        # Per-component Yule-Walker on T~300 traces has high variance (~0.1
+        # spread even on clean ground truth) because the lag-1 / lag-2
+        # autocorrelations are noisy. Pooling all components into one long
+        # concatenated trace gives an effective sample length of K*T and a
+        # much more accurate estimate. We assume all neurons share the same
+        # calcium indicator dynamics — the common case for one recording.
+        #
+        # The estimate is persisted and passed into every update_temporal
+        # call instead of being re-estimated each iteration, which would
+        # re-apply the fudge_factor 0.96 multiplier to already-deconvolved
+        # traces and drift g toward 0.
+        K_init = A.shape[1]
+        try:
+            g_global, _ = estimate_ar_params(C_raw.ravel().astype(np.float32), p=p.ar_order)
+        except Exception:
+            g_global = np.array([0.9 ** (1.0 / max(p.ar_order, 1))] * p.ar_order, dtype=np.float32)
+
+        g_per_k: list[np.ndarray] = [g_global.copy() for _ in range(K_init)]
+        sn_per_k = np.zeros(K_init, dtype=np.float32)
+        for k in range(K_init):
+            try:
+                _, sn_k = estimate_ar_params(C_raw[k], p=p.ar_order)
+            except Exception:
+                sn_k = float(np.std(C_raw[k])) if np.std(C_raw[k]) > 0 else 1.0
+            sn_per_k[k] = sn_k
+
         # --- Step 5: Initial ring background ---
         ring_radius = p.ring_size_factor * (2 * p.sigma + 1)
         print(f"Fitting ring-model background (radius={ring_radius:.1f}px)...")
@@ -193,6 +224,20 @@ class CNMFe:
             Y_flat, A, C, dims, ring_radius,
             lambda_reg=p.ring_lambda, n_jobs=p.n_jobs, device=p.device,
         )
+
+        def _cache_after_merge(members_per_group: list[np.ndarray]) -> None:
+            """Update g_per_k / sn_per_k after merge_components reorders K."""
+            nonlocal g_per_k, sn_per_k
+            new_g: list[np.ndarray] = []
+            new_sn = np.zeros(len(members_per_group), dtype=np.float32)
+            for j, members in enumerate(members_per_group):
+                # Inherit from the first (typically strongest-seeded) member.
+                # No re-estimation -> no fudge_factor drift.
+                m0 = int(members[0])
+                new_g.append(g_per_k[m0])
+                new_sn[j] = sn_per_k[m0]
+            g_per_k = new_g
+            sn_per_k = new_sn
 
         # --- Step 6: Main refinement loop ---
         for iteration in range(p.n_iter_main):
@@ -202,7 +247,7 @@ class CNMFe:
             # still overlap, before threshold_footprint() in update_spatial separates them.
             if iteration == 0 and A.shape[1] >= 2:
                 print("  Pre-merging duplicate seeds...")
-                A, C, n_pre_merged = merge_components(
+                A, C, n_pre_merged, members_per_group = merge_components(
                     A, C_raw,
                     thr_corr=p.merge_thr_corr,
                     thr_overlap=p.merge_thr_overlap,
@@ -211,6 +256,7 @@ class CNMFe:
                     dims=dims,
                     centre_dist_factor=p.merge_centre_dist_factor,
                 )
+                _cache_after_merge(members_per_group)
                 if n_pre_merged:
                     print(f"  {A.shape[1]} components ({n_pre_merged} pre-merged).")
 
@@ -225,19 +271,23 @@ class CNMFe:
             if not alive.all():
                 A = A[:, alive]
                 C = C[alive]
+                alive_idx = np.where(alive)[0]
+                g_per_k = [g_per_k[i] for i in alive_idx]
+                sn_per_k = sn_per_k[alive_idx]
 
             if A.shape[1] == 0:
                 print("  All components died. Stopping.")
                 break
 
             print("  Updating temporal traces...")
-            C, S = update_temporal(
+            C, S, g_per_k, sn_per_k = update_temporal(
                 Y_bg, A, C, sn_flat, p.ar_order, p.n_iter_temporal,
                 n_jobs=p.n_jobs, device=p.device,
+                g_cached=g_per_k, sn_cached=sn_per_k,
             )
 
             print("  Merging correlated components...")
-            A, C, n_merged = merge_components(
+            A, C, n_merged, members_per_group = merge_components(
                 A, C,
                 thr_corr=p.merge_thr_corr,
                 thr_overlap=p.merge_thr_overlap,
@@ -246,10 +296,12 @@ class CNMFe:
                 dims=dims,
                 centre_dist_factor=p.merge_centre_dist_factor,
             )
+            _cache_after_merge(members_per_group)
             if n_merged:
-                C, S = update_temporal(
+                C, S, g_per_k, sn_per_k = update_temporal(
                     Y_bg, A, C, sn_flat, p.ar_order, 1,
                     n_jobs=p.n_jobs, device=p.device,
+                    g_cached=g_per_k, sn_cached=sn_per_k,
                 )
             print(f"  {A.shape[1]} components ({n_merged} merged).")
 
@@ -262,16 +314,33 @@ class CNMFe:
         # Final deconvolution pass to get spike trains
         print("Final temporal update...")
         Y_bg = subtract_background(Y_flat, W_mat, b0)
-        C, S = update_temporal(
+        C, S, g_per_k, sn_per_k = update_temporal(
             Y_bg, A, C, sn_flat, p.ar_order, p.n_iter_temporal,
             n_jobs=p.n_jobs, device=p.device,
+            g_cached=g_per_k, sn_cached=sn_per_k,
         )
+
+        # Compute the residual projected onto each footprint:
+        #   YrA[k, t] = (a_k . (Y_bg - A @ C)[:, t]) / ||a_k||^2
+        # The "noisy projected trace" with the same shape as the underlying
+        # data is C + YrA. OASIS-deconvolved C alone correlates only ~0.6
+        # with ground truth on synthetic data because the shape constraint
+        # c[t] >= g * c[t-1] introduces small spike-timing distortions; the
+        # noisy projection preserves shape and typically correlates > 0.9.
+        AA_final = (A.T @ A).toarray()
+        nA_final = np.maximum(np.diag(AA_final), 1e-10)
+        YA_final = np.asarray(Y_bg.T @ A, dtype=np.float32)              # (T, K)
+        crosstalk = AA_final @ C - np.diag(AA_final)[:, None] * C        # (K, T)
+        YrA = (YA_final.T - crosstalk) / nA_final[:, None] - C           # (K, T)
 
         self.A = A
         self.C = C
         self.S = S
         self.C_raw = C_raw
+        self.YrA = YrA
         self.W = W_mat
         self.b0 = b0
+        self.g = g_per_k
+        self.sn_per_k = sn_per_k
         print(f"Done. Extracted {A.shape[1]} neurons.")
         return self

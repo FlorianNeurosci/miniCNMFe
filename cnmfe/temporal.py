@@ -226,6 +226,16 @@ def _deconvolve_one(trace_k: np.ndarray, ar_order: int) -> tuple[np.ndarray, np.
     return c_k, s_k
 
 
+def _deconvolve_with(trace_k: np.ndarray, g_k: np.ndarray, sn_k: float) -> tuple[np.ndarray, np.ndarray]:
+    """Deconvolve a single trace with pre-computed g/sn (module-level for pickling)."""
+    try:
+        c_k, s_k, _ = deconvolve(trace_k, g_k, sn_k)
+    except Exception:
+        c_k = trace_k.clip(0)
+        s_k = np.zeros_like(c_k)
+    return c_k, s_k
+
+
 def update_temporal(
     Y_flat: np.ndarray,
     A: sp.csc_matrix,
@@ -235,7 +245,9 @@ def update_temporal(
     n_iter: int = 2,
     n_jobs: int = 1,
     device: str = "cpu",
-) -> tuple[np.ndarray, np.ndarray]:
+    g_cached: list[np.ndarray] | None = None,
+    sn_cached: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], np.ndarray]:
     """Refine temporal traces by block coordinate descent.
 
     For each component k, the residual data after subtracting all other
@@ -249,19 +261,31 @@ def update_temporal(
     When device='cuda' the initial projections (Y_flat.T @ A and A.T @ A) run
     on GPU. OASIS deconvolution always runs on CPU (no GPU implementation).
 
+    The AR coefficient `g` (calcium decay) is estimated ONCE per component
+    before the BCD loop and reused across iterations. Re-estimating g from
+    an already-deconvolved trace each iteration causes systematic drift
+    (Yule-Walker recovers ~g_prev, then fudge_factor=0.96 shrinks it again),
+    which distorts decay shape and reduces correlation with ground truth.
+    Pass `g_cached`/`sn_cached` to reuse values estimated upstream (e.g.
+    from C_raw at init); otherwise estimation runs once on input C.
+
     Args:
         Y_flat: (H*W, T) background-subtracted movie.
         A: (H*W, K) sparse spatial footprints.
         C: (K, T) current temporal traces.
-        sn: (H*W,) per-pixel noise std.
+        sn: (H*W,) per-pixel noise std (currently unused — kept for API compat).
         ar_order: AR model order for deconvolution.
         n_iter: Number of BCD iterations.
         n_jobs: Number of parallel workers (-1 = all CPUs, 1 = serial Gauss-Seidel).
         device: 'cpu' or 'cuda'. GPU accelerates the (H*W × T) @ (H*W × K) projection.
+        g_cached: Optional list of length K with pre-estimated AR coefs per component.
+        sn_cached: Optional (K,) array of pre-estimated per-component noise std.
 
     Returns:
         C_new: (K, T) updated calcium traces.
         S: (K, T) inferred spike trains.
+        g_per_k: list of length K — AR coefs used for each component.
+        sn_per_k: (K,) array — noise std used for each component.
     """
     K, T = C.shape
     xp = get_xp(device)
@@ -279,6 +303,23 @@ def update_temporal(
 
     nA = np.maximum(np.diag(AA), 1e-10)
 
+    # Estimate g/sn ONCE per component before the BCD loop. This avoids
+    # the drift that comes from re-estimating from progressively shaped traces.
+    if g_cached is None or sn_cached is None:
+        g_per_k: list[np.ndarray] = []
+        sn_per_k = np.zeros(K, dtype=np.float32)
+        for k in range(K):
+            try:
+                g_k, sn_k = estimate_ar_params(C[k], p=ar_order)
+            except Exception:
+                g_k = np.array([0.9 ** (1.0 / max(ar_order, 1))] * ar_order, dtype=np.float32)
+                sn_k = float(np.std(C[k])) if np.std(C[k]) > 0 else 1.0
+            g_per_k.append(g_k)
+            sn_per_k[k] = sn_k
+    else:
+        g_per_k = list(g_cached)
+        sn_per_k = np.asarray(sn_cached, dtype=np.float32).copy()
+
     C = C.copy()
     S = np.zeros_like(C)
     YrA = YA - (AA @ C).T
@@ -288,7 +329,7 @@ def update_temporal(
         for _ in range(n_iter):
             for k in range(K):
                 trace_k = (YrA[:, k] / nA[k] + C[k]).astype(np.float32)
-                c_k, s_k = _deconvolve_one(trace_k, ar_order)
+                c_k, s_k = _deconvolve_with(trace_k, g_per_k[k], float(sn_per_k[k]))
                 delta = c_k - C[k]
                 YrA -= np.outer(delta, AA[:, k])
                 C[k] = c_k
@@ -300,7 +341,8 @@ def update_temporal(
         for _ in range(n_iter):
             traces = [(YrA[:, k] / nA[k] + C[k]).astype(np.float32) for k in range(K)]
             results = Parallel(n_jobs=n_jobs)(
-                delayed(_deconvolve_one)(trace_k, ar_order) for trace_k in traces
+                delayed(_deconvolve_with)(traces[k], g_per_k[k], float(sn_per_k[k]))
+                for k in range(K)
             )
             for k, (c_k, s_k) in enumerate(results):
                 delta = c_k - C[k]
@@ -308,4 +350,4 @@ def update_temporal(
                 C[k] = c_k
                 S[k] = s_k
 
-    return C, S
+    return C, S, g_per_k, sn_per_k

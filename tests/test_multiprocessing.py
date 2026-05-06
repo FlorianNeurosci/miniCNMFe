@@ -132,8 +132,8 @@ class TestUpdateTemporalParallel:
         C = d["C_true"].copy()
         sn = np.ones(d["dims"][0] * d["dims"][1], dtype=np.float32) * d["sn_true"]
 
-        C1, S1 = update_temporal(Y_flat, A, C.copy(), sn, ar_order=1, n_iter=1, n_jobs=1)
-        C2, S2 = update_temporal(Y_flat, A, C.copy(), sn, ar_order=1, n_iter=1, n_jobs=2)
+        C1, S1, _, _ = update_temporal(Y_flat, A, C.copy(), sn, ar_order=1, n_iter=1, n_jobs=1)
+        C2, S2, _, _ = update_temporal(Y_flat, A, C.copy(), sn, ar_order=1, n_iter=1, n_jobs=2)
 
         # Jacobi (parallel) and Gauss-Seidel (serial) differ numerically but
         # should give similar output: check shapes and non-negativity
@@ -148,7 +148,7 @@ class TestUpdateTemporalParallel:
         Y_flat = make_2d(d["movie"])
         A = sp.csc_matrix(d["A_true"].astype(np.float32))
         sn = np.ones(d["dims"][0] * d["dims"][1], dtype=np.float32) * d["sn_true"]
-        _, S = update_temporal(Y_flat, A, d["C_true"].copy(), sn, n_iter=1, n_jobs=2)
+        _, S, _, _ = update_temporal(Y_flat, A, d["C_true"].copy(), sn, n_iter=1, n_jobs=2)
         assert (S >= -1e-6).all()
 
 
