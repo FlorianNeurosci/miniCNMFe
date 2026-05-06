@@ -99,8 +99,26 @@ K = model.A.shape[1]
 footprint_k = np.array(model.A[:, 0].todense()).reshape(H, W)
 
 # Get trace and spikes for neuron 0
-trace_0 = model.C[0]    # (T,)
-spikes_0 = model.S[0]   # (T,)
+trace_0 = model.C[0]    # (T,)  — OASIS-deconvolved (clean AR(1) shape)
+spikes_0 = model.S[0]   # (T,)  — inferred spike train
+```
+
+### Two flavours of the calcium trace: `C` vs `C + YrA`
+
+`model.C` is the OASIS-deconvolved trace — clean AR(1) shape, ideal for spike-event analyses. But OASIS imposes the strict shape constraint `c[t] >= g * c[t-1]` and small spike-timing distortions can drop its Pearson correlation with the underlying data to ~0.6 on synthetic ground truth.
+
+`model.C + model.YrA` is the **noisy projected trace** — the residual at each footprint added back. It preserves the data's actual shape and typically correlates > 0.9 with ground truth. Use this when you need shape fidelity (correlation analyses, plotting raw fluorescence, regressing against an external reference signal).
+
+```python
+C_clean = model.C                  # denoised AR(1) — for spike detection, event analyses
+C_raw_after = model.C + model.YrA  # noisy but shape-faithful — for correlation, plotting
+```
+
+The per-component AR coefficient and noise std used by OASIS are also exposed:
+
+```python
+g_per_neuron = model.g          # list of length K, each (p,) np.array
+sn_per_neuron = model.sn_per_k  # (K,) np.array
 ```
 
 ---
@@ -151,13 +169,15 @@ Default `1` works for GCaMP6s/GCaMP7 at typical frame rates.
 
 ---
 
-### `merge_thr_corr` — merging threshold
+### `merge_thr_corr` and `merge_thr_overlap` — merging thresholds
 
-Pairs of components with temporal correlation above this threshold **and** spatial overlap are merged.
+Pairs of components with temporal correlation above `merge_thr_corr` **and** (Jaccard overlap above `merge_thr_overlap` **or** centre-of-mass distance below `merge_centre_dist_factor * sigma`) are merged.
 
-- `0.85` (default): merges obvious duplicates
-- `0.95`: very conservative, keeps more separate components
-- `0.7`: aggressive merging (use if many duplicate components appear)
+- `merge_thr_corr=0.85` (default): merges obvious duplicates
+- `merge_thr_corr=0.95`: very conservative, keeps more separate components
+- `merge_thr_corr=0.7`: aggressive merging (use if many duplicate components appear)
+
+The centre-distance fallback (default `merge_centre_dist_factor=2.0`, i.e. ~2σ in pixels) catches duplicate detections of the same neuron whose post-thresholded footprints have ended up at slightly different peak pixels and so have zero Jaccard despite tracking the same trace. Raise this factor if real distinct neurons within ~2σ are being incorrectly merged; lower it (or set 0) to disable the fallback.
 
 ---
 
@@ -271,6 +291,10 @@ with h5py.File("results.h5", "w") as f:
     f.attrs["A_shape"] = model.A.shape
     f.create_dataset("C", data=model.C)
     f.create_dataset("S", data=model.S)
+    f.create_dataset("YrA", data=model.YrA)             # C + YrA = noisy projected trace
+    f.create_dataset("sn_per_k", data=model.sn_per_k)
+    # model.g is a list of variable-length arrays — pad or save individually
+    f.create_dataset("g", data=np.stack(model.g))       # works when ar_order is fixed
     f.create_dataset("shifts", data=model.shifts if model.shifts is not None else [])
 
 # Load from HDF5
@@ -310,7 +334,12 @@ Should not occur in the current version (floor-division fix applied). If you see
 ### Duplicate neurons (same cell found twice)
 
 - Lower `merge_thr_corr` (try `0.7`)
-- Or increase `sigma` slightly so the suppression disk is larger
+- Raise `merge_centre_dist_factor` (try `3.0`) so duplicates within a wider radius merge even when their thresholded supports are disjoint
+- Increase `seed_suppress_factor` (try `2.5`–`3.0`) so the post-extraction suppression disk in greedy init covers more of the residual halo and prevents reseeding on the same neuron in the first place
+
+### Temporal traces look "snappy" / poorly correlated with ground truth
+
+Use `model.C + model.YrA` instead of `model.C` for shape comparison. `model.C` is OASIS-deconvolved (strict AR(1) shape, may distort spike timing slightly); `C + YrA` is the noisy projected trace (preserves data shape).
 
 ### Windows multiprocessing hangs
 

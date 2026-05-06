@@ -83,10 +83,13 @@ graph TD
 | `A` | float32 sparse csc | `(H·W, K)` | `initialization.greedy_corr_pnr` |
 | `C` | float32 | `(K, T)` | same |
 | `C_raw` | float32 | `(K, T)` | same |
+| `g_per_k` | list of `(p,)` arrays | length `K` | `pipeline.fit` (pooled estimate from `C_raw.ravel()`, persisted) |
+| `sn_per_k` | float32 | `(K,)` | `pipeline.fit` |
 | `W_mat` | float32 sparse csr | `(H·W, H·W)` | `background.compute_W` |
 | `b0` | float32 | `(H·W,)` | same |
 | `Y_bg` | float32 | `(H·W, T)` | `background.subtract_background` |
 | `S` | float32 | `(K, T)` | `temporal.update_temporal` |
+| `YrA` | float32 | `(K, T)` | `pipeline.fit` (residual at each footprint after final BCD; `C + YrA` = noisy projection) |
 | `shifts` | float32 | `(T, 2)` | `motion_correction.motion_correct` |
 
 ### Pipeline step by step
@@ -105,17 +108,27 @@ movie_arr (T, H, W)  +  shifts (T, 2)
     │
     ├──► make_2d() ─────────────────────────► Y_flat (H·W, T)
     │
+    ├──► estimate_ar_params(C_raw.ravel()) ─► g_per_k (cached), sn_per_k
+    │
     ├──► compute_W() ───────────────────────► W_mat (H·W, H·W), b0 (H·W)
     │
     └── for n_iter_main iterations:
             │
+            ├──► [iter 0 only]
+            │     merge_components() ────────► A, C, members_per_group
+            │     _cache_after_merge()      ─► g_per_k, sn_per_k (inherit)
+            │
             ├──► subtract_background() ─────► Y_bg (H·W, T)
             ├──► update_spatial() ──────────► A (H·W, K)
-            ├──► update_temporal() ─────────► C (K, T), S (K, T)
-            ├──► merge_components() ────────► A, C (fewer K if merged)
+            ├──► [prune dead components]   ─► A, C, g_per_k, sn_per_k
+            ├──► update_temporal(g_cached=…)─► C, S, g_per_k, sn_per_k (cache reused, no drift)
+            ├──► merge_components() ────────► A, C, members_per_group
+            ├──► _cache_after_merge()      ─► g_per_k, sn_per_k (inherit from members[0])
+            ├──► [if merged] update_temporal()
             └──► compute_W() ────────────────► W_mat, b0  (refresh)
     │
-    └──► update_temporal() (final pass) ────► C, S
+    ├──► update_temporal() (final pass) ────► C, S, g_per_k, sn_per_k
+    └──► [compute residual projection]  ────► YrA (K, T) — model.C + model.YrA = noisy projection
 ```
 
 ---
@@ -130,7 +143,7 @@ Each step that supports `n_jobs` uses `joblib.Parallel` with the `loky` backend 
 | `motion_correct` | Per-frame shift estimate+apply | `_shift_and_correct_frame` |
 | `compute_W` | Ridge regression per pixel batch | `_ring_pixel_batch` |
 | `update_spatial` | LassoLars per pixel batch | `_spatial_pixel_batch` |
-| `update_temporal` | OASIS deconvolution per component | `_deconvolve_one` |
+| `update_temporal` | OASIS deconvolution per component | `_deconvolve_with` |
 | `greedy_corr_pnr` | Initial PSF filtering per frame | `scipy.ndimage.convolve` |
 
 > [!WARNING]

@@ -93,9 +93,9 @@ For seed pixel $(r,c)$, extract a patch of radius $r_\text{patch} = \max(3\sigma
 
 1. **Normalise** each pixel trace to unit std: $\hat{y}_p = (y_p - \bar{y}_p)/\text{std}(y_p)$
 
-2. **Neuron pixels**: $\mathcal{I}_n = \{p : \text{corr}(\hat{y}_\text{seed}, \hat{y}_p) > 0.9\}$
+2. **Neuron pixels**: $\mathcal{I}_n = \{p : \text{corr}(\hat{y}_\text{seed}, \hat{y}_p) > \tau_n\}$ — default $\tau_n = 0.8$ (`init_min_corr_neuron`)
 
-3. **Background pixels**: $\mathcal{I}_b = \{p : \text{corr}(\hat{y}_\text{seed}, \hat{y}_p) < 0.3\}$
+3. **Background pixels**: $\mathcal{I}_b = \{p : \text{corr}(\hat{y}_\text{seed}, \hat{y}_p) < \tau_b\}$ — default $\tau_b = 0.4$ (`init_max_corr_bg`)
 
 4. **Trace**: $c_i = \text{mean}_{p \in \mathcal{I}_n} \hat{y}_p$
 
@@ -103,7 +103,7 @@ For seed pixel $(r,c)$, extract a patch of radius $r_\text{patch} = \max(3\sigma
 
 6. **OLS footprint**: solve $[c_i \,|\, y_\text{bg} \,|\, \mathbf{1}] \cdot \boldsymbol{\beta} \approx \mathbf{Y}_\text{patch}$ for $\boldsymbol{\beta}$; set $a_i = \boldsymbol{\beta}_{0,:}\text{.clip}(0)$
 
-7. **Shape constraints**: circular constraint (zero pixels $> 2R$ from centroid) and connectivity constraint (keep largest connected component).
+7. **Shape constraints**: circular constraint (zero pixels $> \alpha \cdot R$ from centroid where $R = \sqrt{\text{area}/\pi}$, default $\alpha = 2.5$ via `circular_max_dist_factor`) and connectivity constraint (keep largest connected component).
 
 ### 4.3 AR(1) Deconvolution of Seed Trace
 
@@ -113,7 +113,11 @@ After extraction, deconvolve $c_i$ using OASIS (see §6) to obtain the clean tra
 
 $$\mathbf{Y}_\text{flat}[:, r_0:r_1, c_0:c_1] \mathrel{-}= a_i[\text{np.newaxis}] \cdot \tilde{c}_i[:,\text{np.newaxis},\text{np.newaxis}]$$
 
-Then recompute CORR/PNR on the updated patch and suppress a disk of radius $\max(2, \sigma)$ around every already-found centre.
+Then recompute CORR/PNR on the updated patch and suppress a disk of radius
+
+$$r_\text{supp} = \max\!\big(\lfloor f \cdot \sigma \rfloor,\;\lfloor 2\sigma + 1 \rfloor\big)$$
+
+around every already-found centre, where $f$ is `seed_suppress_factor` (default 2.0). The disk must cover the neuron's actual support (FWHM $\approx 2\sigma$) — otherwise the residual halo from incomplete subtraction reseeds at a pixel a few px from the original centre and the same neuron is detected multiple times.
 
 ---
 
@@ -163,13 +167,23 @@ Then deconvolve $\text{trace}_k$ with OASIS → $(c_k, s_k)$. Update residuals i
 
 ### 6.2 AR(1) Parameter Estimation
 
-1. **Noise**: $\hat{\sigma} = \sqrt{\exp(\text{mean}[\log P(\omega), \omega \in \Omega])}$ (same as §3.1, on trace)
+The AR coefficient $\mathbf{g}$ is estimated **once** per pipeline run (not per BCD iteration) and cached for every subsequent `update_temporal` call. Re-estimating from already-deconvolved traces re-applies the fudge factor on top of the OASIS-imposed shape, drifting $\mathbf{g}$ toward 0 across iterations and distorting the calcium decay shape.
 
-2. **Yule-Walker**: build autocorrelation $r(k) = \frac{1}{T-k}\sum_t (y_t - \bar{y})(y_{t+k} - \bar{y})$
+The pipeline pools all components' raw traces into a single concatenated vector before estimation:
+
+$$\mathbf{c}_\text{pool} = \big[\mathbf{c}_{\text{raw},1};\;\mathbf{c}_{\text{raw},2};\;\ldots;\;\mathbf{c}_{\text{raw},K}\big] \in \mathbb{R}^{KT}$$
+
+Per-component estimation on $T \approx 300$ traces has a $\sim 0.1$ spread in the recovered $g$ even on clean ground truth; pooling gives an effective sample length of $KT$ and a much more stable estimate (assumes all neurons share the same calcium indicator dynamics — the common case for one recording).
+
+1. **Noise** (per component, used by OASIS): $\hat{\sigma}_k = \sqrt{\exp(\text{mean}[\log P_k(\omega), \omega \in \Omega])}$ on each $\mathbf{c}_{\text{raw},k}$.
+
+2. **Yule-Walker** (on $\mathbf{c}_\text{pool}$): build autocorrelation $r(k) = \frac{1}{T_\text{pool}-k}\sum_t (y_t - \bar{y})(y_{t+k} - \bar{y})$.
 
    Solve the Toeplitz system $\mathbf{R}\,\mathbf{g} = \mathbf{r}$ where $[\mathbf{R}]_{ij} = r(|i-j|)$ and $[\mathbf{r}]_k = r(k+1)$.
 
 3. **Fudge**: $\mathbf{g} \leftarrow 0.96\,\mathbf{g}$, clipped to $[0, 0.9999]$.
+
+4. **Cache**: store $\mathbf{g}_k = \mathbf{g}$ (broadcast to all components) and $\hat{\sigma}_k$. After merging, the cache for component $j$ inherits from the strongest member: $\mathbf{g}_j \leftarrow \mathbf{g}_{\text{members}_j[0]}$ (no re-estimation, no drift).
 
 ### 6.3 OASIS Deconvolution (AR(1))
 
@@ -218,14 +232,31 @@ After regression, for each component $k$:
 
 Build overlap matrix $\mathbf{O} = \mathbf{A}^\top\mathbf{A}$ (sparse).
 
-Jaccard overlap: $J(i,j) = \frac{O_{ij}}{\|\mathbf{a}_i\|_2^2 + \|\mathbf{a}_j\|_2^2 - O_{ij}}$
+**Jaccard overlap**: $J(i,j) = \dfrac{O_{ij}}{\|\mathbf{a}_i\|_2^2 + \|\mathbf{a}_j\|_2^2 - O_{ij}}$
 
-Temporal correlation: $\rho(i,j) = \text{corr}(\mathbf{c}_i, \mathbf{c}_j)$
+**Centre-of-mass distance**: $d(i,j) = \|\mathbf{p}_i - \mathbf{p}_j\|_2$ where $\mathbf{p}_k = \dfrac{\sum_q q\,a_{k,q}}{\sum_q a_{k,q}}$ is the weighted centroid of component $k$ in pixel coordinates $q = (\text{row}, \text{col})$.
 
-Merge edge: $(i,j)$ if $J(i,j) > \theta_\text{overlap}$ **and** $\rho(i,j) > \theta_\text{corr}$ (default 0.85).
+**Temporal correlation**: $\rho(i,j) = \text{corr}(\mathbf{c}_i, \mathbf{c}_j)$.
+
+**Merge edge** $(i,j)$ if traces are correlated *and* footprints either overlap *or* sit close:
+
+$$|\rho(i,j)| > \theta_\text{corr}\quad\text{AND}\quad\big(J(i,j) > \theta_\text{overlap}\;\text{OR}\;d(i,j) < f_\text{ctr}\,\sigma\big)$$
+
+Defaults: $\theta_\text{corr}=0.85$, $\theta_\text{overlap}=0.5$, $f_\text{ctr}=2.0$ (`merge_centre_dist_factor`).
+
+The centre-distance fallback catches duplicate detections of the same neuron: after `threshold_footprint` keeps only the largest connected component around each detection's peak, two duplicates of one neuron may end up with **disjoint supports** ($J \approx 0$) despite tracking nearly the same trace ($\rho \approx 1$). Centre proximity is the robust fallback for that case.
 
 For each merge group $\mathcal{G}$:
 
-$$\mathbf{a}_\text{new} = \frac{\sum_{k \in \mathcal{G}} \mathbf{a}_k}{\|\sum_{k \in \mathcal{G}} \mathbf{a}_k\|_2}, \qquad \mathbf{c}_\text{new} = \text{mean}_{k \in \mathcal{G}} \mathbf{c}_k$$
+$$\mathbf{a}_\text{new} = \texttt{threshold\_footprint}\!\Big(\sum_{k \in \mathcal{G}} \mathbf{a}_k\Big),\qquad \mathbf{c}_\text{new} = \max\!\big(0,\;\text{mean}_{k \in \mathcal{G}} \mathbf{c}_k\big)$$
 
-Then re-run one temporal update pass on the merged components.
+Re-deconvolution is **deferred** to the next `update_temporal` pass, which uses the persistent per-component AR cache (re-deconvolving here would require re-estimating $g$ from a corrupted intermediate trace, re-introducing the fudge-factor drift §6.2 fixes).
+
+`merge_components` returns `members_per_group` — a list of length $K_\text{new}$ where `members_per_group[j]` lists the original indices that fused into output $j$. The pipeline uses this to update the AR cache: $\mathbf{g}_j \leftarrow \mathbf{g}_{\text{members}_j[0]}$, $\hat{\sigma}_j \leftarrow \hat{\sigma}_{\text{members}_j[0]}$.
+
+### 8.1 When merging runs
+
+The pipeline runs `merge_components` **twice** per outer iteration in iteration 0:
+
+- **Pre-spatial merge** (iteration 0 only): catches duplicates from greedy init while their footprints still overlap, before `update_spatial` runs `threshold_footprint` and separates duplicate cores.
+- **Post-temporal merge** (every iteration): standard merge after the spatial+temporal cycle.

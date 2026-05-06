@@ -44,9 +44,12 @@ flowchart LR
 | Symbol | Shape | Meaning |
 |--------|-------|---------|
 | `A` | `(H·W, K)` sparse | Spatial footprints — where each neuron lives |
-| `C` | `(K, T)` | Denoised calcium traces |
+| `C` | `(K, T)` | OASIS-deconvolved calcium traces (clean AR(1) shape) |
 | `S` | `(K, T)` | Inferred spike trains |
-| `C_raw` | `(K, T)` | Raw (pre-deconvolution) traces |
+| `C_raw` | `(K_init, T)` | Raw traces from greedy init (pre-deconvolution) |
+| `YrA` | `(K, T)` | Residual at each footprint; `C + YrA` is the noisy projected trace |
+| `g` | list of `(p,)` | Per-component AR coefficients used by OASIS |
+| `sn_per_k` | `(K,)` | Per-component noise std used by OASIS |
 | `W` | `(H·W, H·W)` sparse | Ring background weights |
 | `b0` | `(H·W,)` | Per-pixel baseline |
 | `sn` | `(H, W)` | Per-pixel noise std |

@@ -32,6 +32,10 @@ class CNMFeParams:
     min_pixel: int = 3                         # Min nonzero pixels in a valid footprint
     border_px: int = 5                         # Ignore seeds within N border pixels
     max_neurons: int | None = None             # Stop early (None = no limit)
+    init_min_corr_neuron: float = 0.8          # "Neuron pixel" threshold inside extract_spatial_temporal
+    init_max_corr_bg: float = 0.4              # "Background pixel" threshold inside extract_spatial_temporal
+    seed_suppress_factor: float = 2.0          # Suppression disk after extraction = factor * sigma
+    circular_max_dist_factor: float = 2.5      # circular_constraint cutoff = factor * estimated_radius
 
     # Background (ring model)
     ring_size_factor: float = 1.5              # ring_radius = factor * (2*sigma + 1)
@@ -48,6 +52,7 @@ class CNMFeParams:
     # Merging
     merge_thr_corr: float = 0.85               # Min temporal correlation to merge
     merge_thr_overlap: float = 0.5             # Min Jaccard spatial overlap to merge
+    merge_centre_dist_factor: float = 2.0      # Centre-distance fallback = factor * sigma (px)
 
     # Main loop
     n_iter_main: int = 2                       # Full spatial+temporal+merge cycles
@@ -88,14 +93,20 @@ class CNMFe:
 | Attribute | Type | Shape | Description |
 |-----------|------|-------|-------------|
 | `A` | `sp.csc_matrix` | `(H·W, K)` | Spatial footprints |
-| `C` | `np.ndarray` | `(K, T)` | Denoised calcium traces |
+| `C` | `np.ndarray` | `(K, T)` | OASIS-deconvolved calcium traces (clean AR(1) shape) |
 | `S` | `np.ndarray` | `(K, T)` | Inferred spike trains |
-| `C_raw` | `np.ndarray` | `(K, T)` | Raw (pre-deconvolution) traces |
+| `C_raw` | `np.ndarray` | `(K_init, T)` | Raw traces from greedy init (pre-deconvolution); `K_init` may differ from final `K` after merging |
+| `YrA` | `np.ndarray` | `(K, T)` | Residual at each footprint after the final BCD pass. `C + YrA` is the noisy projected trace — preserves the data's actual shape better than `C` alone (Pearson r vs ground truth typically > 0.9 vs ~0.6 for `C`). |
 | `W` | `sp.csr_matrix` | `(H·W, H·W)` | Ring background weights |
 | `b0` | `np.ndarray` | `(H·W,)` | Per-pixel baseline |
 | `sn` | `np.ndarray` | `(H, W)` | Per-pixel noise std |
+| `g` | `list[np.ndarray]` | `K × (p,)` | Per-component AR coefficients used for OASIS (pooled estimate from `C_raw` then cached, not re-estimated each iteration) |
+| `sn_per_k` | `np.ndarray` | `(K,)` | Per-component noise std used for OASIS |
 | `shifts` | `np.ndarray \| None` | `(T, 2)` | Per-frame (dy, dx) shifts, or `None` |
 | `dims` | `tuple[int, int]` | — | `(H, W)` image dimensions |
+
+> [!TIP]
+> Use `model.C` for analyses that want a clean denoised AR(1) trace (e.g. event detection); use `model.C + model.YrA` when you need the data's actual shape (e.g. correlation against an external reference, plotting raw fluorescence).
 
 ---
 
@@ -313,10 +324,22 @@ def greedy_corr_pnr(
     border_px: int = 0,
     ar_order: int = 1,
     n_jobs: int = 1,
+    device: str = "cpu",
+    min_corr_neuron: float = 0.8,
+    max_corr_bg: float = 0.4,
+    seed_suppress_factor: float = 2.0,
+    circular_max_dist_factor: float = 2.5,
 ) -> tuple[sp.csc_matrix, np.ndarray, np.ndarray, np.ndarray]
 ```
 
 Greedy CORR-PNR neuron initialisation.
+
+| Parameter | Description |
+|-----------|-------------|
+| `min_corr_neuron` | Threshold for "neuron pixel" set inside the patch — pixels whose normalised trace correlates above this with the seed are pooled into the trace estimate. |
+| `max_corr_bg` | Threshold for "background pixel" set — pixels below this are used as the local-background regressor in the OLS extraction. |
+| `seed_suppress_factor` | After extracting a component, the CORR/PNR around its centre is zeroed within a disk of radius `max(seed_suppress_factor * sigma, 2*sigma + 1)` to prevent re-seeding on the same neuron's residual halo. |
+| `circular_max_dist_factor` | Footprint cleanup: zero pixels farther than `factor * sqrt(area / π)` from the centroid. |
 
 **Returns:** `(A, C, C_raw, centers)`
 
@@ -353,8 +376,9 @@ def extract_spatial_temporal(
     data_raw: np.ndarray,
     seed_rc: tuple[int, int],
     patch_radius: int,
-    min_corr_neuron: float = 0.9,
-    max_corr_bg: float = 0.3,
+    min_corr_neuron: float = 0.8,
+    max_corr_bg: float = 0.4,
+    circular_max_dist_factor: float = 2.5,
 ) -> tuple[np.ndarray, np.ndarray, bool]
 ```
 
@@ -422,13 +446,18 @@ def update_temporal(
     ar_order: int = 1,
     n_iter: int = 2,
     n_jobs: int = 1,
-) -> tuple[np.ndarray, np.ndarray]
+    device: str = "cpu",
+    g_cached: list[np.ndarray] | None = None,
+    sn_cached: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], np.ndarray]
 ```
 
-Block coordinate descent temporal refinement. **Returns** `(C_new, S)` both `(K, T)`.
+Block coordinate descent temporal refinement. **Returns** `(C, S, g_per_k, sn_per_k)` — denoised traces `(K, T)`, spike trains `(K, T)`, per-component AR coefs (list of length K), and per-component noise std `(K,)`.
 
 - `n_jobs=1`: Gauss-Seidel (sequential updates, slightly faster convergence)
 - `n_jobs!=1`: Jacobi (parallel, all components updated simultaneously)
+
+**`g_cached` / `sn_cached`**: pass pre-estimated AR coefficients and noise stds to skip per-call estimation. Critical for avoiding drift — without caching, `g` is re-estimated each call from the previously-deconvolved trace, and `estimate_ar_params` re-applies the `fudge_factor=0.96` shrinkage each time, drifting `g` toward 0 over iterations. The pipeline estimates `g` once after init from a pooled `C_raw.ravel()` trace and threads the cache through every call. If `None`, estimation runs once before the BCD loop on the input `C`.
 
 ---
 
@@ -471,12 +500,27 @@ def merge_components(
     thr_corr: float = 0.85,
     thr_overlap: float = 0.5,
     ar_order: int = 1,
-) -> tuple[sp.csc_matrix, np.ndarray, int]
+    sigma: float | None = None,
+    dims: tuple[int, int] | None = None,
+    centre_dist_factor: float = 2.0,
+    max_thr: float = 0.1,
+) -> tuple[sp.csc_matrix, np.ndarray, int, list[np.ndarray]]
 ```
 
-Merge spatially overlapping and temporally correlated components. **Returns** `(A_merged, C_merged, n_merged)`.
+Merge spatially overlapping and temporally correlated components.
 
-Two components are merged only when **both** conditions are met: Jaccard overlap > `thr_overlap` AND |Pearson r| > `thr_corr`. Merged trace is re-deconvolved with OASIS.
+**Returns:** `(A_merged, C_merged, n_merged, members_per_group)` — merged footprints `(H·W, K_new)`, traces `(K_new, T)`, count of merge events, and a list of length `K_new` where `members_per_group[j]` gives the original-component indices that fused into output component `j` (singletons for unmerged, length > 1 for merged). Use this to update any per-component cache (e.g. `g_per_k`).
+
+**Merge rule** (changed from earlier versions): two components merge if their traces are correlated **AND** they share spatial support **OR** sit close in centre-of-mass:
+
+```
+|Pearson(C[i], C[j])| > thr_corr  AND
+( Jaccard(i, j) > thr_overlap  OR  centre_dist(i, j) < centre_dist_factor * sigma )
+```
+
+The centre-distance fallback catches duplicate detections of the same neuron whose footprints, after `threshold_footprint` keeps only the largest connected component around different peak pixels, end up with disjoint supports (`Jaccard ≈ 0`) despite tracking the same trace.
+
+`sigma` and `dims` must be passed to enable the centre-distance fallback; otherwise only Jaccard is used. Merged footprints are re-thresholded via `threshold_footprint(max_thr=...)`. The merged trace is the mean of members (clipped non-negative) — re-deconvolution is **deferred** to the caller's next `update_temporal` pass, which uses the persistent per-component AR cache (re-estimating `g` here would re-introduce fudge-factor drift).
 
 ---
 

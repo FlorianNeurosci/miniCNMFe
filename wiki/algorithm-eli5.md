@@ -98,7 +98,9 @@ Given the updated shapes, re-fit each neuron's trace. For each neuron: take ever
 
 ### Merge duplicates (Merging)
 
-Sometimes two nearby seeds got picked for the same neuron. We check every pair of components: if they overlap spatially *and* their traces are highly correlated, they're probably the same neuron — merge them into one.
+Sometimes two nearby seeds got picked for the same neuron. We check every pair of components: if their traces look nearly identical, *and* either their footprints overlap *or* their centres of mass sit close together, they're probably the same neuron — merge them.
+
+> **Why both rules?** After cleaning up footprints (we threshold-and-keep-the-largest-blob), two duplicates of the same neuron can end up with no spatial overlap at all — each kept just the bright core around its own peak. The centre-distance rule catches these: even when the cleaned blobs don't touch, their centroids are still right next to each other.
 
 We do this whole update cycle 2–3 times until things stabilise.
 
@@ -125,10 +127,17 @@ We use an algorithm called **OASIS** (Online Active Set to Infer Spikes) — it'
 After all this, you have:
 
 - **A** — for each neuron: a map showing which pixels it covers (its "footprint")
-- **C** — for each neuron: its smooth calcium trace over time
+- **C** — for each neuron: its smooth calcium trace over time (denoised by OASIS into a clean AR(1) shape)
 - **S** — for each neuron: exactly when it fired (the spike train)
+- **YrA** — the *noisy* version of each calcium trace: what's left in the data at that footprint after subtracting all other neurons. `C + YrA` is the noisy-but-shape-faithful trace, useful when you want to compare against an external reference.
 
 > **Analogy:** Like unmixing a cocktail party recording into individual speakers (who is talking), when they spoke, and how loud each word was.
+
+### Wait, why two flavours of `C`?
+
+`C` is what OASIS *thinks* the calcium trace should look like, given the AR(1) decay model. It's clean, smooth, and ideal for spike analyses.
+
+`C + YrA` is what's actually *in the data* at that footprint. It's noisier, but its shape matches the underlying biology more faithfully — handy if you're correlating with another signal, or if your analysis cares about exact spike timing rather than smooth amplitude.
 
 ---
 
