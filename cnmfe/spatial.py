@@ -166,6 +166,7 @@ def update_spatial(
     dims: tuple[int, int],
     dilation_radius: int = 3,
     n_jobs: int = 1,
+    max_thr: float = 0.1,
 ) -> sp.csc_matrix:
     """Refine spatial footprints by per-pixel non-negative LASSO regression.
 
@@ -188,6 +189,7 @@ def update_spatial(
         dims: (H, W) spatial dimensions.
         dilation_radius: Footprint dilation for support computation.
         n_jobs: Number of parallel workers (-1 = all CPUs, 1 = serial).
+        max_thr: Pixels below max_thr * max(ai) are zeroed after LASSO.
 
     Returns:
         A_new: Updated sparse (H*W, K) footprints.
@@ -253,7 +255,7 @@ def update_spatial(
 
         ai_flat = np.zeros(n_pixels, dtype=np.float32)
         ai_flat[pixel_ids] = values
-        ai_flat = threshold_footprint(ai_flat, dims)
+        ai_flat = threshold_footprint(ai_flat, dims, max_thr=max_thr)
 
         nz = np.where(ai_flat > 0)[0]
         if len(nz) == 0:

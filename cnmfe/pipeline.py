@@ -52,6 +52,7 @@ class CNMFeParams:
 
     # --- Spatial update ---
     dilation_radius: int = 3
+    spatial_max_thr: float = 0.1    # Zero footprint pixels below this fraction of the peak
 
     # --- Temporal update / deconvolution ---
     ar_order: int = 1
@@ -59,6 +60,7 @@ class CNMFeParams:
 
     # --- Merging ---
     merge_thr_corr: float = 0.85
+    merge_thr_overlap: float = 0.5  # Min Jaccard spatial overlap to consider merging
 
     # --- Main loop ---
     n_iter_main: int = 2  # Full spatial + temporal + merge cycles
@@ -190,7 +192,7 @@ class CNMFe:
             Y_bg = subtract_background(Y_flat, W_mat, b0)  # (H*W, T)
 
             print("  Updating spatial footprints...")
-            A = update_spatial(Y_bg, C, A, sn_flat, dims, p.dilation_radius, p.n_jobs)
+            A = update_spatial(Y_bg, C, A, sn_flat, dims, p.dilation_radius, p.n_jobs, p.spatial_max_thr)
 
             # Remove dead components (all-zero footprints)
             nA = np.asarray(A.power(2).sum(axis=0)).ravel()
@@ -210,7 +212,7 @@ class CNMFe:
             )
 
             print("  Merging correlated components...")
-            A, C, n_merged = merge_components(A, C, thr_corr=p.merge_thr_corr)
+            A, C, n_merged = merge_components(A, C, thr_corr=p.merge_thr_corr, thr_overlap=p.merge_thr_overlap)
             if n_merged:
                 C, S = update_temporal(
                     Y_bg, A, C, sn_flat, p.ar_order, 1,

@@ -39,6 +39,7 @@ class CNMFeParams:
 
     # Spatial update
     dilation_radius: int = 3                   # Support dilation for LassoLars
+    spatial_max_thr: float = 0.1               # Zero footprint pixels < this fraction of peak
 
     # Temporal update / deconvolution
     ar_order: int = 1                          # AR model order (1 or 2)
@@ -46,12 +47,14 @@ class CNMFeParams:
 
     # Merging
     merge_thr_corr: float = 0.85               # Min temporal correlation to merge
+    merge_thr_overlap: float = 0.5             # Min Jaccard spatial overlap to merge
 
     # Main loop
     n_iter_main: int = 2                       # Full spatial+temporal+merge cycles
 
     # Parallelism
     n_jobs: int = 1                            # Workers (-1 = all CPUs, 1 = serial)
+    device: str = "cpu"                        # 'cpu' or 'cuda' (requires CuPy)
 ```
 
 ---
@@ -372,10 +375,13 @@ def update_spatial(
     dims: tuple[int, int],
     dilation_radius: int = 3,
     n_jobs: int = 1,
+    max_thr: float = 0.1,
 ) -> sp.csc_matrix
 ```
 
 Refine spatial footprints by per-pixel non-negative LassoLars regression. **Returns** updated `(H·W, K)` sparse matrix.
+
+`max_thr`: after regression, pixels whose value falls below `max_thr × peak` are zeroed. Lower values keep dim peripheral pixels; higher values produce tighter footprints.
 
 ---
 
@@ -464,10 +470,13 @@ def merge_components(
     C: np.ndarray,
     thr_corr: float = 0.85,
     thr_overlap: float = 0.5,
+    ar_order: int = 1,
 ) -> tuple[sp.csc_matrix, np.ndarray, int]
 ```
 
 Merge spatially overlapping and temporally correlated components. **Returns** `(A_merged, C_merged, n_merged)`.
+
+Two components are merged only when **both** conditions are met: Jaccard overlap > `thr_overlap` AND |Pearson r| > `thr_corr`. Merged trace is re-deconvolved with OASIS.
 
 ---
 
