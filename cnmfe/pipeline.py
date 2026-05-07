@@ -60,6 +60,7 @@ class CNMFeParams:
 
     # --- Temporal update / deconvolution ---
     ar_order: int = 1
+    global_ar: bool = True  # True = one g estimated from pooled C_raw; False = per-neuron
     n_iter_temporal: int = 2
 
     # --- Merging ---
@@ -203,19 +204,32 @@ class CNMFe:
         # re-apply the fudge_factor 0.96 multiplier to already-deconvolved
         # traces and drift g toward 0.
         K_init = A.shape[1]
-        try:
-            g_global, _ = estimate_ar_params(C_raw.ravel().astype(np.float32), p=p.ar_order)
-        except Exception:
-            g_global = np.array([0.9 ** (1.0 / max(p.ar_order, 1))] * p.ar_order, dtype=np.float32)
-
-        g_per_k: list[np.ndarray] = [g_global.copy() for _ in range(K_init)]
+        g_per_k: list[np.ndarray] = []
         sn_per_k = np.zeros(K_init, dtype=np.float32)
-        for k in range(K_init):
+
+        if p.global_ar:
             try:
-                _, sn_k = estimate_ar_params(C_raw[k], p=p.ar_order)
+                g_global, _ = estimate_ar_params(C_raw.ravel().astype(np.float32), p=p.ar_order)
             except Exception:
-                sn_k = float(np.std(C_raw[k])) if np.std(C_raw[k]) > 0 else 1.0
-            sn_per_k[k] = sn_k
+                g_global = np.array([0.9 ** (1.0 / max(p.ar_order, 1))] * p.ar_order,
+                                    dtype=np.float32)
+            for k in range(K_init):
+                g_per_k.append(g_global.copy())
+                try:
+                    _, sn_k = estimate_ar_params(C_raw[k], p=p.ar_order)
+                except Exception:
+                    sn_k = float(np.std(C_raw[k])) if np.std(C_raw[k]) > 0 else 1.0
+                sn_per_k[k] = sn_k
+        else:
+            for k in range(K_init):
+                try:
+                    g_k, sn_k = estimate_ar_params(C_raw[k], p=p.ar_order)
+                except Exception:
+                    g_k = np.array([0.9 ** (1.0 / max(p.ar_order, 1))] * p.ar_order,
+                                   dtype=np.float32)
+                    sn_k = float(np.std(C_raw[k])) if np.std(C_raw[k]) > 0 else 1.0
+                g_per_k.append(g_k)
+                sn_per_k[k] = sn_k
 
         # --- Step 5: Initial ring background ---
         ring_radius = p.ring_size_factor * (2 * p.sigma + 1)

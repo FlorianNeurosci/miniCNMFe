@@ -150,3 +150,24 @@ class TestCNMFePipeline:
         assert np.mean(rs_oasis) > 0.85, f"Mean r(C) = {np.mean(rs_oasis):.3f}"
         assert np.mean(rs_proj) > 0.85, f"Mean r(C+YrA) = {np.mean(rs_proj):.3f}"
         assert min(rs_proj) > 0.70, f"Min r(C+YrA) = {min(rs_proj):.3f}"
+
+    def test_per_neuron_ar_temporal_correlation(self, synth):
+        """Per-neuron AR estimation (global_ar=False) should recover traces as well as global."""
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.7, min_pnr=3.0,
+            n_iter_main=2, n_iter_temporal=2,
+            global_ar=False,
+        )
+        model = CNMFe(params).fit(synth["movie"], do_motion_correction=False)
+        matches = match_components(model.A, synth["A_true"])
+
+        def pearson(a, b):
+            a = a - a.mean(); b = b - b.mean()
+            d = np.sqrt(np.sum(a ** 2) * np.sum(b ** 2))
+            return float(np.dot(a, b) / d) if d > 0 else 0.0
+
+        valid = [(kt, ke) for kt, ke, sc in matches if sc > 0.5]
+        assert len(valid) >= 5, f"Only {len(valid)}/6 truth neurons recovered"
+
+        rs_proj = [pearson((model.C + model.YrA)[ke], synth["C_true"][kt]) for kt, ke in valid]
+        assert np.mean(rs_proj) > 0.85, f"Mean r(C+YrA) per-neuron AR = {np.mean(rs_proj):.3f}"
