@@ -36,6 +36,9 @@ class CNMFeParams:
     mc_n_iter: int = 2
     mc_template_frames: int = 200
     mc_gSig_filt: float | None = None  # 1p high-pass sigma; set ≈ sigma to enable
+    mc_roi: "tuple[slice, slice] | None" = None   # manual (y_slice, x_slice) for shift estimation
+    mc_auto_roi: bool = False           # auto-detect neuron-dense ROI via select_roi()
+    mc_auto_roi_frac: float = 0.5      # crop fraction (H and W) for auto-detection
 
     # --- Spatial filtering / PSF ---
     sigma: float = 3.0        # Gaussian sigma in pixels (neuron size)
@@ -118,6 +121,7 @@ class CNMFe:
         self.dims: tuple[int, int] | None = None
         self.g: list[np.ndarray] | None = None    # per-component AR coefs
         self.sn_per_k: np.ndarray | None = None   # per-component noise std
+        self.mc_roi: "tuple[slice, slice] | None" = None  # ROI used for shift estimation
 
     def fit_mc(
         self,
@@ -147,6 +151,14 @@ class CNMFe:
         T, H, W = movie_arr.shape
         self.dims = (H, W)
 
+        roi = p.mc_roi
+        if p.mc_auto_roi and roi is None:
+            from cnmfe.motion_correction import select_roi
+            print("Auto-selecting neuron-dense ROI for shift estimation...")
+            roi = select_roi(movie_arr, frac_h=p.mc_auto_roi_frac, frac_w=p.mc_auto_roi_frac)
+            print(f"  ROI: y={roi[0].start}:{roi[0].stop}  x={roi[1].start}:{roi[1].stop}")
+        self.mc_roi = roi
+
         mc_path = Path(output_dir) / "mc.zarr" if output_dir else None
         corrected, self.shifts = motion_correct(
             movie_arr,
@@ -158,6 +170,7 @@ class CNMFe:
             n_jobs=p.n_jobs,
             device=p.device,
             gSig_filt=p.mc_gSig_filt,
+            roi=roi,
         )
         # When output_path is set, motion_correct() writes corrected_buf to
         # zarr and returns the zarr handle.  Returning it directly allows the

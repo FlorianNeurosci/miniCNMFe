@@ -189,13 +189,93 @@ def _shift_and_correct_frame(
     upsample_factor: int,
     max_shift: tuple[int, int],
     gSig_filt: float | None = None,
+    roi: "tuple[slice, slice] | None" = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Estimate and apply shift for one frame (module-level for pickling).
 
     Always uses CPU (numpy). Used by the joblib parallel path.
+
+    Args:
+        template: already cropped to roi when roi is set (caller's responsibility).
+        roi: if set, crop frame before shift estimation; shift is applied to full frame.
     """
-    shift = estimate_shifts(frame, template, upsample_factor, max_shift, gSig_filt)
+    frame_for_est = frame[roi] if roi is not None else frame
+    shift = estimate_shifts(frame_for_est, template, upsample_factor, max_shift, gSig_filt)
     return to_numpy(apply_shift(frame, shift)), shift
+
+
+def select_roi(
+    movie: "zarr.Array | np.ndarray",
+    frac_h: float = 0.5,
+    frac_w: float = 0.5,
+    n_frames: int = 800,
+    border_margin: int = 40,
+    hp_sigma: float = 25.0,
+    blob_sigma: float = 3.0,
+    use_blobness: bool = False,
+) -> "tuple[slice, slice]":
+    """Find the most neuron-dense rectangular crop of the movie.
+
+    Strategy:
+    1. Temporal-std image on a subsampled movie (neurons flicker; background is slow).
+    2. Spatial high-pass (subtract Gaussian blur) to remove broad gradients.
+    3. Optional LoG blobness filter to further favour blob-shaped structures.
+    4. Mask borders to avoid edge artefacts winning.
+    5. Find the crop of size (frac_h*H, frac_w*W) with highest total score via
+       an integral-image (O(H*W) vectorised, no Python loop).
+
+    Args:
+        movie: (T, H, W) zarr or numpy array.
+        frac_h: Crop height as a fraction of H.
+        frac_w: Crop width as a fraction of W.
+        n_frames: Number of evenly-spaced frames for the std image.
+        border_margin: Pixels excluded from each edge of the score map.
+        hp_sigma: Gaussian sigma for the background-subtraction high-pass.
+        blob_sigma: LoG sigma used when use_blobness=True.
+        use_blobness: Apply LoG on top of the high-passed std image to prefer
+                      blob-shaped structures over vessels or bright edges.
+
+    Returns:
+        (y_slice, x_slice) — the best crop as a pair of slice objects.
+    """
+    from scipy.ndimage import gaussian_filter, gaussian_laplace
+
+    T = len(movie)
+    H, W = np.asarray(movie[0]).shape
+
+    stride    = max(1, T // n_frames)
+    t_idx     = np.arange(0, T, stride)
+    frames    = np.asarray(movie[t_idx], dtype=np.float32)   # (N, H, W)
+
+    # Temporal std: neurons flicker; background is slow
+    score_map = frames.std(axis=0)
+
+    # Spatial high-pass: remove slow background gradients
+    bg        = gaussian_filter(score_map, sigma=hp_sigma)
+    score_map = np.clip(score_map - bg, 0, None)
+
+    # Optional LoG blobness to prefer compact blob-like structures
+    if use_blobness:
+        score_map = np.clip(-gaussian_laplace(score_map, sigma=blob_sigma), 0, None)
+
+    # Mask borders
+    m = border_margin
+    if m > 0:
+        score_map[:m, :]  = 0
+        score_map[-m:, :] = 0
+        score_map[:, :m]  = 0
+        score_map[:, -m:] = 0
+
+    # Best crop via integral image (vectorised sliding-window sum)
+    crop_h = min(max(8, int(H * frac_h)), H)
+    crop_w = min(max(8, int(W * frac_w)), W)
+    ii  = np.pad(score_map, ((1, 0), (1, 0)), mode="constant").cumsum(0).cumsum(1)
+    y2  = np.arange(crop_h, H + 1)[:, None]
+    x2  = np.arange(crop_w, W + 1)[None, :]
+    y1, x1 = y2 - crop_h, x2 - crop_w
+    sums = ii[y2, x2] - ii[y1, x2] - ii[y2, x1] + ii[y1, x1]
+    y0, x0 = np.unravel_index(sums.argmax(), sums.shape)
+    return slice(int(y0), int(y0) + crop_h), slice(int(x0), int(x0) + crop_w)
 
 
 def motion_correct(
@@ -209,6 +289,7 @@ def motion_correct(
     n_jobs: int = 1,
     device: str = "cpu",
     gSig_filt: float | None = None,
+    roi: "tuple[slice, slice] | None" = None,
 ) -> tuple["zarr.Array", np.ndarray]:
     """Rigidly motion-correct a (T, H, W) movie.
 
@@ -246,6 +327,10 @@ def motion_correct(
                 recommended for 1p miniscope data (slow background otherwise
                 corrupts low-frequency phase). The shift is applied to the
                 unfiltered original frame.
+        roi: optional (y_slice, x_slice). When given, shift estimation uses only
+                the cropped sub-region (e.g. a neuron-dense area found by
+                select_roi()), while the shift is applied to the full frame.
+                Use select_roi() to find a good crop automatically.
 
     Returns:
         corrected: zarr.Array (or np.ndarray) of shape (T, H, W).
@@ -260,6 +345,8 @@ def motion_correct(
     n_init = min(template_frames, T)
     init_frames = np.asarray(movie[:n_init], dtype=np.float32)
     template = init_frames.mean(axis=0)
+    # Pre-crop template once; all workers receive the cropped version.
+    template_for_est = template[roi] if roi is not None else template
 
     cumulative_shifts = np.zeros((T, 2), dtype=np.float32)
     corrected_buf = np.empty((T, H, W), dtype=np.float32)
@@ -279,18 +366,19 @@ def motion_correct(
                 # GPU path: estimate shifts on CPU, apply on GPU
                 results = []
                 for frame in batch:
-                    shift = estimate_shifts(frame, template, upsample_factor, max_shift, gSig_filt)
+                    frame_for_est = frame[roi] if roi is not None else frame
+                    shift = estimate_shifts(frame_for_est, template_for_est, upsample_factor, max_shift, gSig_filt)
                     corrected_frame = to_numpy(apply_shift(frame, shift, xp=xp))
                     results.append((corrected_frame, shift))
             elif n_jobs == 1:
                 results = [
-                    _shift_and_correct_frame(frame, template, upsample_factor, max_shift, gSig_filt)
+                    _shift_and_correct_frame(frame, template_for_est, upsample_factor, max_shift, gSig_filt, roi)
                     for frame in batch
                 ]
             else:
                 results = Parallel(n_jobs=n_jobs)(
                     delayed(_shift_and_correct_frame)(
-                        frame, template, upsample_factor, max_shift, gSig_filt
+                        frame, template_for_est, upsample_factor, max_shift, gSig_filt, roi
                     )
                     for frame in batch
                 )
