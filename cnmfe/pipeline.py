@@ -77,6 +77,13 @@ class CNMFeParams:
     n_jobs: int = 1      # Workers for pixel-parallel steps (-1 = all CPUs)
     device: str = "cpu"  # 'cpu' or 'cuda' (requires CuPy + CUDA GPU)
 
+    # --- Statistics sampling ---
+    sample_frames: int = 1000  # Max frames used for noise + CORR/PNR (evenly sampled when T > this)
+
+    # --- Speed / accuracy trade-offs ---
+    skip_first_deconv: bool = True  # Use NNLS (p=0) for first temporal pass; OASIS on all others
+    bg_tsub: int = 5                # Temporal subsampling factor for ring-background W solve
+
 
 class CNMFe:
     """Clean CNMFe for 1-photon calcium imaging.
@@ -151,14 +158,23 @@ class CNMFe:
             )
             movie_arr = np.asarray(movie_arr, dtype=np.float32)
 
+        # --- Steps 2-3: sample frames for statistics if T > sample_frames ---
+        T = len(movie_arr)
+        stride = max(1, T // p.sample_frames)
+        if stride > 1:
+            t_idx = np.arange(0, T, stride)
+            stats_movie = np.stack(movie_arr[t_idx])
+        else:
+            stats_movie = movie_arr
+
         # --- Step 2: Noise estimation ---
         print("Estimating noise...")
-        self.sn = estimate_noise(movie_arr)   # (H, W)
+        self.sn = estimate_noise(stats_movie)   # (H, W)
 
         # --- Step 3: Summary images ---
         print("Computing CORR and PNR images...")
         cn, pnr = correlation_pnr(
-            movie_arr, sigma=p.sigma, center_psf=p.center_psf,
+            stats_movie, sigma=p.sigma, center_psf=p.center_psf,
             n_jobs=p.n_jobs, device=p.device,
         )
 
@@ -237,10 +253,11 @@ class CNMFe:
 
         # --- Step 5: Initial ring background ---
         ring_radius = p.ring_size_factor * (2 * p.sigma + 1)
-        print(f"Fitting ring-model background (radius={ring_radius:.1f}px)...")
+        print(f"Fitting ring-model background (radius={ring_radius:.1f}px, tsub={p.bg_tsub})...")
         W_mat, b0 = compute_W(
             Y_flat, A, C, dims, ring_radius,
             lambda_reg=p.ring_lambda, n_jobs=p.n_jobs, device=p.device,
+            tsub=p.bg_tsub,
         )
 
         def _cache_after_merge(members_per_group: list[np.ndarray]) -> None:
@@ -298,10 +315,12 @@ class CNMFe:
                 break
 
             print("  Updating temporal traces...")
+            _deconvolve = (iteration > 0) or (not p.skip_first_deconv)
             C, S, g_per_k, sn_per_k = update_temporal(
                 Y_bg, A, C, sn_flat, p.ar_order, p.n_iter_temporal,
                 n_jobs=p.n_jobs, device=p.device,
                 g_cached=g_per_k, sn_cached=sn_per_k,
+                deconvolve=_deconvolve,
             )
 
             print("  Merging correlated components...")
@@ -320,13 +339,15 @@ class CNMFe:
                     Y_bg, A, C, sn_flat, p.ar_order, 1,
                     n_jobs=p.n_jobs, device=p.device,
                     g_cached=g_per_k, sn_cached=sn_per_k,
+                    deconvolve=True,
                 )
             print(f"  {A.shape[1]} components ({n_merged} merged).")
 
-            # Update background with refined components
+            # Refit background with refined components (W solve is fast with bg_tsub)
             W_mat, b0 = compute_W(
                 Y_flat, A, C, dims, ring_radius,
                 lambda_reg=p.ring_lambda, n_jobs=p.n_jobs, device=p.device,
+                tsub=p.bg_tsub,
             )
 
         # Final deconvolution pass to get spike trains

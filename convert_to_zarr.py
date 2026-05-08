@@ -32,7 +32,7 @@ def main() -> None:
             print(f"  {avi_path.name}: zarr already exists, skipping")
             continue
         print(f"  {avi_path.name} → {zarr_path.name} …", end=" ", flush=True)
-        z = avi_to_zarr(avi_path, zarr_path, chunk_t=100, grayscale=True, dtype="float32")
+        z = avi_to_zarr(avi_path, zarr_path, chunk_t=100, grayscale=True)
         print(f"shape={z.shape}  chunks={z.chunks}")
 
     print("\nDone. Open zarrs lazily with  cnmfe.io.open_zarr('demo_movies/<name>.zarr')")

@@ -145,17 +145,25 @@ movie_arr (T, H, W)  +  shifts (T, 2)
 
 Each step that supports `n_jobs` uses `joblib.Parallel` with the `loky` backend (process-based, Windows-compatible). Worker functions are defined at **module level** to be picklable.
 
-| Function | What is parallelised | Worker |
-|----------|---------------------|--------|
-| `correlation_pnr` | PSF convolution per frame | `scipy.ndimage.convolve` |
-| `motion_correct` | Per-frame shift estimate+apply | `_shift_and_correct_frame` |
-| `compute_W` | Ridge regression per pixel batch | `_ring_pixel_batch` |
-| `update_spatial` | LassoLars per pixel batch | `_spatial_pixel_batch` |
-| `update_temporal` | OASIS deconvolution per component | `_deconvolve_with` |
-| `greedy_corr_pnr` | Initial PSF filtering per frame | `scipy.ndimage.convolve` |
+Parallelism is **axis-aligned** — partitioning along frames, flattened pixels, or neurons depending on the step. The full FOV is always processed as one piece; there is no spatial tiling.
+
+| Step | Axis | Worker | Unit of work |
+|------|------|--------|--------------|
+| `correlation_pnr` (PSF conv) | frames (T) | `scipy.ndimage.convolve` | one frame |
+| `greedy_corr_pnr` (PSF conv) | frames (T) | `scipy.ndimage.convolve` | one frame |
+| `motion_correct` | frames (T) | `_shift_and_correct_frame` | one frame |
+| `compute_W` (ring background) | pixels (H·W) | `_ring_pixel_batch` | 500 pixels per batch |
+| `update_spatial` | pixels (H·W) | `_spatial_pixel_batch` | 256 pixels per batch |
+| `update_temporal` (OASIS) | neurons (K) | `_deconvolve_with` | one component |
 
 > [!WARNING]
-> On Windows, `n_jobs != 1` always forks via `spawn` (no fork). Avoid large global state; prefer passing arguments explicitly. The greedy loop itself is always sequential.
+> On Windows, `n_jobs != 1` uses `spawn` (no fork). Avoid large global state; prefer passing arguments explicitly. The greedy seed loop in `greedy_corr_pnr` is itself sequential — only the per-frame PSF convolution that feeds it is parallel. OASIS is sequential along T per component (cannot be parallelised within a trace), only across K.
+
+### Why axis-aligned and not patch-based (vs CaImAn)
+
+CaImAn's `rf` parallelism splits the FOV into overlapping spatial tiles, runs full CNMF per tile in parallel, then stitches. That scales to FOVs that don't fit in RAM, at the cost of edge artefacts and a stitching/merge step across patch boundaries.
+
+`cnmfe/` parallelises along T / pixels / K instead. Every step sees the whole FOV, so there is no boundary stitching and no patch-boundary duplicate components — but the in-memory `(T, H, W)` movie is the hard ceiling. Motion correction already streams from zarr; the BCD stages (`update_spatial`, `update_temporal`, `compute_W`) currently require the full movie in RAM. For very large recordings, adding patch-based parallelism or zarr-streamed BCD would be the natural extensions.
 
 ---
 

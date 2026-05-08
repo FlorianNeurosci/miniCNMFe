@@ -11,7 +11,11 @@ The AVI files are sorted by the integer embedded in their filename:
 Files whose names are not purely numeric (e.g. "preview.avi") are skipped
 unless you pass --pattern to change the glob.
 
-Output zarr is time-chunked (100 frames/chunk), float32, shape (T_total, H, W).
+
+
+Output zarr is time-chunked (100 frames/chunk), uint8, shape (T_total, H, W),
+with lossless blosc lz4+bitshuffle compression. Use --dtype float32 for
+float-valued intermediates.
 It can be opened lazily with  cnmfe.io.open_zarr(output_path).
 """
 
@@ -25,12 +29,12 @@ import numpy as np
 
 
 def _iter_frames(path: Path, grayscale: bool = True):
-    """Yield float32 frames from a single AVI file."""
+    """Yield frames from a single AVI file in their natural dtype."""
     import imageio.v3 as iio
     for frame in iio.imiter(str(path), plugin="pyav"):
-        frame = np.asarray(frame, dtype=np.float32)
+        frame = np.asarray(frame)  # keep natural dtype (uint8 for 8-bit AVIs)
         if grayscale and frame.ndim == 3:
-            frame = frame.mean(axis=-1)
+            frame = frame.mean(axis=-1)  # store assignment handles final cast
         yield frame
 
 
@@ -64,6 +68,8 @@ def main() -> None:
                         help="Glob pattern for AVI files (default: *.avi)")
     parser.add_argument("--chunk-t", type=int, default=100,
                         help="Frames per time chunk in zarr (default: 100)")
+    parser.add_argument("--dtype", default="uint8",
+                        help="On-disk dtype (default: uint8; use float32 for float intermediates)")
     parser.add_argument("--color", action="store_true",
                         help="Keep colour channels (default: convert to grayscale)")
     args = parser.parse_args()
@@ -73,6 +79,7 @@ def main() -> None:
         parser.error(f"Not a directory: {folder}")
 
     grayscale = not args.color
+    dtype: str = args.dtype
 
     # --- Collect AVI files, sort numerically --------------------------------
     candidates = sorted(folder.glob(args.pattern), key=_numeric_key)
@@ -112,13 +119,14 @@ def main() -> None:
         print("Delete it first if you want to overwrite.")
         return
 
-    import zarr
-    store = zarr.open_array(str(out_path), mode="w",
-                            shape=(T_total, ref_H, ref_W),
-                            chunks=(args.chunk_t, ref_H, ref_W),
-                            dtype="float32")
+    from cnmfe.io import _open_array
+    store = _open_array(out_path, "w",
+                        shape=(T_total, ref_H, ref_W),
+                        chunks=(args.chunk_t, ref_H, ref_W),
+                        dtype=dtype,
+                        compression=True)
     print(f"\nWriting -> {out_path}")
-    print(f"  shape={store.shape}  chunks={store.chunks}", flush=True)
+    print(f"  shape={store.shape}  chunks={store.chunks}  dtype={dtype}", flush=True)
 
     # --- Stream each AVI into the zarr -------------------------------------
     write_start = 0
@@ -127,7 +135,7 @@ def main() -> None:
     def _flush(buf: list, start: int) -> int:
         if not buf:
             return start
-        batch = np.stack(buf, axis=0)
+        batch = np.stack(buf, axis=0).astype(dtype)
         end = start + len(batch)
         store[start:end] = batch
         return end

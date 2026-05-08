@@ -184,6 +184,7 @@ def compute_W(
     lambda_reg: float = 1e-5,
     n_jobs: int = 1,
     device: str = "cpu",
+    tsub: int = 1,
 ) -> tuple[sp.csr_matrix, np.ndarray]:
     """Fit ring-model weights W and per-pixel baseline b0.
 
@@ -217,11 +218,18 @@ def compute_W(
     b0 = X.mean(axis=1)
     X -= b0[:, np.newaxis]
 
+    # Optionally subsample time for the expensive BTB = B @ B.T solve.
+    # b0 is kept from the full T; only the ring regression uses fewer frames.
+    # Cap tsub so at least 200 frames are used (prevents noisy W on short movies).
+    n_T = X.shape[1]
+    actual_tsub = max(1, min(tsub, n_T // 200)) if tsub > 1 else 1
+    X_fit = X[:, ::actual_tsub] if actual_tsub > 1 else X
+
     ring_idx = build_ring_indices(dims, radius)
 
     if xp is not np:
         # GPU path: vectorized batched solve grouped by ring size
-        rows_list, cols_list, data_list = _compute_W_gpu(X, ring_idx, lambda_reg, xp)
+        rows_list, cols_list, data_list = _compute_W_gpu(X_fit, ring_idx, lambda_reg, xp)
     else:
         # CPU path: serial or joblib-parallel batches
         batch_size = 500
@@ -234,12 +242,12 @@ def compute_W(
             raw_results: list[tuple[int, np.ndarray, np.ndarray]] = []
             for start, end in batches:
                 raw_results.extend(
-                    _ring_pixel_batch(start, X[start:end], ring_idx[start:end], X, lambda_reg)
+                    _ring_pixel_batch(start, X_fit[start:end], ring_idx[start:end], X_fit, lambda_reg)
                 )
         else:
             from joblib import Parallel, delayed
             batch_lists = Parallel(n_jobs=n_jobs)(
-                delayed(_ring_pixel_batch)(start, X[start:end], ring_idx[start:end], X, lambda_reg)
+                delayed(_ring_pixel_batch)(start, X_fit[start:end], ring_idx[start:end], X_fit, lambda_reg)
                 for start, end in batches
             )
             raw_results = [item for batch in batch_lists for item in batch]

@@ -247,6 +247,7 @@ def update_temporal(
     device: str = "cpu",
     g_cached: list[np.ndarray] | None = None,
     sn_cached: np.ndarray | None = None,
+    deconvolve: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], np.ndarray]:
     """Refine temporal traces by block coordinate descent.
 
@@ -329,7 +330,11 @@ def update_temporal(
         for _ in range(n_iter):
             for k in range(K):
                 trace_k = (YrA[:, k] / nA[k] + C[k]).astype(np.float32)
-                c_k, s_k = _deconvolve_with(trace_k, g_per_k[k], float(sn_per_k[k]))
+                if deconvolve:
+                    c_k, s_k = _deconvolve_with(trace_k, g_per_k[k], float(sn_per_k[k]))
+                else:
+                    c_k = np.maximum(trace_k, 0.0)
+                    s_k = np.zeros_like(c_k)
                 delta = c_k - C[k]
                 YrA -= np.outer(delta, AA[:, k])
                 C[k] = c_k
@@ -340,10 +345,16 @@ def update_temporal(
         # Jacobi: all K components deconvolved in parallel, then YrA updated
         for _ in range(n_iter):
             traces = [(YrA[:, k] / nA[k] + C[k]).astype(np.float32) for k in range(K)]
-            results = Parallel(n_jobs=n_jobs)(
-                delayed(_deconvolve_with)(traces[k], g_per_k[k], float(sn_per_k[k]))
-                for k in range(K)
-            )
+            if deconvolve:
+                results = Parallel(n_jobs=n_jobs)(
+                    delayed(_deconvolve_with)(traces[k], g_per_k[k], float(sn_per_k[k]))
+                    for k in range(K)
+                )
+            else:
+                results = [
+                    (np.maximum(traces[k], 0.0), np.zeros_like(traces[k]))
+                    for k in range(K)
+                ]
             for k, (c_k, s_k) in enumerate(results):
                 delta = c_k - C[k]
                 YrA -= np.outer(delta, AA[:, k])

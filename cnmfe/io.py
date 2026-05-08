@@ -16,19 +16,43 @@ from typing import Iterator
 
 import numpy as np
 import zarr
+import zarr.codecs as zcodecs
 
 from cnmfe._utils import ensure_float32, iter_frames
 
 
-def _open_array(path: Path, mode: str, shape=None, chunks=None, dtype=None) -> zarr.Array:
-    """Create or open a zarr array using v3 API without optional codecs."""
+def _open_array(
+    path: Path,
+    mode: str,
+    shape=None,
+    chunks=None,
+    dtype=None,
+    compression: bool = True,
+) -> zarr.Array:
+    """Create or open a zarr array using v3 API.
+
+    When compression=True (default) uses blosc+lz4+bitshuffle — lossless,
+    fast to decompress, and typically 2–10× smaller than uncompressed float32
+    or uint8 imaging data.
+    """
     if mode == "w":
+        codecs = None
+        if compression:
+            codecs = [
+                zcodecs.BytesCodec(),
+                zcodecs.BloscCodec(
+                    cname="lz4",
+                    clevel=5,
+                    shuffle=zcodecs.BloscShuffle.bitshuffle,
+                ),
+            ]
         return zarr.open_array(
             str(path),
             mode="w",
             shape=shape,
             chunks=chunks,
             dtype=dtype,
+            codecs=codecs,
         )
     else:
         return zarr.open_array(str(path), mode=mode)
@@ -43,19 +67,26 @@ def avi_to_zarr(
     dest: str | Path,
     chunk_t: int = 100,
     grayscale: bool = True,
-    dtype: str = "float32",
+    dtype: str = "uint8",
+    compression: bool = True,
 ) -> zarr.Array:
     """Convert AVI/MP4 to a time-chunked zarr store.
 
     Reads frames one batch at a time via imageio-ffmpeg — the full movie is
     never in memory at once. Grayscale conversion averages RGB channels.
 
+    The default dtype is uint8 (matching the natural bit depth of miniscope
+    AVIs). The pipeline loads with np.asarray(movie, dtype=np.float32) so the
+    float32 conversion happens in RAM, not on disk — keeping the zarr 4× smaller.
+    Compression is lossless (blosc lz4 + bitshuffle).
+
     Args:
         src: Path to AVI/MP4 file.
         dest: Output zarr store path (directory). Created if absent.
         chunk_t: Number of frames per time chunk.
         grayscale: Average RGB channels to produce (T, H, W) output.
-        dtype: Output dtype for the zarr array.
+        dtype: On-disk dtype (default "uint8" for 8-bit miniscope data).
+        compression: Use blosc lz4+bitshuffle compression (default True).
 
     Returns:
         Open zarr.Array with shape (T, H, W).
@@ -75,7 +106,8 @@ def avi_to_zarr(
     else:
         H, W = int(_s[0]), int(_s[1])
 
-    store = _open_array(dest, "w", shape=(T, H, W), chunks=(chunk_t, H, W), dtype=dtype)
+    store = _open_array(dest, "w", shape=(T, H, W), chunks=(chunk_t, H, W),
+                        dtype=dtype, compression=compression)
 
     for start, batch in _read_video_batches(src, batch_size=chunk_t, grayscale=grayscale):
         end = min(start + len(batch), T)
@@ -93,9 +125,9 @@ def _read_video_batches(
     start = 0
     idx = 0
     for frame in iio.imiter(path, plugin="pyav"):
-        frame = np.asarray(frame, dtype=np.float32)
+        frame = np.asarray(frame)  # keep natural dtype (uint8 for 8-bit AVIs)
         if grayscale and frame.ndim == 3:
-            frame = frame.mean(axis=-1)
+            frame = frame.mean(axis=-1)  # caller's .astype(dtype) handles final cast
         frames.append(frame)
         idx += 1
         if len(frames) == batch_size:
@@ -133,6 +165,7 @@ def save_zarr(
     path: str | Path,
     chunk_t: int = 100,
     dtype: str = "float32",
+    compression: bool = True,
 ) -> zarr.Array:
     """Persist an in-memory (T, H, W) array to a zarr store.
 
@@ -141,7 +174,8 @@ def save_zarr(
     """
     arr = ensure_float32(arr) if dtype == "float32" else arr.astype(dtype)
     T, H, W = arr.shape
-    store = _open_array(Path(path), "w", shape=(T, H, W), chunks=(chunk_t, H, W), dtype=dtype)
+    store = _open_array(Path(path), "w", shape=(T, H, W), chunks=(chunk_t, H, W),
+                        dtype=dtype, compression=compression)
     for start, batch in iter_frames(arr, batch_size=chunk_t):
         end = start + len(batch)
         store[start:end] = batch
