@@ -240,8 +240,8 @@ def select_roi(
     """
     from scipy.ndimage import gaussian_filter, gaussian_laplace
 
-    T = len(movie)
-    H, W = np.asarray(movie[0]).shape
+    T = movie.shape[0]
+    H, W = movie.shape[1], movie.shape[2]
 
     stride    = max(1, T // n_frames)
     t_idx     = np.arange(0, T, stride)
