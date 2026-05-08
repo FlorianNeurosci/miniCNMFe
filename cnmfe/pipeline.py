@@ -34,6 +34,8 @@ class CNMFeParams:
     max_shift: tuple[int, int] = (20, 20)
     upsample_factor: int = 10
     mc_n_iter: int = 2
+    mc_template_frames: int = 200
+    mc_gSig_filt: float | None = None  # 1p high-pass sigma; set ≈ sigma to enable
 
     # --- Spatial filtering / PSF ---
     sigma: float = 3.0        # Gaussian sigma in pixels (neuron size)
@@ -141,9 +143,11 @@ class CNMFe:
                 upsample_factor=p.upsample_factor,
                 max_shift=p.max_shift,
                 n_iter=p.mc_n_iter,
+                template_frames=p.mc_template_frames,
                 output_path=mc_path,
                 n_jobs=p.n_jobs,
                 device=p.device,
+                gSig_filt=p.mc_gSig_filt,
             )
             movie_arr = np.asarray(movie_arr, dtype=np.float32)
 

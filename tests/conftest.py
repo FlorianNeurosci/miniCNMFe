@@ -16,6 +16,7 @@ def make_synthetic_movie(
     ar_decay: float = 0.9,
     bg_strength: float = 1.5,
     sigma_neuron: float = 3.0,
+    motion_max_shift: float = 0.0,
     seed: int = 42,
 ) -> dict:
     """Generate a synthetic 1-photon calcium imaging movie with known ground truth.
@@ -77,15 +78,35 @@ def make_synthetic_movie(
     Y_flat += rng.standard_normal(Y_flat.shape).astype(np.float32) * noise_std
     movie = Y_flat.T.reshape(T, H, W)  # (T, H, W)
 
+    movie = movie.astype(np.float32)
+
+    if motion_max_shift > 0:
+        from scipy.ndimage import uniform_filter1d
+        from cnmfe.motion_correction import apply_shift as _apply_shift
+        rng_m = np.random.default_rng(seed + 1)
+        steps = rng_m.normal(0, motion_max_shift / 10, size=(T, 2)).astype(np.float64)
+        drift = np.cumsum(steps, axis=0)
+        drift = uniform_filter1d(drift, size=max(1, T // 20), axis=0)
+        peak = np.abs(drift).max()
+        if peak > 0:
+            drift = drift * (motion_max_shift / peak)
+        drift = drift.astype(np.float32)
+        movie = np.stack([_apply_shift(movie[t], drift[t]) for t in range(T)],
+                         axis=0).astype(np.float32)
+        motion_shifts = drift
+    else:
+        motion_shifts = np.zeros((T, 2), dtype=np.float32)
+
     return {
-        "movie": movie.astype(np.float32),
-        "A_true": A_true,
-        "C_true": C_true,
-        "S_true": S_true,
-        "centers": np.array(centers, dtype=np.int32),
-        "sn_true": float(noise_std),
-        "ar_decay": float(ar_decay),
-        "dims": dims,
+        "movie":         movie,
+        "A_true":        A_true,
+        "C_true":        C_true,
+        "S_true":        S_true,
+        "centers":       np.array(centers, dtype=np.int32),
+        "sn_true":       float(noise_std),
+        "ar_decay":      float(ar_decay),
+        "motion_shifts": motion_shifts,
+        "dims":          dims,
     }
 
 

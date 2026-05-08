@@ -17,7 +17,7 @@ algorithmic reference only. All math is reimplemented from scratch with numpy/sc
 
 ## Current status
 
-**Complete and working.** All 77 tests pass:
+**Complete and working.** All 78 tests pass:
 
 ```bash
 pytest tests/ -v
@@ -27,10 +27,12 @@ Major work done so far:
 - Full pipeline: motion correction → CORR/PNR → greedy init → ring background → spatial/temporal refinement → merging
 - `n_jobs` CPU parallelism via joblib (every bottleneck step)
 - `device="cuda"` GPU acceleration via CuPy (opt-in, falls back gracefully)
-- Algorithm bugs fixed: greedy-init over-detection, silent-merge failure, temporal-trace AR-coefficient drift (see *Bugs already fixed* below)
+- Algorithm bugs fixed: greedy-init over-detection, silent-merge failure, temporal-trace AR-coefficient drift, `avi_to_zarr` imageio v3 shape (see *Bugs already fixed* below)
 - Two trace flavours exposed: `model.C` (OASIS-deconvolved) and `model.C + model.YrA` (noisy projected trace)
-- Realistic miniscope simulator (`tests/miniscope_simulator.py`) with multi-component drifting bg, ghost cells, vasculature, vignetting, photobleaching, shot noise, 8-bit quantisation
-- Three tutorials: `tutorial.ipynb`, `tutorial2.ipynb` (clean rewrite), `tutorial_realistic.ipynb` (uses the realistic simulator), and a CaImAn-comparison notebook (`tutorial_caiman_compare.ipynb`, ready-to-run, requires CaImAn installed separately)
+- Realistic miniscope simulator (`tests/miniscope_simulator.py`) with multi-component drifting bg, ghost cells, vasculature, vignetting, photobleaching, shot noise, 8-bit quantisation, and optional inter-frame motion drift (`motion_max_shift` param)
+- Four tutorials: `tutorial.ipynb`, `tutorial2.ipynb` (clean rewrite), `tutorial_realistic.ipynb` (uses the realistic simulator), `tutorial_caiman_compare.ipynb` (CaImAn side-by-side, requires CaImAn), and `tutorial_demo.ipynb` (realistic lazy-load AVI workflow)
+- Demo movie generation + AVI-to-zarr workflow: `generate_demo_movies.py`, `convert_to_zarr.py`, `concat_avis_to_zarr.py`
+- CLI pipeline runner: `full_pipeline.py` (loads zarr lazily, runs full pipeline, saves all results to disk)
 - Obsidian wiki (`wiki/`) updated for all of the above
 
 ---
@@ -154,6 +156,13 @@ ground truth from the expected ~0.94 to ~0.76.
 thread cache through every `update_temporal` call. Inherited via `members[0]`
 after merging.
 
+### `avi_to_zarr` imageio v3 shape extraction
+`iio.improps(src).shape` in imageio v3 returns `(T, H, W)` (full video shape), not `(H, W)`.
+Using `props.shape[:2]` silently extracted `(T, H)` as the spatial dimensions, creating a zarr
+with shape `(T, T, H)` and failing with a broadcast error when the first chunk was written.
+**Fix** (in `cnmfe/io.py`): check whether `_s[0] == T` and extract H, W from `_s[1:]` if so,
+otherwise fall back to `_s[0:2]`. The same fix applies to `concat_avis_to_zarr.py`.
+
 ---
 
 ## File structure
@@ -171,16 +180,23 @@ cnmfe/                         Main package
   merging.py                   merge_components  (4-tuple return)
   pipeline.py                  CNMFeParams (dataclass), CNMFe.fit()
 tests/
-  conftest.py                  make_synthetic_movie() — clean fixture (small, fast)
-  miniscope_simulator.py       make_miniscope_movie() — realistic 1p movie with bg/ghosts/vasc/bleach/shot noise/8-bit
+  conftest.py                  make_synthetic_movie() — clean fixture; supports motion_max_shift
+  miniscope_simulator.py       make_miniscope_movie() — realistic 1p movie with bg/ghosts/vasc/bleach/shot noise/8-bit/motion
   test_multiprocessing.py      n_jobs correctness tests
   test_pipeline.py             includes test_temporal_correlation_against_truth (regression for the AR drift fix)
 wiki/                          Obsidian docs (math, eli5, architecture, api-reference, usage-guide)
+demo_movies/                   Generated AVI files + _meta.npz sidecars + .zarr stores (created by scripts below)
+generate_demo_movies.py        Generate demo_movies/*.avi with ground-truth NPZ sidecars (idempotent)
+convert_to_zarr.py             Batch-convert demo_movies/*.avi -> *.zarr (idempotent)
+concat_avis_to_zarr.py         Concatenate a folder of 0.avi ... N.avi into one zarr store (CLI)
+full_pipeline.py               CLI: load any zarr lazily, run full CNMFe pipeline, save A/C/S/YrA/shifts/sn/params to disk
 tutorial.ipynb                 Original walkthrough (preserved)
 tutorial2.ipynb                Clean rewrite of the original tutorial
 tutorial_realistic.ipynb       Tutorial on the realistic simulator + mp4 export of the simulated movie
 tutorial_caiman_compare.ipynb  Side-by-side CaImAn vs our CNMFe (requires CaImAn installed separately)
+tutorial_demo.ipynb            Realistic-use demo: AVI -> zarr -> lazy load -> full pipeline -> visualise
 CaImAn-main/                   Reference source only — never import from here for production
+todo/speedup.md                Implementation guide for future speed improvements (skip OASIS on first pass, cache W)
 ```
 
 `CNMFeParams` fields (excerpt of the params added or made adjustable in this round):
@@ -189,6 +205,14 @@ CaImAn-main/                   Reference source only — never import from here 
 - `seed_suppress_factor: float = 2.0` — controls greedy-init suppression disk size
 - `circular_max_dist_factor: float = 2.5` — `circular_constraint` cutoff
 - `merge_centre_dist_factor: float = 2.0` — centre-distance fallback for `merge_components`
+- `global_ar: bool = False` — `True` = one `g` estimated from pooled `C_raw`; `False` = per-neuron `g` from each `C_raw[k]`. Both modes estimate once from raw traces and cache; neither re-estimates from deconvolved traces.
+
+`make_miniscope_movie` / `make_synthetic_movie` parameters added (in `tests/`):
+- `motion_max_shift: float = 0.0` — peak drift amplitude in pixels; 0 = no motion (backward-compatible)
+- `motion_seed: int | None = None` — RNG seed for drift (defaults to `seed + 1`); `make_synthetic_movie` always uses `seed + 1`
+- Drift is a smoothed correlated random walk (cumsum of small Gaussian steps, uniform_filter1d, rescaled to peak = `motion_max_shift`)
+- Applied frame-by-frame via `cnmfe.motion_correction.apply_shift`; stored as `result["motion_shifts"]` (T, 2) float32
+- Sign convention: `motion_shifts[t]` is the `(dy, dx)` shift applied to generate frame t; motion correction's `model.shifts` is approximately the negative (the correction that undoes the drift)
 
 `CNMFe` result attributes added:
 - `model.YrA: (K, T)` — residual at each footprint; `C + YrA` = noisy projected trace
@@ -208,15 +232,24 @@ pip install oasis-deconvolution          # faster deconvolution
 pip install cupy-cuda12x                 # GPU support (match your CUDA version)
 
 # Tests
-pytest tests/ -v                         # all 77 tests
+pytest tests/ -v                         # all 78 tests
 pytest tests/test_pipeline.py -v         # pipeline + temporal-correlation regression
 pytest tests/test_multiprocessing.py -v  # parallelism only
+
+# Demo movies (one-time setup)
+python generate_demo_movies.py           # creates demo_movies/*.avi + *_meta.npz
+python convert_to_zarr.py                # creates demo_movies/*.zarr
+
+# CLI pipeline
+python concat_avis_to_zarr.py /path/to/folder/   # concatenate 0.avi...N.avi -> movie.zarr
+python full_pipeline.py /path/to/movie.zarr       # run full pipeline, save results/
 
 # Tutorials
 jupyter notebook tutorial.ipynb
 jupyter notebook tutorial2.ipynb              # clean rewrite
 jupyter notebook tutorial_realistic.ipynb     # realistic miniscope simulator
 jupyter notebook tutorial_caiman_compare.ipynb  # needs CaImAn (see notebook intro)
+jupyter notebook tutorial_demo.ipynb          # realistic lazy-load AVI workflow
 ```
 
 ---
@@ -234,3 +267,8 @@ jupyter notebook tutorial_caiman_compare.ipynb  # needs CaImAn (see notebook int
   installed under `C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/`); use the
   Developer Command Prompt or run `vcvars64.bat` to get `cl` on PATH before
   `python setup.py build_ext --inplace`. CaImAn is not actually imported by `cnmfe/`.
+- When using `n_jobs=-1` followed by CaImAn's `cm.cluster.setup_cluster()` (e.g. in
+  `tutorial_caiman_compare.ipynb`), the loky worker pool from joblib persists after `CNMFe.fit()`.
+  CaImAn's `setup_cluster` raises "A cluster is already running" when it detects live processes.
+  **Fix:** call `from joblib.externals.loky import get_reusable_executor; get_reusable_executor().shutdown(wait=True)`
+  before each `setup_cluster` call. This drains loky workers without affecting subsequent `CNMFe` calls.

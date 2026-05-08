@@ -66,8 +66,14 @@ def avi_to_zarr(
     dest = Path(dest)
 
     props = iio.improps(src, plugin="pyav")
-    T = props.n_images
-    H, W = props.shape[:2]
+    T = int(props.n_images)
+    # props.shape is (T, H, W) or (T, H, W, C) when the full video is described;
+    # skip the leading time axis so we always get the spatial (H, W).
+    _s = props.shape
+    if len(_s) >= 3 and _s[0] == T:
+        H, W = int(_s[1]), int(_s[2])
+    else:
+        H, W = int(_s[0]), int(_s[1])
 
     store = _open_array(dest, "w", shape=(T, H, W), chunks=(chunk_t, H, W), dtype=dtype)
 

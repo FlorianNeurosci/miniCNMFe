@@ -14,7 +14,7 @@ tags: [cnmfe, usage, tutorial, quickstart]
 pip install -e ".[test]"
 ```
 
-Requires Python ≥ 3.10. Key dependencies: `numpy`, `scipy`, `scikit-image`, `scikit-learn`, `zarr < 3`, `joblib`, `tqdm`, `imageio-ffmpeg`.
+Requires Python ≥ 3.10. Key dependencies: `numpy`, `scipy`, `scikit-image`, `scikit-learn`, `zarr >= 3.0`, `joblib`, `tqdm`, `imageio-ffmpeg`.
 
 Optional but recommended: `oasis-deconvolution` (faster AR deconvolution). Without it the pure-Python AR(1) PAVA fallback is used automatically.
 
@@ -120,6 +120,84 @@ The per-component AR coefficient and noise std used by OASIS are also exposed:
 g_per_neuron = model.g          # list of length K, each (p,) np.array
 sn_per_neuron = model.sn_per_k  # (K,) np.array
 ```
+
+---
+
+## Real-data CLI Workflow
+
+### From a folder of numbered AVI files
+
+Miniscope recordings typically arrive as `0.avi`, `1.avi`, ..., `65.avi`. Use the included scripts for an end-to-end workflow without writing any Python:
+
+```bash
+# Step 1: concatenate all AVI files in the folder into one zarr store
+python concat_avis_to_zarr.py /path/to/recording/
+# creates /path/to/recording/movie.zarr
+
+# Step 2: run the full pipeline
+python full_pipeline.py /path/to/recording/movie.zarr \
+    --sigma 3.0 --min-corr 0.8 --min-pnr 8.0 \
+    --n-jobs -1
+
+# Results saved to /path/to/recording/results/:
+#   A.npz         spatial footprints  (scipy CSC, H*W x K)
+#   C.npy         OASIS-deconvolved traces  (K x T)
+#   S.npy         spike trains  (K x T)
+#   YrA.npy       residuals; C + YrA = noisy projected trace  (K x T)
+#   shifts.npy    per-frame motion correction shifts  (T x 2)
+#   sn.npy        per-pixel noise std  (H x W)
+#   params.json   all pipeline parameters used
+```
+
+Loading the results in Python:
+
+```python
+import numpy as np
+import scipy.sparse as sp
+
+A   = sp.load_npz("results/A.npz")    # (H*W, K) sparse
+C   = np.load("results/C.npy")        # (K, T)
+YrA = np.load("results/YrA.npy")      # (K, T)
+C_proj = C + YrA                      # noisy projected trace (shape-faithful)
+```
+
+### Demo movies
+
+To generate synthetic demo recordings and try the full workflow:
+
+```bash
+python generate_demo_movies.py   # creates demo_movies/*.avi + *_meta.npz
+python convert_to_zarr.py        # creates demo_movies/*.zarr
+jupyter notebook tutorial_demo.ipynb
+```
+
+The `tutorial_demo.ipynb` notebook opens a zarr lazily, runs the full pipeline, and scores extraction quality against the ground-truth.
+
+### `concat_avis_to_zarr.py` options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--output PATH` | `<folder>/movie.zarr` | Output zarr path |
+| `--pattern GLOB` | `*.avi` | Glob to select AVI files |
+| `--chunk-t N` | `100` | Frames per time chunk |
+| `--color` | off | Keep RGB channels (default: grayscale) |
+
+### `full_pipeline.py` options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--sigma` | `3.0` | Neuron radius in pixels |
+| `--min-corr` | `0.8` | Min local correlation for seed detection |
+| `--min-pnr` | `10.0` | Min peak-to-noise ratio for seed detection |
+| `--n-iter` | `1` | Main refinement cycles |
+| `--n-jobs` | `-1` | CPU workers (-1 = all cores) |
+| `--no-mc` | off | Skip motion correction |
+| `--mc-iter` | `2` | Motion correction passes |
+| `--max-shift` | `20` | Max shift in pixels |
+| `--merge-corr` | `0.85` | Temporal correlation threshold for merging |
+| `--spatial-thr` | `0.1` | Footprint peak-fraction threshold |
+| `--global-ar` | off | Use one pooled AR coefficient (default: per-neuron) |
+| `--output PATH` | `<zarr_parent>/results/` | Output directory |
 
 ---
 

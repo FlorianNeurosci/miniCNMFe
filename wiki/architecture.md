@@ -15,7 +15,7 @@ D:\code\claude_cnmfe\
 ├── cnmfe/                        # Main package
 │   ├── __init__.py               # Public re-exports: CNMFe, CNMFeParams, load_movie
 │   ├── _utils.py                 # Shared low-level helpers (no algorithm logic)
-│   ├── io.py                     # File I/O: AVI/MP4 → zarr, open/save zarr
+│   ├── io.py                     # File I/O: AVI/MP4 -> zarr, open/save zarr
 │   ├── motion_correction.py      # Rigid motion correction (FFT phase correlation)
 │   ├── preprocess.py             # Noise estimation, center-surround PSF, CORR/PNR
 │   ├── background.py             # Ring-model background (compute_W, subtract_background)
@@ -25,7 +25,8 @@ D:\code\claude_cnmfe\
 │   ├── merging.py                # Component merging (overlap + correlation)
 │   └── pipeline.py               # CNMFeParams + CNMFe.fit() orchestrator
 ├── tests/
-│   ├── conftest.py               # make_synthetic_movie() fixture
+│   ├── conftest.py               # make_synthetic_movie() fixture; supports motion_max_shift
+│   ├── miniscope_simulator.py    # make_miniscope_movie() realistic simulator; supports motion_max_shift
 │   ├── test_io.py
 │   ├── test_motion_correction.py
 │   ├── test_preprocess.py
@@ -36,7 +37,14 @@ D:\code\claude_cnmfe\
 │   ├── test_pipeline.py
 │   └── test_multiprocessing.py   # n_jobs parallelism tests
 ├── wiki/                         # This documentation
+├── demo_movies/                  # Generated AVI + zarr + meta files (created by scripts)
+├── generate_demo_movies.py       # Generate demo_movies/*.avi with ground-truth NPZ sidecars
+├── convert_to_zarr.py            # Batch-convert demo_movies/*.avi -> *.zarr
+├── concat_avis_to_zarr.py        # CLI: concatenate 0.avi...N.avi into one zarr store
+├── full_pipeline.py              # CLI: load zarr, run full pipeline, save results to disk
 ├── tutorial.ipynb                # End-to-end walkthrough notebook
+├── tutorial_demo.ipynb           # Realistic lazy-load AVI workflow demo
+├── todo/speedup.md               # Guide for future speed improvements
 └── pyproject.toml
 ```
 
@@ -163,4 +171,4 @@ After initialisation, the movie is stored as `(H·W, T)` — pixels as rows, tim
 All math is reimplemented from scratch using numpy/scipy/skimage/sklearn. CaImAn source is referenced for algorithm design only.
 
 ### Module-level worker functions
-Functions dispatched by `joblib.Parallel` (e.g. `_shift_and_correct_frame`, `_deconvolve_one`) are always defined at the **top level** of their module, not as lambdas or nested functions. This is required for pickling on Windows (`spawn` process start method).
+Functions dispatched by `joblib.Parallel` (e.g. `_shift_and_correct_frame`, `_deconvolve_with`) are always defined at the **top level** of their module, not as lambdas or nested functions. This is required for pickling on Windows (`spawn` process start method). `_deconvolve_with` replaced the older `_deconvolve_one` and takes pre-computed `g`/`sn` so it does not re-estimate AR params per call.

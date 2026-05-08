@@ -57,6 +57,9 @@ class CNMFeParams:
     # Main loop
     n_iter_main: int = 2                       # Full spatial+temporal+merge cycles
 
+    # AR coefficient strategy
+    global_ar: bool = False                    # True = one g from pooled C_raw; False = per-neuron g
+
     # Parallelism
     n_jobs: int = 1                            # Workers (-1 = all CPUs, 1 = serial)
     device: str = "cpu"                        # 'cpu' or 'cuda' (requires CuPy)

@@ -109,7 +109,12 @@ def local_correlations_fft(movie: np.ndarray, xp=np) -> np.ndarray:
     """Compute local (8-neighbor) correlation image.
 
     Each pixel's value is the mean Pearson correlation with its 8 neighbors
-    over time. Implemented via FFT-based shift for efficiency.
+    over time. Spatial-domain integer shifts via interior-slice multiplies —
+    no FFT, no complex64/128 allocations. Memory ≈ size of the input movie
+    (the FFT path used to spike to ~13× that on big movies).
+
+    Edge pixels are divided by their actual neighbor count (5 at corners,
+    8 in the bulk), not always 8.
 
     Args:
         movie: (T, H, W) float32, with time-mean already subtracted.
@@ -125,21 +130,22 @@ def local_correlations_fft(movie: np.ndarray, xp=np) -> np.ndarray:
     std[std == 0] = 1.0
     Y = Y / std  # (T, H, W), unit-std traces
 
-    Yf = xp.fft.fft2(Y, axes=(1, 2))
-
-    cn = xp.zeros((H, W), dtype=xp.float64)
+    cn = xp.zeros((H, W), dtype=xp.float32)
+    counts = xp.zeros((H, W), dtype=xp.float32)
     for dy in (-1, 0, 1):
         for dx in (-1, 0, 1):
             if dy == 0 and dx == 0:
                 continue
-            Nr = xp.fft.ifftshift(xp.arange(-(H // 2), H - H // 2)).reshape(1, -1, 1)
-            Nc = xp.fft.ifftshift(xp.arange(-(W // 2), W - W // 2)).reshape(1, 1, -1)
-            phase = xp.exp(1j * 2 * xp.pi * (dy * Nr / H + dx * Nc / W))
-            Y_shifted = xp.real(xp.fft.ifft2(Yf * phase, axes=(1, 2)))
-            cn += (Y * Y_shifted).mean(axis=0)
+            y0, y1 = max(0, dy), H + min(0, dy)
+            x0, x1 = max(0, dx), W + min(0, dx)
+            ny0, ny1 = max(0, -dy), H + min(0, -dy)
+            nx0, nx1 = max(0, -dx), W + min(0, -dx)
+            corr = (Y[:, y0:y1, x0:x1] * Y[:, ny0:ny1, nx0:nx1]).mean(axis=0)
+            cn[y0:y1, x0:x1] += corr
+            counts[y0:y1, x0:x1] += 1.0
 
-    cn /= 8.0
-    return to_numpy(cn.astype(xp.float32))
+    cn /= xp.maximum(counts, 1.0)
+    return to_numpy(cn)
 
 
 def correlation_pnr(

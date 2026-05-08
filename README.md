@@ -159,7 +159,7 @@ pip install -e ".[test]"
 pytest tests/ -v
 ```
 
-76 tests covering every module plus end-to-end pipeline and multiprocessing correctness. All tests use a synthetic ground-truth movie generated in `tests/conftest.py`.
+78 tests covering every module plus end-to-end pipeline and multiprocessing correctness. All tests use a synthetic ground-truth movie generated in `tests/conftest.py`.
 
 ---
 
@@ -168,8 +168,8 @@ pytest tests/ -v
 ```
 cnmfe/
 ├── __init__.py            # Public API: CNMFe, CNMFeParams, load_movie
-├── _utils.py              # Shared helpers (make_2d, get_xp, to_numpy, …)
-├── io.py                  # AVI/MP4 → zarr converter, open/save zarr
+├── _utils.py              # Shared helpers (make_2d, get_xp, to_numpy, ...)
+├── io.py                  # AVI/MP4 -> zarr converter, open/save zarr
 ├── motion_correction.py   # Rigid motion correction (FFT phase correlation)
 ├── preprocess.py          # Noise estimation, center-surround PSF, CORR/PNR
 ├── background.py          # Ring-model background (compute_W, subtract_background)
@@ -179,9 +179,46 @@ cnmfe/
 ├── merging.py             # Component merging (overlap + correlation)
 └── pipeline.py            # CNMFeParams dataclass + CNMFe.fit() orchestrator
 
-tests/                     # pytest suite — synthetic ground-truth data
+tests/                     # pytest suite (78 tests) — synthetic ground-truth data
 wiki/                      # Obsidian-optimised documentation
+demo_movies/               # Generated demo AVIs + zarr stores (created by scripts)
+generate_demo_movies.py    # Generate demo_movies/*.avi with ground-truth sidecars
+convert_to_zarr.py         # Batch-convert demo_movies/*.avi -> *.zarr
+concat_avis_to_zarr.py     # CLI: concatenate 0.avi...N.avi into one zarr store
+full_pipeline.py           # CLI: load zarr, run full pipeline, save results to disk
 tutorial.ipynb             # End-to-end walkthrough with explanations
+tutorial_demo.ipynb        # Realistic lazy-load AVI workflow demo
+```
+
+---
+
+## Real-data workflow (AVI files)
+
+Miniscope recordings are typically a folder of sequentially numbered AVI files. The recommended workflow:
+
+```bash
+# 1. Concatenate 0.avi ... 65.avi into one lazy zarr store
+python concat_avis_to_zarr.py /path/to/recording/
+
+# 2. Run the full pipeline and save all results
+python full_pipeline.py /path/to/recording/movie.zarr --sigma 3.0 --n-jobs -1
+
+# Results written to /path/to/recording/results/:
+#   A.npz         spatial footprints (scipy CSC, H*W x K)
+#   C.npy         OASIS-deconvolved traces (K x T)
+#   S.npy         spike trains (K x T)
+#   YrA.npy       residuals; C + YrA is the noisy projected trace (K x T)
+#   shifts.npy    per-frame motion correction shifts (T x 2)
+#   sn.npy        per-pixel noise std (H x W)
+#   params.json   all pipeline parameters
+```
+
+To generate demo movies and try the pipeline end-to-end:
+
+```bash
+python generate_demo_movies.py   # creates demo_movies/*.avi
+python convert_to_zarr.py        # creates demo_movies/*.zarr
+# then open tutorial_demo.ipynb
 ```
 
 ---
@@ -196,9 +233,9 @@ The `wiki/` directory contains Obsidian-optimised documentation:
 | `wiki/algorithm-eli5.md` | Plain-English explanation with analogies |
 | `wiki/architecture.md` | Module map, dependency graph, data-flow diagram |
 | `wiki/api-reference.md` | Every public function — signatures, parameters, returns |
-| `wiki/usage-guide.md` | Quick-start, parameter tuning, troubleshooting |
+| `wiki/usage-guide.md` | Quick-start, parameter tuning, CLI workflow, troubleshooting |
 
-The `tutorial.ipynb` notebook walks through each pipeline step interactively, explaining the *why* behind every decision.
+The `tutorial.ipynb` notebook walks through each pipeline step interactively. `tutorial_demo.ipynb` demonstrates the realistic AVI-based workflow end to end.
 
 ---
 

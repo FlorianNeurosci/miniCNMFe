@@ -60,6 +60,9 @@ def make_miniscope_movie(
     photon_scale: float = 80.0,
     read_noise_std: float = 0.4,
     quantize_8bit: bool = True,
+    # ---- motion ----
+    motion_max_shift: float = 0.0,  # peak drift amplitude (pixels); 0 = no motion
+    motion_seed: int | None = None,
     # ---- misc ----
     seed: int = 0,
 ) -> dict:
@@ -273,17 +276,37 @@ def make_miniscope_movie(
     # Reshape to (T, H, W) movie
     movie = Y.T.reshape(T, H, W).astype(np.float32)
 
-    return {
-        "movie":      movie,
-        "A_true":     A_true,
-        "C_true":     C_true,
-        "S_true":     S_true,
-        "centers":    centers_arr,
-        "g_true":     g_true,
-        "sn_true":    float(read_noise_std),
-        "ar_decay":   float(np.mean(g_true)),
-        "bleach":     bleach,
-        "vignette":   vignette,
-        "background": background,
-        "dims":       dims,
+    # Simulate inter-frame rigid motion via a smoothed random walk drift
+    if motion_max_shift > 0:
+        from scipy.ndimage import uniform_filter1d
+        from cnmfe.motion_correction import apply_shift as _apply_shift
+        rng_m = np.random.default_rng(seed + 1 if motion_seed is None else motion_seed)
+        steps = rng_m.normal(0, motion_max_shift / 10, size=(T, 2)).astype(np.float64)
+        drift = np.cumsum(steps, axis=0)
+        drift = uniform_filter1d(drift, size=max(1, T // 20), axis=0)
+        peak = np.abs(drift).max()
+        if peak > 0:
+            drift = drift * (motion_max_shift / peak)
+        drift = drift.astype(np.float32)
+        movie = np.stack([_apply_shift(movie[t], drift[t]) for t in range(T)],
+                         axis=0).astype(np.float32)
+        motion_shifts = drift
+    else:
+        motion_shifts = np.zeros((T, 2), dtype=np.float32)
+
+    result = {
+        "movie":         movie,
+        "A_true":        A_true,
+        "C_true":        C_true,
+        "S_true":        S_true,
+        "centers":       centers_arr,
+        "g_true":        g_true,
+        "sn_true":       float(read_noise_std),
+        "ar_decay":      float(np.mean(g_true)),
+        "bleach":        bleach,
+        "vignette":      vignette,
+        "background":    background,
+        "motion_shifts": motion_shifts,
+        "dims":          dims,
     }
+    return result

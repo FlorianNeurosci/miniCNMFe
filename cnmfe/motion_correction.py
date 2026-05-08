@@ -2,22 +2,29 @@
 
 Algorithm
 ---------
-1. Compute the cross-power spectrum of a frame and the template in Fourier space.
-2. Find the peak of the inverse FFT → coarse integer shift.
-3. Refine to subpixel accuracy using an upsampled DFT (matrix-multiply DFT).
-4. Apply the shift as a Fourier-domain phase ramp (no interpolation artifacts).
+1. Optionally high-pass filter both frame and template (1p miniscope data
+   has slow background structure that corrupts low-frequency phase, dragging
+   the cross-correlation peak off-true; CaImAn's `gSig_filt` does the same).
+2. Compute the phase-normalized cross-power spectrum and its inverse FFT.
+3. Mask the cross-correlation surface outside the allowed shift region —
+   the peak search is constrained to be in-bounds, so a corrupted peak that
+   would have landed at 60 px gets the best in-bounds peak instead, rather
+   than the post-hoc-clipped wrong answer.
+4. Refine to subpixel via parabolic interpolation in a 3×3 neighborhood.
+5. Apply the shift as a Fourier-domain phase ramp (no interpolation artifacts).
 
-This matches the algorithm in CaImAn's `register_translation` /
-`apply_shifts_dft` but uses numpy.fft throughout (no cv2 dependency).
+The algorithmic shape mirrors CaImAn's `register_translation` /
+`apply_shifts_dft` but is small enough that we own it directly.
 """
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
-from skimage.registration import phase_cross_correlation
+from scipy.ndimage import convolve
 from tqdm import tqdm
 
 from cnmfe._utils import ensure_float32, get_xp, iter_frames, to_numpy
@@ -27,32 +34,118 @@ if TYPE_CHECKING:
     import zarr
 
 
+def _high_pass_filter_space(img: np.ndarray, gSig_filt: float) -> np.ndarray:
+    """CaImAn-style centered Gaussian band-pass kernel.
+
+    Builds a 2D Gaussian of size (3*gSig_filt//2)*2+1, then for the central
+    blob (pixels ≥ the kernel's edge value) subtracts the blob's mean and
+    zeros the surrounding pixels. The result is a band-pass kernel: it
+    suppresses scales much larger than gSig_filt (because the kernel
+    integrates to ~0) while preserving features on scales ~gSig_filt.
+    Used only on the inputs to shift estimation; the actual frame that gets
+    shifted is the unfiltered original.
+    """
+    ksize = int((3 * gSig_filt) // 2) * 2 + 1
+    if ksize < 3:
+        ksize = 3
+    ax = (np.arange(ksize, dtype=np.float64) - ksize // 2)
+    g1 = np.exp(-0.5 * (ax / float(gSig_filt)) ** 2)
+    g1 /= g1.sum()
+    ker = np.outer(g1, g1)
+    # Match CaImAn: keep only the central blob (pixels ≥ edge value of the
+    # last column), zero-DC over that blob, zero outside it.
+    threshold = ker[:, 0].max()
+    nz = ker >= threshold
+    ker[nz] -= ker[nz].mean()
+    ker[~nz] = 0.0
+    return convolve(img.astype(np.float32), ker.astype(np.float32),
+                    mode="constant", cval=0.0)
+
+
 def estimate_shifts(
     frame: np.ndarray,
     template: np.ndarray,
     upsample_factor: int = 10,
     max_shift: tuple[int, int] = (20, 20),
+    gSig_filt: float | None = None,
 ) -> np.ndarray:
     """Compute subpixel (dy, dx) shift between frame and template.
 
-    Uses phase cross-correlation with upsampled DFT refinement.
-    The detected shift is clipped to max_shift to prevent runaway corrections.
+    Phase correlation with the cross-correlation surface masked to the
+    allowed shift region BEFORE peak finding (so a corrupted peak that
+    would have escaped the bounds gets the best in-bounds peak instead),
+    then refined to subpixel via 3×3 parabolic interpolation.
+
+    Args:
+        frame: (H, W) frame to register.
+        template: (H, W) reference image.
+        upsample_factor: kept for API compatibility; subpixel uses parabolic
+            interpolation regardless.
+        max_shift: (dy_max, dx_max) — peak search is constrained to this
+            box around zero shift.
+        gSig_filt: if not None, apply a centered Gaussian high-pass with this
+            sigma to BOTH frame and template before phase correlation. The
+            standard preprocessing for 1p miniscope data.
 
     Returns:
-        shift: float array shape (2,) — (dy, dx) in pixels.
+        shift: float32 array shape (2,) — (dy, dx) such that
+        ``apply_shift(frame, shift) ≈ template``.
     """
-    frame = ensure_float32(frame)
-    template = ensure_float32(template)
+    f = ensure_float32(frame)
+    t = ensure_float32(template)
+    if gSig_filt is not None and gSig_filt > 0:
+        f = _high_pass_filter_space(f, float(gSig_filt))
+        t = _high_pass_filter_space(t, float(gSig_filt))
 
-    shift, _, _ = phase_cross_correlation(
-        template,
-        frame,
-        upsample_factor=upsample_factor,
-        normalization=None,
+    F_t = np.fft.fft2(t)
+    F_f = np.fft.fft2(f)
+    R = F_t * F_f.conj()
+    eps = 100.0 * np.finfo(R.real.dtype).eps
+    R /= np.maximum(np.abs(R), eps)                 # phase normalization
+
+    cc = np.fft.fftshift(np.real(np.fft.ifft2(R)))
+    H, W = cc.shape
+    cy, cx = H // 2, W // 2
+    msy = min(int(max_shift[0]), cy)
+    msx = min(int(max_shift[1]), cx)
+
+    # Constrain the peak search to the allowed shift region (CaImAn-style).
+    cc_m = np.full_like(cc, -np.inf)
+    cc_m[cy - msy : cy + msy + 1, cx - msx : cx + msx + 1] = (
+        cc[cy - msy : cy + msy + 1, cx - msx : cx + msx + 1]
     )
-    # Clip to max_shift
-    shift = np.clip(shift, -np.array(max_shift), np.array(max_shift))
-    return shift.astype(np.float32)
+
+    py, px = np.unravel_index(int(np.argmax(cc_m)), cc.shape)
+    dy_int = py - cy
+    dx_int = px - cx
+
+    # Subpixel refinement via parabolic fit in a 3×3 neighborhood.
+    def _parabolic_offset(a: float, b: float, c: float) -> float:
+        denom = a - 2.0 * b + c
+        if abs(denom) < 1e-12:
+            return 0.0
+        off = 0.5 * (a - c) / denom
+        # Clamp to [-0.5, 0.5] — only meaningful for a true local max.
+        if off > 0.5:
+            return 0.5
+        if off < -0.5:
+            return -0.5
+        return off
+
+    if 0 < py < H - 1:
+        dy_sub = _parabolic_offset(
+            float(cc[py - 1, px]), float(cc[py, px]), float(cc[py + 1, px])
+        )
+    else:
+        dy_sub = 0.0
+    if 0 < px < W - 1:
+        dx_sub = _parabolic_offset(
+            float(cc[py, px - 1]), float(cc[py, px]), float(cc[py, px + 1])
+        )
+    else:
+        dx_sub = 0.0
+
+    return np.array([dy_int + dy_sub, dx_int + dx_sub], dtype=np.float32)
 
 
 def apply_shift(frame: np.ndarray, shift: np.ndarray, xp=np) -> np.ndarray:
@@ -95,12 +188,13 @@ def _shift_and_correct_frame(
     template: np.ndarray,
     upsample_factor: int,
     max_shift: tuple[int, int],
+    gSig_filt: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Estimate and apply shift for one frame (module-level for pickling).
 
     Always uses CPU (numpy). Used by the joblib parallel path.
     """
-    shift = estimate_shifts(frame, template, upsample_factor, max_shift)
+    shift = estimate_shifts(frame, template, upsample_factor, max_shift, gSig_filt)
     return to_numpy(apply_shift(frame, shift)), shift
 
 
@@ -114,16 +208,26 @@ def motion_correct(
     update_interval: int = 100,
     n_jobs: int = 1,
     device: str = "cpu",
+    gSig_filt: float | None = None,
 ) -> tuple["zarr.Array", np.ndarray]:
     """Rigidly motion-correct a (T, H, W) movie.
 
     Template strategy:
-    - Pass 1: initialize template from the mean of the first `template_frames` frames,
-      then update as a running mean every `update_interval` frames.
-    - Pass 2 (if n_iter >= 2): restart with the final template from pass 1.
+    - One static template — the mean of the first `template_frames` frames
+      of the raw movie — is built before the first pass and reused across
+      every pass. Pass 2+ then runs against the same template on already-
+      corrected frames; residual misalignments surface as small refinement
+      shifts.
+    - The template is NOT updated between passes. Iterative refinement
+      (median-of-corrected-frames between passes, CaImAn-style) was tried
+      and produced positive-feedback divergence on movies whose pass-1
+      alignment is imperfect: median across partially-aligned frames stays
+      smear-y, pass 2 makes mistakes correlated with pass 1's mistakes, and
+      `max_shift` saturation grows with each iteration. The static template
+      is empirically more stable.
 
     Within each batch, shift estimation and application are independent and run
-    in parallel when n_jobs != 1. Template updates remain sequential.
+    in parallel when n_jobs != 1.
 
     Args:
         movie: Input movie, shape (T, H, W). zarr or numpy array.
@@ -136,7 +240,12 @@ def motion_correct(
         n_jobs: Number of parallel workers for per-frame registration
                 (-1 = all CPUs, 1 = serial). Ignored when device='cuda'.
         device: 'cpu' (default) or 'cuda'. GPU accelerates apply_shift (FFT);
-                shift estimation always runs on CPU (skimage requirement).
+                shift estimation always runs on CPU.
+        gSig_filt: if not None, apply a centered Gaussian high-pass with this
+                sigma to frame and template before shift estimation. Strongly
+                recommended for 1p miniscope data (slow background otherwise
+                corrupts low-frequency phase). The shift is applied to the
+                unfiltered original frame.
 
     Returns:
         corrected: zarr.Array (or np.ndarray) of shape (T, H, W).
@@ -167,37 +276,54 @@ def motion_correct(
             end = start + len(batch)
 
             if xp is not np:
-                # GPU path: estimate shifts on CPU (skimage), apply on GPU
+                # GPU path: estimate shifts on CPU, apply on GPU
                 results = []
                 for frame in batch:
-                    shift = estimate_shifts(frame, template, upsample_factor, max_shift)
+                    shift = estimate_shifts(frame, template, upsample_factor, max_shift, gSig_filt)
                     corrected_frame = to_numpy(apply_shift(frame, shift, xp=xp))
                     results.append((corrected_frame, shift))
             elif n_jobs == 1:
                 results = [
-                    _shift_and_correct_frame(frame, template, upsample_factor, max_shift)
+                    _shift_and_correct_frame(frame, template, upsample_factor, max_shift, gSig_filt)
                     for frame in batch
                 ]
             else:
                 results = Parallel(n_jobs=n_jobs)(
                     delayed(_shift_and_correct_frame)(
-                        frame, template, upsample_factor, max_shift
+                        frame, template, upsample_factor, max_shift, gSig_filt
                     )
                     for frame in batch
                 )
 
-            corrected_frames = []
             for i, (corrected_frame, shift) in enumerate(results):
                 corrected_buf[start + i] = corrected_frame
                 pass_shifts[start + i] = shift
-                corrected_frames.append(corrected_frame)
-
-            template = np.stack(corrected_frames, axis=0).mean(axis=0)
 
         cumulative_shifts += pass_shifts
 
         if iteration < n_iter - 1:
             movie = corrected_buf
+
+    # Surface silent failures: phase correlation may report shifts beyond
+    # max_shift, which estimate_shifts then clips. If a non-trivial fraction
+    # of frames hit the clip on either axis (across any pass), the template
+    # likely doesn't represent the data well and the correction is unreliable.
+    sat_tol = 1e-3
+    sat_per_pass = max(1, n_iter)
+    sat_dy = np.abs(cumulative_shifts[:, 0]) >= (max_shift[0] * sat_per_pass - sat_tol)
+    sat_dx = np.abs(cumulative_shifts[:, 1]) >= (max_shift[1] * sat_per_pass - sat_tol)
+    n_saturated = int((sat_dy | sat_dx).sum())
+    if T > 0 and n_saturated / T > 0.01:
+        warnings.warn(
+            f"Motion correction: {n_saturated}/{T} frames "
+            f"({100.0 * n_saturated / T:.1f}%) saturated the max_shift={max_shift} "
+            f"clip across all {n_iter} pass(es). Phase correlation is pointing "
+            f"to shifts beyond the clip ceiling, so the correction is likely "
+            f"unreliable on those frames. Consider increasing template_frames, "
+            f"raising max_shift if true motion is large, or inspecting the "
+            f"movie for non-rigid drift / extreme intensity changes.",
+            stacklevel=2,
+        )
 
     if output_path is not None:
         corrected_out = save_zarr(corrected_buf, output_path)
