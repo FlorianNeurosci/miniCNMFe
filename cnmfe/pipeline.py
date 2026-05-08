@@ -119,6 +119,51 @@ class CNMFe:
         self.g: list[np.ndarray] | None = None    # per-component AR coefs
         self.sn_per_k: np.ndarray | None = None   # per-component noise std
 
+    def fit_mc(
+        self,
+        movie: "zarr.Array | np.ndarray",
+        output_dir: str | Path | None = None,
+    ) -> "zarr.Array | np.ndarray":
+        """Run only the motion correction step.
+
+        Stores self.shifts and self.dims.
+
+        When output_dir is given: saves mc.zarr to disk and returns the zarr
+        handle so the in-memory corrected buffer is freed after this call.
+        When output_dir is None: returns a float32 numpy array in memory.
+
+        Call model.fit(mc, do_motion_correction=False) afterward to run
+        extraction without re-running correction.
+
+        Args:
+            movie: Input movie, shape (T, H, W). zarr or numpy array.
+            output_dir: If given, write mc.zarr here and return zarr handle.
+
+        Returns:
+            Corrected movie — zarr handle (if output_dir given) or np.ndarray.
+        """
+        p = self.params
+        movie_arr = np.asarray(movie, dtype=np.float32)
+        T, H, W = movie_arr.shape
+        self.dims = (H, W)
+
+        mc_path = Path(output_dir) / "mc.zarr" if output_dir else None
+        corrected, self.shifts = motion_correct(
+            movie_arr,
+            upsample_factor=p.upsample_factor,
+            max_shift=p.max_shift,
+            n_iter=p.mc_n_iter,
+            template_frames=p.mc_template_frames,
+            output_path=mc_path,
+            n_jobs=p.n_jobs,
+            device=p.device,
+            gSig_filt=p.mc_gSig_filt,
+        )
+        # When output_path is set, motion_correct() writes corrected_buf to
+        # zarr and returns the zarr handle.  Returning it directly allows the
+        # temporary numpy buffer to be garbage-collected, freeing RAM.
+        return corrected
+
     def fit(
         self,
         movie: "zarr.Array | np.ndarray",
