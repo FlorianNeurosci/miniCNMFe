@@ -42,6 +42,7 @@ class CNMFeParams:
     mc_method: str = "phase_correlation"  # 'phase_correlation', 'orb', or 'sift'
     mc_n_features: int = 500           # keypoints per image for ORB/SIFT
     mc_min_matches: int = 6            # min RANSAC inliers before fallback to phase corr
+    mc_temporal_smooth_sigma: float = 0.0  # Gaussian sigma (frames) for temporal shift smoothing
 
     # --- Spatial filtering / PSF ---
     sigma: float = 3.0        # Gaussian sigma in pixels (neuron size)
@@ -177,6 +178,7 @@ class CNMFe:
             method=p.mc_method,
             n_features=p.mc_n_features,
             min_matches=p.mc_min_matches,
+            temporal_smooth_sigma=p.mc_temporal_smooth_sigma,
         )
         # When output_path is set, motion_correct() writes corrected_buf to
         # zarr and returns the zarr handle.  Returning it directly allows the
@@ -222,6 +224,7 @@ class CNMFe:
                 method=p.mc_method,
                 n_features=p.mc_n_features,
                 min_matches=p.mc_min_matches,
+                temporal_smooth_sigma=p.mc_temporal_smooth_sigma,
             )
             movie_arr = np.asarray(movie_arr, dtype=np.float32)
 

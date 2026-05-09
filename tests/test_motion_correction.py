@@ -104,3 +104,80 @@ class TestMotionCorrect:
         corrected, shifts = motion_correct(movie, n_iter=1)
         assert np.asarray(corrected).shape == (10, 32, 32)
         assert shifts.shape == (10, 2)
+
+
+class TestMotionCorrectRealistic:
+    """MC tests using the miniscope simulator with known inter-frame drift.
+
+    Compared with TestMotionCorrect, this class uses the full realistic
+    simulator (shot noise, background, ghost cells, vignetting) to verify that
+    algorithmic improvements hold up under real-world 1-photon conditions.
+
+    Key challenge: on realistic movies the per-frame SNR is too low (~2.4)
+    for phase correlation to reliably detect the sub-pixel drift between
+    consecutive frames.  The temporal_smooth_sigma feature exploits the fact
+    that brain drift is a smooth process: Gaussian smoothing along the time
+    axis suppresses estimation noise while preserving the true slow drift.
+    """
+
+    @staticmethod
+    def _make_sim(motion_max_shift: float = 4.0, seed: int = 7) -> dict:
+        from miniscope_simulator import make_miniscope_movie
+        return make_miniscope_movie(
+            n_neurons=5,
+            dims=(64, 64),
+            T=100,
+            motion_max_shift=motion_max_shift,
+            seed=seed,
+            quantize_8bit=False,  # avoid 8-bit rounding artifacts in registration
+        )
+
+    def test_temporal_smoothing_improves_shift_accuracy(self):
+        """Temporal Gaussian smoothing should recover the known drift with |r| > 0.7.
+
+        Raw phase-correlation estimates on a noisy 1p movie achieve |r| ~ 0.5
+        against the true drift because each frame's correlation surface is
+        dominated by shot noise.  Smoothing the shift trajectory with a
+        Gaussian kernel (sigma≈7 frames) suppresses that noise while keeping
+        the slow-drift signal intact, raising |r| above 0.7.
+        """
+        sim = self._make_sim()
+        movie = sim["movie"]
+        true_shifts = sim["motion_shifts"]
+
+        _, raw_shifts = motion_correct(movie, n_iter=1, max_shift=(10, 10), upsample_factor=5)
+        _, smooth_shifts = motion_correct(
+            movie, n_iter=1, max_shift=(10, 10), upsample_factor=5,
+            temporal_smooth_sigma=7.0,
+        )
+
+        rs_raw    = [abs(float(np.corrcoef(raw_shifts[:, ax],    true_shifts[:, ax])[0, 1])) for ax in range(2)]
+        rs_smooth = [abs(float(np.corrcoef(smooth_shifts[:, ax], true_shifts[:, ax])[0, 1])) for ax in range(2)]
+
+        for axis in range(2):
+            assert rs_smooth[axis] > rs_raw[axis], (
+                f"Smoothing should raise |r|: axis {axis} raw={rs_raw[axis]:.3f} smooth={rs_smooth[axis]:.3f}"
+            )
+        mean_r = float(np.mean(rs_smooth))
+        assert mean_r > 0.7, (
+            f"Mean smoothed |r| too weak: {mean_r:.3f} < 0.7  (per-axis: {rs_smooth})"
+        )
+
+    def test_temporal_smoothing_reduces_shift_noise(self):
+        """Smoothed shifts should vary less frame-to-frame than raw estimates.
+
+        Frame-to-frame jitter in raw phase-correlation estimates comes from
+        noise, not from real motion.  A Gaussian filter with sigma > 1 frame
+        should substantially reduce that jitter.
+        """
+        sim = self._make_sim()
+        movie = sim["movie"]
+
+        _, raw    = motion_correct(movie, n_iter=1, max_shift=(10, 10))
+        _, smooth = motion_correct(movie, n_iter=1, max_shift=(10, 10), temporal_smooth_sigma=7.0)
+
+        raw_jitter    = float(np.diff(raw,    axis=0).std())
+        smooth_jitter = float(np.diff(smooth, axis=0).std())
+        assert smooth_jitter < raw_jitter, (
+            f"Smoothing should reduce jitter: {smooth_jitter:.4f} >= {raw_jitter:.4f}"
+        )

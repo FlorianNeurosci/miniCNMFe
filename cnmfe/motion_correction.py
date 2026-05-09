@@ -426,6 +426,7 @@ def motion_correct(
     method: str = "phase_correlation",
     n_features: int = 500,
     min_matches: int = 6,
+    temporal_smooth_sigma: float = 0.0,
 ) -> tuple["zarr.Array", np.ndarray]:
     """Rigidly motion-correct a (T, H, W) movie.
 
@@ -474,6 +475,14 @@ def motion_correct(
         n_features: max keypoints per image for ORB/SIFT (ignored for phase_correlation).
         min_matches: minimum RANSAC inlier matches for ORB/SIFT; frames below this
                 threshold fall back to phase correlation.
+        temporal_smooth_sigma: if > 0, apply a 1-D Gaussian smoothing with this
+                sigma (in frames) to the cumulative shift trajectory after all
+                passes, then re-apply the smoothed shifts to the original movie.
+                Brain motion is a smooth process; smoothing suppresses high-frequency
+                noise in the per-frame phase-correlation estimates while preserving
+                the true slow drift.  Values of 5–10 are effective for typical
+                miniscope recordings (smooth drift, low per-frame SNR).  Set to 0
+                (default) to disable.
 
     Returns:
         corrected: zarr.Array (or np.ndarray) of shape (T, H, W).
@@ -490,6 +499,9 @@ def motion_correct(
     template = init_frames.mean(axis=0)
     # Pre-crop template once; all workers receive the cropped version.
     template_for_est = template[roi] if roi is not None else template
+
+    # Keep reference to original movie for re-application after temporal smoothing.
+    original_movie = movie
 
     cumulative_shifts = np.zeros((T, 2), dtype=np.float32)
     corrected_buf = np.empty((T, H, W), dtype=np.float32)
@@ -545,6 +557,26 @@ def motion_correct(
 
         if iteration < n_iter - 1:
             movie = corrected_buf
+
+    # --- Optional temporal smoothing of shift trajectory ---
+    # Phase-correlation estimates are noisy frame-by-frame; brain drift is
+    # smooth.  A Gaussian low-pass along the time axis suppresses estimation
+    # noise while preserving the true slow-drift signal.  After smoothing we
+    # re-apply the revised shifts to the *original* movie so the corrected
+    # output is consistent with the returned shift array.
+    if temporal_smooth_sigma > 0:
+        from scipy.ndimage import gaussian_filter1d
+        smoothed = gaussian_filter1d(
+            cumulative_shifts.astype(np.float64),
+            sigma=float(temporal_smooth_sigma),
+            axis=0,
+        ).astype(np.float32)
+        for start, batch in iter_frames(original_movie, batch_size=update_interval):
+            for i, frame in enumerate(batch):
+                corrected_buf[start + i] = to_numpy(
+                    apply_shift(np.asarray(frame, dtype=np.float32), smoothed[start + i], xp=xp)
+                )
+        cumulative_shifts = smoothed
 
     # Surface silent failures: phase correlation may report shifts beyond
     # max_shift, which estimate_shifts then clips. If a non-trivial fraction
