@@ -62,6 +62,123 @@ def _high_pass_filter_space(img: np.ndarray, gSig_filt: float) -> np.ndarray:
                     mode="constant", cval=0.0)
 
 
+def _to_uint8(img: np.ndarray) -> np.ndarray:
+    """Percentile-normalize float32 image to uint8 for feature detectors."""
+    lo, hi = np.percentile(img, [1, 99])
+    if hi <= lo:
+        return np.zeros_like(img, dtype=np.uint8)
+    return np.clip((img - lo) / (hi - lo) * 255.0, 0, 255).astype(np.uint8)
+
+
+def estimate_shifts_features(
+    frame: np.ndarray,
+    template: np.ndarray,
+    method: str = "orb",
+    max_shift: tuple[int, int] = (20, 20),
+    gSig_filt: float | None = None,
+    n_features: int = 500,
+    min_matches: int = 6,
+    fallback: bool = True,
+) -> np.ndarray:
+    """Estimate (dy, dx) shift via feature-point matching (ORB or SIFT) + RANSAC.
+
+    Detects keypoints in both frame and template, matches descriptors with a
+    brute-force matcher (crossCheck), then estimates a 2D similarity transform
+    (translation + optional rotation/scale) via RANSAC. Falls back to phase
+    correlation when too few inlier matches are found.
+
+    ORB uses binary (Hamming) descriptors and is ~5× faster than SIFT on CPU.
+    SIFT uses float L2 descriptors and is more robust on smooth/low-contrast images.
+
+    Args:
+        frame: (H, W) float32 frame to register.
+        template: (H, W) float32 reference image.
+        method: 'orb' or 'sift'.
+        max_shift: (dy_max, dx_max) — output is clipped to this range.
+        gSig_filt: if not None, apply the same high-pass used by phase correlation
+            before feature detection (reduces background influence).
+        n_features: max keypoints to detect per image.
+        min_matches: minimum RANSAC inliers required; below this falls back to
+            phase correlation (when fallback=True) or returns zero shift.
+        fallback: fall back to estimate_shifts() when matching fails.
+
+    Returns:
+        shift: float32 array shape (2,) — (dy, dx) such that
+            apply_shift(frame, shift) ≈ template.
+    """
+    try:
+        import cv2
+    except ImportError as exc:
+        raise ImportError(
+            "opencv-python is required for feature-based motion correction. "
+            "Install with: pip install opencv-python"
+        ) from exc
+
+    f = ensure_float32(frame)
+    t = ensure_float32(template)
+
+    if gSig_filt is not None and gSig_filt > 0:
+        f = _high_pass_filter_space(f, float(gSig_filt))
+        t = _high_pass_filter_space(t, float(gSig_filt))
+
+    f_u8 = _to_uint8(f)
+    t_u8 = _to_uint8(t)
+
+    method_lower = method.lower()
+    if method_lower == "sift":
+        detector = cv2.SIFT_create(nfeatures=n_features)
+        norm_type = cv2.NORM_L2
+    else:  # orb (default)
+        detector = cv2.ORB_create(nfeatures=n_features)
+        norm_type = cv2.NORM_HAMMING
+
+    kp_t, des_t = detector.detectAndCompute(t_u8, None)
+    kp_f, des_f = detector.detectAndCompute(f_u8, None)
+
+    def _fallback() -> np.ndarray:
+        if fallback:
+            return estimate_shifts(frame, template, max_shift=max_shift, gSig_filt=None)
+        return np.zeros(2, dtype=np.float32)
+
+    if des_t is None or des_f is None:
+        return _fallback()
+    if len(kp_t) < min_matches or len(kp_f) < min_matches:
+        return _fallback()
+
+    bf = cv2.BFMatcher(norm_type, crossCheck=True)
+    matches = bf.match(des_t, des_f)
+
+    if len(matches) < min_matches:
+        return _fallback()
+
+    matches = sorted(matches, key=lambda m: m.distance)
+    n_use = max(min_matches, min(100, len(matches)))
+    good = matches[:n_use]
+
+    pts_t = np.float32([kp_t[m.queryIdx].pt for m in good])  # (x, y) = (col, row)
+    pts_f = np.float32([kp_f[m.trainIdx].pt for m in good])
+
+    M, inliers = cv2.estimateAffinePartial2D(
+        pts_t, pts_f,
+        method=cv2.RANSAC,
+        ransacReprojThreshold=2.0,
+        maxIters=2000,
+        confidence=0.995,
+    )
+
+    n_inliers = int(inliers.sum()) if inliers is not None else 0
+    if M is None or n_inliers < min_matches:
+        return _fallback()
+
+    # M maps template coords → frame coords: M[:, 2] = (tx, ty) = how content moved.
+    # Correction: shift frame by the negative to align back to template.
+    # Our (dy, dx) convention: dy = row direction, dx = col direction.
+    dy = float(np.clip(-M[1, 2], -max_shift[0], max_shift[0]))
+    dx = float(np.clip(-M[0, 2], -max_shift[1], max_shift[1]))
+
+    return np.array([dy, dx], dtype=np.float32)
+
+
 def estimate_shifts(
     frame: np.ndarray,
     template: np.ndarray,
@@ -190,6 +307,9 @@ def _shift_and_correct_frame(
     max_shift: tuple[int, int],
     gSig_filt: float | None = None,
     roi: "tuple[slice, slice] | None" = None,
+    method: str = "phase_correlation",
+    n_features: int = 500,
+    min_matches: int = 6,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Estimate and apply shift for one frame (module-level for pickling).
 
@@ -198,9 +318,22 @@ def _shift_and_correct_frame(
     Args:
         template: already cropped to roi when roi is set (caller's responsibility).
         roi: if set, crop frame before shift estimation; shift is applied to full frame.
+        method: 'phase_correlation', 'orb', or 'sift'.
+        n_features: keypoints per image (ORB/SIFT only).
+        min_matches: minimum RANSAC inliers before falling back to phase correlation.
     """
     frame_for_est = frame[roi] if roi is not None else frame
-    shift = estimate_shifts(frame_for_est, template, upsample_factor, max_shift, gSig_filt)
+    if method == "phase_correlation":
+        shift = estimate_shifts(frame_for_est, template, upsample_factor, max_shift, gSig_filt)
+    else:
+        shift = estimate_shifts_features(
+            frame_for_est, template,
+            method=method,
+            max_shift=max_shift,
+            gSig_filt=gSig_filt,
+            n_features=n_features,
+            min_matches=min_matches,
+        )
     return to_numpy(apply_shift(frame, shift)), shift
 
 
@@ -290,6 +423,9 @@ def motion_correct(
     device: str = "cpu",
     gSig_filt: float | None = None,
     roi: "tuple[slice, slice] | None" = None,
+    method: str = "phase_correlation",
+    n_features: int = 500,
+    min_matches: int = 6,
 ) -> tuple["zarr.Array", np.ndarray]:
     """Rigidly motion-correct a (T, H, W) movie.
 
@@ -331,6 +467,13 @@ def motion_correct(
                 the cropped sub-region (e.g. a neuron-dense area found by
                 select_roi()), while the shift is applied to the full frame.
                 Use select_roi() to find a good crop automatically.
+        method: shift estimation method — 'phase_correlation' (default, FFT-based),
+                'orb' (feature-point matching with binary ORB descriptors, fast),
+                or 'sift' (SIFT descriptors, more accurate but ~5× slower on CPU).
+                ORB/SIFT fall back to phase correlation when too few matches are found.
+        n_features: max keypoints per image for ORB/SIFT (ignored for phase_correlation).
+        min_matches: minimum RANSAC inlier matches for ORB/SIFT; frames below this
+                threshold fall back to phase correlation.
 
     Returns:
         corrected: zarr.Array (or np.ndarray) of shape (T, H, W).
@@ -367,18 +510,29 @@ def motion_correct(
                 results = []
                 for frame in batch:
                     frame_for_est = frame[roi] if roi is not None else frame
-                    shift = estimate_shifts(frame_for_est, template_for_est, upsample_factor, max_shift, gSig_filt)
+                    if method == "phase_correlation":
+                        shift = estimate_shifts(frame_for_est, template_for_est, upsample_factor, max_shift, gSig_filt)
+                    else:
+                        shift = estimate_shifts_features(
+                            frame_for_est, template_for_est,
+                            method=method, max_shift=max_shift, gSig_filt=gSig_filt,
+                            n_features=n_features, min_matches=min_matches,
+                        )
                     corrected_frame = to_numpy(apply_shift(frame, shift, xp=xp))
                     results.append((corrected_frame, shift))
             elif n_jobs == 1:
                 results = [
-                    _shift_and_correct_frame(frame, template_for_est, upsample_factor, max_shift, gSig_filt, roi)
+                    _shift_and_correct_frame(
+                        frame, template_for_est, upsample_factor, max_shift, gSig_filt, roi,
+                        method, n_features, min_matches,
+                    )
                     for frame in batch
                 ]
             else:
                 results = Parallel(n_jobs=n_jobs)(
                     delayed(_shift_and_correct_frame)(
-                        frame, template_for_est, upsample_factor, max_shift, gSig_filt, roi
+                        frame, template_for_est, upsample_factor, max_shift, gSig_filt, roi,
+                        method, n_features, min_matches,
                     )
                     for frame in batch
                 )

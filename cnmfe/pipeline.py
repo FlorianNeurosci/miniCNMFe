@@ -39,6 +39,9 @@ class CNMFeParams:
     mc_roi: "tuple[slice, slice] | None" = None   # manual (y_slice, x_slice) for shift estimation
     mc_auto_roi: bool = False           # auto-detect neuron-dense ROI via select_roi()
     mc_auto_roi_frac: float = 0.5      # crop fraction (H and W) for auto-detection
+    mc_method: str = "phase_correlation"  # 'phase_correlation', 'orb', or 'sift'
+    mc_n_features: int = 500           # keypoints per image for ORB/SIFT
+    mc_min_matches: int = 6            # min RANSAC inliers before fallback to phase corr
 
     # --- Spatial filtering / PSF ---
     sigma: float = 3.0        # Gaussian sigma in pixels (neuron size)
@@ -171,6 +174,9 @@ class CNMFe:
             device=p.device,
             gSig_filt=p.mc_gSig_filt,
             roi=roi,
+            method=p.mc_method,
+            n_features=p.mc_n_features,
+            min_matches=p.mc_min_matches,
         )
         # When output_path is set, motion_correct() writes corrected_buf to
         # zarr and returns the zarr handle.  Returning it directly allows the
@@ -213,6 +219,9 @@ class CNMFe:
                 n_jobs=p.n_jobs,
                 device=p.device,
                 gSig_filt=p.mc_gSig_filt,
+                method=p.mc_method,
+                n_features=p.mc_n_features,
+                min_matches=p.mc_min_matches,
             )
             movie_arr = np.asarray(movie_arr, dtype=np.float32)
 
