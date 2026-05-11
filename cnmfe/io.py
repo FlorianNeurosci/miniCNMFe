@@ -62,56 +62,115 @@ def _open_array(
 # Converters: input format → zarr
 # ---------------------------------------------------------------------------
 
+from pathlib import Path
+from collections.abc import Sequence
+import numpy as np
+import zarr
+
+
 def avi_to_zarr(
-    src: str | Path,
+    src: str | Path | Sequence[str | Path],
     dest: str | Path,
     chunk_t: int = 100,
     grayscale: bool = True,
-    dtype: str = "uint8",
+    dtype: str = "uint16",
     compression: bool = True,
 ) -> zarr.Array:
-    """Convert AVI/MP4 to a time-chunked zarr store.
+    """Convert one or multiple AVI/MP4 files into a single zarr array.
 
-    Reads frames one batch at a time via imageio-ffmpeg — the full movie is
-    never in memory at once. Grayscale conversion averages RGB channels.
-
-    The default dtype is uint8 (matching the natural bit depth of miniscope
-    AVIs). The pipeline loads with np.asarray(movie, dtype=np.float32) so the
-    float32 conversion happens in RAM, not on disk — keeping the zarr 4× smaller.
-    Compression is lossless (blosc lz4 + bitshuffle).
+    Videos are concatenated along time axis.
 
     Args:
-        src: Path to AVI/MP4 file.
-        dest: Output zarr store path (directory). Created if absent.
-        chunk_t: Number of frames per time chunk.
-        grayscale: Average RGB channels to produce (T, H, W) output.
-        dtype: On-disk dtype (default "uint8" for 8-bit miniscope data).
-        compression: Use blosc lz4+bitshuffle compression (default True).
+        src:
+            Single AVI/MP4 path or list of paths.
+        dest:
+            Output zarr store path.
+        chunk_t:
+            Time chunk size.
+        grayscale:
+            Convert RGB -> grayscale by averaging channels.
+        dtype:
+            On-disk dtype.
+        compression:
+            Use blosc lz4 + bitshuffle compression.
 
     Returns:
-        Open zarr.Array with shape (T, H, W).
+        zarr.Array with shape (T_total, H, W)
     """
     import imageio.v3 as iio
 
-    src = Path(src)
+    # ------------------------------------------------------------------
+    # normalize input
+    # ------------------------------------------------------------------
+    if isinstance(src, (str, Path)):
+        srcs = [Path(src)]
+    else:
+        srcs = [Path(s) for s in src]
+
+    if len(srcs) == 0:
+        raise ValueError("No input videos provided.")
+
     dest = Path(dest)
 
-    props = iio.improps(src, plugin="pyav")
-    T = int(props.n_images)
-    # props.shape is (T, H, W) or (T, H, W, C) when the full video is described;
-    # skip the leading time axis so we always get the spatial (H, W).
-    _s = props.shape
-    if len(_s) >= 3 and _s[0] == T:
-        H, W = int(_s[1]), int(_s[2])
-    else:
-        H, W = int(_s[0]), int(_s[1])
+    # ------------------------------------------------------------------
+    # inspect videos
+    # ------------------------------------------------------------------
+    video_info = []
+    total_T = 0
+    H = W = None
 
-    store = _open_array(dest, "w", shape=(T, H, W), chunks=(chunk_t, H, W),
-                        dtype=dtype, compression=compression)
+    for s in srcs:
+        props = iio.improps(s, plugin="pyav")
 
-    for start, batch in _read_video_batches(src, batch_size=chunk_t, grayscale=grayscale):
-        end = min(start + len(batch), T)
-        store[start:end] = batch.astype(dtype)
+        T = int(props.n_images)
+
+        _s = props.shape
+        if len(_s) >= 3 and _s[0] == T:
+            h, w = int(_s[1]), int(_s[2])
+        else:
+            h, w = int(_s[0]), int(_s[1])
+
+        if H is None:
+            H, W = h, w
+        elif (h, w) != (H, W):
+            raise ValueError(
+                f"Video size mismatch: {s} has {(h, w)}, expected {(H, W)}"
+            )
+
+        video_info.append((s, T))
+        total_T += T
+
+    # ------------------------------------------------------------------
+    # create zarr
+    # ------------------------------------------------------------------
+    store = _open_array(
+        dest,
+        "w",
+        shape=(total_T, H, W),
+        chunks=(chunk_t, H, W),
+        dtype=dtype,
+        compression=compression,
+    )
+
+    # ------------------------------------------------------------------
+    # write videos sequentially
+    # ------------------------------------------------------------------
+    write_start = 0
+
+    for s, T in video_info:
+        for batch_start, batch in _read_video_batches(
+            s,
+            batch_size=chunk_t,
+            grayscale=grayscale,
+        ):
+            batch_end = batch_start + len(batch)
+
+            global_start = write_start + batch_start
+            global_end = write_start + batch_end
+
+            store[global_start:global_end] = batch.astype(dtype)
+
+        write_start += T
 
     return store
 
