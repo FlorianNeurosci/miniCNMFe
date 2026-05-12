@@ -323,41 +323,77 @@ def apply_shift_caiman(img, shift):
 # MAIN PUBLIC FUNCTION
 # =============================================================================
 
+
 def motion_correction_rigid(
         movie,
         max_shift=(20, 20),
         gSig_filt=7,
         upsample_factor=10,
         niter_rig=1,
-        bin_window=10,
+        bin_window=100,
         template=None,
         verbose=True,
+        out=None,
+        chunk_size=500,
 ):
-
     """
-    CaImAn-compatible rigid motion correction.
+    Works with:
+        - numpy arrays
+        - memmaps
+        - zarr arrays
 
     Parameters
     ----------
-    movie : ndarray
-        Shape:
-            (T, H, W)
+    movie : array-like
+        Shape (T, H, W)
 
-    Returns
-    -------
-    corrected_movie : ndarray
+    out : None | str | zarr.Array
+        If provided:
+            - creates/writes corrected movie lazily
+            - avoids holding full movie in RAM
 
-    shifts : ndarray
-        Shape:
-            (T, 2)
-
-        Convention:
-            (row_shift, col_shift)
+    chunk_size : int
+        Number of frames processed at once.
     """
-
-    movie = movie.astype(np.float32)
-
+    import zarr
+    import numpy as np
+    from tqdm import tqdm
     T, H, W = movie.shape
+
+    # -----------------------------------------------------------------
+    # output allocation
+    # -----------------------------------------------------------------
+
+    if out is None:
+
+        corrected = np.asarray(movie, dtype=np.float32).copy()
+
+    else:
+
+        if isinstance(out, str):
+
+            corrected = zarr.open(
+                out,
+                mode="w",
+                shape=(T, H, W),
+                chunks=(min(chunk_size, T), H, W),
+                dtype="float32",
+            )
+
+        else:
+            corrected = out
+
+        # initialize from input
+        for start in range(0, T, chunk_size):
+
+            stop = min(start + chunk_size, T)
+
+            corrected[start:stop] = np.asarray(
+                movie[start:stop],
+                dtype=np.float32
+            )
+
+    shifts_total = np.zeros((T, 2), dtype=np.float32)
 
     # -----------------------------------------------------------------
     # initial template
@@ -365,26 +401,33 @@ def motion_correction_rigid(
 
     if template is None:
 
-        filtered = np.zeros_like(movie)
+        filtered = np.zeros((T, H, W), dtype=np.float32)
 
-        for i in range(T):
+        iterator = range(0, T, chunk_size)
 
-            filtered[i] = high_pass_filter_space(
-                movie[i],
-                gSig_filt
+        if verbose:
+            iterator = tqdm(iterator, desc="initial filtering")
+
+        for start in iterator:
+
+            stop = min(start + chunk_size, T)
+
+            chunk = np.asarray(
+                movie[start:stop],
+                dtype=np.float32
             )
+
+            for i in range(chunk.shape[0]):
+
+                filtered[start + i] = high_pass_filter_space(
+                    chunk[i],
+                    gSig_filt
+                )
 
         template = caiman_bin_median(
             filtered,
             window=bin_window
         )
-
-    corrected = movie.copy()
-
-    shifts_total = np.zeros(
-        (T, 2),
-        dtype=np.float32
-    )
 
     # -----------------------------------------------------------------
     # rigid iterations
@@ -403,21 +446,23 @@ def motion_correction_rigid(
             gSig_filt
         )
 
-        corrected_iter = np.zeros_like(corrected)
-
-        shifts_iter = np.zeros(
-            (T, 2),
-            dtype=np.float32
-        )
+        shifts_iter = np.zeros((T, 2), dtype=np.float32)
 
         iterator = range(T)
 
         if verbose:
             iterator = tqdm(iterator)
 
+        # -------------------------------------------------------------
+        # framewise registration
+        # -------------------------------------------------------------
+
         for t in iterator:
 
-            frame = corrected[t]
+            frame = np.asarray(
+                corrected[t],
+                dtype=np.float32
+            )
 
             filtered_frame = high_pass_filter_space(
                 frame,
@@ -436,25 +481,42 @@ def motion_correction_rigid(
                 shift
             )
 
-            corrected_iter[t] = corrected_frame
+            corrected[t] = corrected_frame
             shifts_iter[t] = shift
-
-        corrected = corrected_iter
 
         shifts_total += shifts_iter
 
-        # -----------------------------------------------------------------
+        # -------------------------------------------------------------
         # update template
-        # -----------------------------------------------------------------
+        # -------------------------------------------------------------
 
-        filtered_corrected = np.zeros_like(corrected)
+        filtered_corrected = np.zeros(
+            (T, H, W),
+            dtype=np.float32
+        )
 
-        for i in range(T):
+        iterator = range(0, T, chunk_size)
 
-            filtered_corrected[i] = high_pass_filter_space(
-                corrected[i],
-                gSig_filt
+        if verbose:
+            iterator = tqdm(iterator, desc="template update")
+
+        for start in iterator:
+
+            stop = min(start + chunk_size, T)
+
+            chunk = np.asarray(
+                corrected[start:stop],
+                dtype=np.float32
             )
+
+            for i in range(chunk.shape[0]):
+
+                filtered_corrected[start + i] = (
+                    high_pass_filter_space(
+                        chunk[i],
+                        gSig_filt
+                    )
+                )
 
         template = caiman_bin_median(
             filtered_corrected,
