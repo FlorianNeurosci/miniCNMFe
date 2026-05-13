@@ -42,27 +42,6 @@ class TestCorrelationPNRParallel:
 
 
 # ---------------------------------------------------------------------------
-# Motion correction
-# ---------------------------------------------------------------------------
-
-class TestMotionCorrectParallel:
-    def test_matches_serial(self, synth_data):
-        from cnmfe.motion_correction import motion_correct
-        movie = synth_data["movie"]
-        _, shifts1 = motion_correct(movie, n_iter=1, upsample_factor=5, n_jobs=1)
-        _, shifts2 = motion_correct(movie, n_iter=1, upsample_factor=5, n_jobs=2)
-        np.testing.assert_allclose(shifts1, shifts2, atol=1e-4)
-
-    def test_output_shape_parallel(self, synth_data):
-        from cnmfe.motion_correction import motion_correct
-        movie = synth_data["movie"]
-        T = movie.shape[0]
-        corrected, shifts = motion_correct(movie, n_iter=1, upsample_factor=5, n_jobs=2)
-        assert np.asarray(corrected).shape == movie.shape
-        assert shifts.shape == (T, 2)
-
-
-# ---------------------------------------------------------------------------
 # Background
 # ---------------------------------------------------------------------------
 

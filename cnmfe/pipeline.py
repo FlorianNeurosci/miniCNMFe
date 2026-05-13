@@ -17,7 +17,7 @@ from cnmfe._utils import make_2d
 from cnmfe.background import compute_W, subtract_background
 from cnmfe.initialization import greedy_corr_pnr
 from cnmfe.merging import merge_components
-from cnmfe.motion_correction import motion_correct
+from cnmfe.motion_correction import motion_correction_rigid
 from cnmfe.preprocess import correlation_pnr, estimate_noise
 from cnmfe.spatial import update_spatial
 from cnmfe.temporal import estimate_ar_params, update_temporal
@@ -33,16 +33,8 @@ class CNMFeParams:
     # --- Motion correction ---
     max_shift: tuple[int, int] = (20, 20)
     upsample_factor: int = 10
-    mc_n_iter: int = 2
-    mc_template_frames: int = 200
+    mc_niter_rig: int = 1              # number of rigid MC passes (CaImAn default is 1)
     mc_gSig_filt: float | None = None  # 1p high-pass sigma; set ≈ sigma to enable
-    mc_roi: "tuple[slice, slice] | None" = None   # manual (y_slice, x_slice) for shift estimation
-    mc_auto_roi: bool = False           # auto-detect neuron-dense ROI via select_roi()
-    mc_auto_roi_frac: float = 0.5      # crop fraction (H and W) for auto-detection
-    mc_method: str = "phase_correlation"  # 'phase_correlation', 'orb', or 'sift'
-    mc_n_features: int = 500           # keypoints per image for ORB/SIFT
-    mc_min_matches: int = 6            # min RANSAC inliers before fallback to phase corr
-    mc_temporal_smooth_sigma: float = 0.0  # Gaussian sigma (frames) for temporal shift smoothing
 
     # --- Spatial filtering / PSF ---
     sigma: float = 3.0        # Gaussian sigma in pixels (neuron size)
@@ -155,34 +147,13 @@ class CNMFe:
         T, H, W = movie_arr.shape
         self.dims = (H, W)
 
-        roi = p.mc_roi
-        if p.mc_auto_roi and roi is None:
-            from cnmfe.motion_correction import select_roi
-            print("Auto-selecting neuron-dense ROI for shift estimation...")
-            roi = select_roi(movie_arr, frac_h=p.mc_auto_roi_frac, frac_w=p.mc_auto_roi_frac)
-            print(f"  ROI: y={roi[0].start}:{roi[0].stop}  x={roi[1].start}:{roi[1].stop}")
-        self.mc_roi = roi
-
-        mc_path = Path(output_dir) / "mc.zarr" if output_dir else None
-        corrected, self.shifts = motion_correct(
+        corrected, self.shifts = motion_correction_rigid(
             movie_arr,
-            upsample_factor=p.upsample_factor,
             max_shift=p.max_shift,
-            n_iter=p.mc_n_iter,
-            template_frames=p.mc_template_frames,
-            output_path=mc_path,
-            n_jobs=p.n_jobs,
-            device=p.device,
             gSig_filt=p.mc_gSig_filt,
-            roi=roi,
-            method=p.mc_method,
-            n_features=p.mc_n_features,
-            min_matches=p.mc_min_matches,
-            temporal_smooth_sigma=p.mc_temporal_smooth_sigma,
+            upsample_factor=p.upsample_factor,
+            niter_rig=p.mc_niter_rig,
         )
-        # When output_path is set, motion_correct() writes corrected_buf to
-        # zarr and returns the zarr handle.  Returning it directly allows the
-        # temporary numpy buffer to be garbage-collected, freeing RAM.
         return corrected
 
     def fit(
@@ -210,23 +181,13 @@ class CNMFe:
 
         # --- Step 1: Motion correction ---
         if do_motion_correction:
-            mc_path = Path(output_dir) / "mc.zarr" if output_dir else None
-            movie_arr, self.shifts = motion_correct(
+            movie_arr, self.shifts = motion_correction_rigid(
                 movie_arr,
-                upsample_factor=p.upsample_factor,
                 max_shift=p.max_shift,
-                n_iter=p.mc_n_iter,
-                template_frames=p.mc_template_frames,
-                output_path=mc_path,
-                n_jobs=p.n_jobs,
-                device=p.device,
                 gSig_filt=p.mc_gSig_filt,
-                method=p.mc_method,
-                n_features=p.mc_n_features,
-                min_matches=p.mc_min_matches,
-                temporal_smooth_sigma=p.mc_temporal_smooth_sigma,
+                upsample_factor=p.upsample_factor,
+                niter_rig=p.mc_niter_rig,
             )
-            movie_arr = np.asarray(movie_arr, dtype=np.float32)
 
         # --- Steps 2-3: sample frames for statistics if T > sample_frames ---
         T = len(movie_arr)
@@ -241,12 +202,12 @@ class CNMFe:
         print("Estimating noise...")
         self.sn = estimate_noise(stats_movie)   # (H, W)
 
-        # --- Step 3: Summary images ---
-        print("Computing CORR and PNR images...")
-        cn, pnr = correlation_pnr(
-            stats_movie, sigma=p.sigma, center_psf=p.center_psf,
-            n_jobs=p.n_jobs, device=p.device,
-        )
+        # # --- Step 3: Summary images ---
+        # print("Computing CORR and PNR images...")
+        # cn, pnr = correlation_pnr(
+        #     stats_movie, sigma=p.sigma, center_psf=p.center_psf,
+        #     n_jobs=p.n_jobs, device=p.device,
+        # )
 
         # --- Step 4: Initialization ---
         print("Running greedy CORR-PNR initialization...")

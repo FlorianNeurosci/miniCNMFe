@@ -37,9 +37,9 @@ def ensure_float32(arr: np.ndarray) -> np.ndarray:
 def iter_frames(movie: "Any", batch_size: int = 200) -> Iterator[tuple[int, np.ndarray]]:
     """Yield (start_idx, batch) where batch is float32 shape (B, H, W).
 
-    Works with zarr arrays, numpy arrays, and any object with __len__ and __getitem__.
+    Works with zarr arrays, numpy arrays, and any object supporting .shape or __len__.
     """
-    T = len(movie)
+    T = movie.shape[0] if hasattr(movie, "shape") else len(movie)
     for start in range(0, T, batch_size):
         end = min(start + batch_size, T)
         batch = np.asarray(movie[start:end], dtype=np.float32)

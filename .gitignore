@@ -90,5 +90,8 @@ results/
 tmp/
 temp/
 
+# ── Local-only test data (large binaries, not committed) ─────────────────────
+tests/data/
+
 # ── CaImAn reference source (algorithmic reference only, not part of this pkg) ─
 CaImAn-main/

@@ -365,14 +365,12 @@ def motion_correction_rigid(
 
     if template is None:
 
-        filtered = np.zeros_like(movie)
-
-        for i in range(T):
-
-            filtered[i] = high_pass_filter_space(
-                movie[i],
-                gSig_filt
-            )
+        if gSig_filt is not None:
+            filtered = np.zeros_like(movie)
+            for i in range(T):
+                filtered[i] = high_pass_filter_space(movie[i], gSig_filt)
+        else:
+            filtered = movie
 
         template = caiman_bin_median(
             filtered,
@@ -398,10 +396,10 @@ def motion_correction_rigid(
                 f"{iteration+1}/{niter_rig}"
             )
 
-        filtered_template = high_pass_filter_space(
-            template,
-            gSig_filt
-        )
+        if gSig_filt is not None:
+            filtered_template = high_pass_filter_space(template, gSig_filt)
+        else:
+            filtered_template = template
 
         corrected_iter = np.zeros_like(corrected)
 
@@ -419,10 +417,10 @@ def motion_correction_rigid(
 
             frame = corrected[t]
 
-            filtered_frame = high_pass_filter_space(
-                frame,
-                gSig_filt
-            )
+            if gSig_filt is not None:
+                filtered_frame = high_pass_filter_space(frame, gSig_filt)
+            else:
+                filtered_frame = frame
 
             shift = register_translation_caiman(
                 filtered_template,
@@ -447,14 +445,12 @@ def motion_correction_rigid(
         # update template
         # -----------------------------------------------------------------
 
-        filtered_corrected = np.zeros_like(corrected)
-
-        for i in range(T):
-
-            filtered_corrected[i] = high_pass_filter_space(
-                corrected[i],
-                gSig_filt
-            )
+        if gSig_filt is not None:
+            filtered_corrected = np.zeros_like(corrected)
+            for i in range(T):
+                filtered_corrected[i] = high_pass_filter_space(corrected[i], gSig_filt)
+        else:
+            filtered_corrected = corrected
 
         template = caiman_bin_median(
             filtered_corrected,
@@ -462,3 +458,37 @@ def motion_correction_rigid(
         )
 
     return corrected, shifts_total
+
+
+# ---------------------------------------------------------------------------
+# Convenience aliases used by the rest of the package
+# ---------------------------------------------------------------------------
+
+def apply_shift(img: np.ndarray, shift) -> np.ndarray:
+    """Alias for apply_shift_caiman — apply (dy, dx) shift via cv2.warpAffine."""
+    return apply_shift_caiman(img, shift)
+
+
+def estimate_shifts(
+    frame: np.ndarray,
+    template: np.ndarray,
+    upsample_factor: int = 10,
+    max_shift=(20, 20),
+    gSig_filt: float | None = None,
+) -> np.ndarray:
+    """Estimate subpixel (dy, dx) shift between frame and template.
+
+    Thin wrapper around register_translation_caiman that optionally applies
+    the CaImAn high-pass filter before cross-correlation.
+
+    Returns:
+        shift: float32 array shape (2,) — (dy, dx)
+    """
+    f = frame.astype(np.float32)
+    t = template.astype(np.float32)
+    if gSig_filt is not None and gSig_filt > 0:
+        f = high_pass_filter_space(f, float(gSig_filt))
+        t = high_pass_filter_space(t, float(gSig_filt))
+    dy, dx = register_translation_caiman(t, f, upsample_factor=upsample_factor,
+                                          max_shifts=max_shift)
+    return np.array([dy, dx], dtype=np.float32)

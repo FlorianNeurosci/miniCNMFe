@@ -74,7 +74,7 @@ def estimate_noise(
     Returns:
         sn: (H, W) float32 noise std estimate.
     """
-    T = len(movie)
+    T = movie.shape[0] if hasattr(movie, "shape") else len(movie)
     # Load full movie in chunks and accumulate PSD
     # rfft gives T//2+1 frequency bins; select the noise range
     n_fft = T

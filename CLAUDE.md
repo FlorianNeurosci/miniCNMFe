@@ -54,6 +54,33 @@ Major work done so far:
 
 ## Key design decisions
 
+### Motion correction — canonical implementation
+`motion_correction_rigid` in `cnmfe/motion_correction.py` is the **only** motion
+correction algorithm. It uses `cv2.filter2D` for high-pass filtering (matching
+CaImAn's `border_reflect`) and `cv2.warpAffine` for applying shifts. Both choices
+are critical for producing the same shifts as CaImAn on real data — using
+`scipy.ndimage.convolve` or FFT-based shift application produces a ~4–5 px absolute
+offset compared to CaImAn even when correlation is high. Do not replace these with
+scipy equivalents.
+
+Convenience wrappers added alongside `motion_correction_rigid`:
+- `apply_shift(img, shift)` — alias for `apply_shift_caiman`
+- `estimate_shifts(frame, template, ...)` — thin wrapper around `register_translation_caiman`
+
+**ROI-based shift estimation (design note — not currently implemented):**
+A `select_roi` function was prototyped that finds the neuron-dense rectangular
+sub-region of a frame for use in shift estimation (shift estimated from ROI,
+applied to full frame). Algorithm:
+1. Temporal-std projection on a subsampled movie (neurons flicker; background drifts slowly).
+2. Spatial high-pass (subtract Gaussian blur) to remove broad gradients.
+3. Optional LoG blobness filter to favour blob-shaped structures over vessels.
+4. Mask frame borders to avoid edge artefacts.
+5. Find the crop of size `(frac_h·H, frac_w·W)` with the highest total score via an
+   O(H·W) integral-image (vectorised sliding-window sum, no Python loop).
+This approach can reduce the influence of vasculature and slow background on shift
+estimation. If re-implementing, apply the filter to the crop before cross-correlation,
+and apply the resulting shift to the full (uncropped) frame.
+
 ### `device` / `n_jobs` pattern
 - `get_xp(device)` in `_utils.py` — returns `numpy` or `cupy`; call at function entry
 - `to_numpy(arr)` in `_utils.py` — always returns numpy; handles cupy transparently
@@ -171,7 +198,7 @@ otherwise fall back to `_s[0:2]`. The same fix applies to `concat_avis_to_zarr.p
 cnmfe/                         Main package
   _utils.py                    make_2d, make_3d, get_xp, to_numpy, iter_frames, ensure_float32
   io.py                        avi_to_zarr, open_zarr, save_zarr
-  motion_correction.py
+  motion_correction.py         motion_correction_rigid, apply_shift, estimate_shifts
   preprocess.py                make_center_surround_psf, estimate_noise, correlation_pnr
   background.py                build_ring_indices, compute_W, subtract_background
   initialization.py            detect_seeds, extract_spatial_temporal, greedy_corr_pnr
