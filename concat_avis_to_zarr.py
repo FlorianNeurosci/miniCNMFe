@@ -11,25 +11,44 @@ The AVI files are sorted by the integer embedded in their filename:
 Files whose names are not purely numeric (e.g. "preview.avi") are skipped
 unless you pass --pattern to change the glob.
 
-
-
 Output zarr is time-chunked (100 frames/chunk), uint8, shape (T_total, H, W),
 with lossless blosc lz4+bitshuffle compression. Use --dtype float32 for
 float-valued intermediates.
 It can be opened lazily with  cnmfe.io.open_zarr(output_path).
+
+Programmatic use:
+    from concat_avis_to_zarr import concat_avis_to_zarr
+    z = concat_avis_to_zarr(folder, output_path="session.zarr",
+                            pattern="*.avi", skip_if_exists=True)
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import queue
 import re
+import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
+if TYPE_CHECKING:
+    import zarr as zarr_pkg  # noqa: F401
+
+
+# A "done" sentinel pushed onto the queue when a decoder finishes its file.
+# Using a unique singleton object so we never confuse it with a real batch.
+_DECODER_DONE = object()
+
 
 def _iter_frames(path: Path, grayscale: bool = True):
-    """Yield frames from a single AVI file in their natural dtype."""
+    """Yield frames from a single AVI file in their natural dtype.
+
+    Used only by the serial (n_jobs=1) path. The parallel path goes through
+    `_decode_avi_worker` which talks to pyav directly.
+    """
     import imageio.v3 as iio
     for frame in iio.imiter(str(path), plugin="pyav"):
         frame = np.asarray(frame)  # keep natural dtype (uint8 for 8-bit AVIs)
@@ -57,6 +76,395 @@ def _numeric_key(path: Path) -> int:
     return int(m.group()) if m else -1
 
 
+# ---------------------------------------------------------------------------
+# Parallel decode pipeline (n_jobs >= 2)
+# ---------------------------------------------------------------------------
+
+def _decode_avi_worker(
+    path: Path,
+    file_idx: int,
+    start_offset: int,
+    chunk_t: int,
+    grayscale: bool,
+    grayscale_method: str,
+    dtype: str,
+    out_q: "queue.Queue",
+    errors: list,
+    stop_event: threading.Event,
+) -> None:
+    """Decode one AVI in a worker thread and push (start, batch) to out_q.
+
+    Each batch is a `(<=chunk_t, H, W)` (or `(.., H, W, 3)` for colour)
+    ndarray already cast to `dtype`. Frames within a file stay in order;
+    the absolute `start` index carried by each batch lets the writer place
+    them correctly when batches from different files arrive interleaved.
+
+    On any exception, the exception is appended to `errors`, `stop_event`
+    is set, and a `_DECODER_DONE` sentinel is sent so the writer can
+    bail out.
+
+    The Y-plane fast path (`grayscale_method="luma"`) decodes straight to
+    a `(H, W) uint8` frame via pyav's `format="gray8"`, skipping any
+    RGB intermediate. For grayscale-encoded sources (R==G==B in the
+    original) this is pixel-identical to the historical `frame.mean(axis=-1)`
+    behaviour.
+    """
+    try:
+        import av  # pyav
+
+        # batch buffer + how many frames have been written into it
+        buf = None       # lazy-allocated once we know H, W
+        fill = 0
+        cur_start = start_offset
+
+        container = av.open(str(path))
+        try:
+            stream = container.streams.video[0]
+            # FRAME-level multithread decode helps MJPEG (each frame is
+            # intra-coded). Harmless on other codecs.
+            stream.thread_type = "FRAME"
+
+            for frame in container.decode(stream):
+                if stop_event.is_set():
+                    return
+
+                if grayscale and grayscale_method == "luma":
+                    arr = frame.to_ndarray(format="gray8")  # (H, W) uint8
+                elif grayscale and grayscale_method == "mean":
+                    rgb = frame.to_ndarray(format="rgb24")  # (H, W, 3) uint8
+                    arr = rgb.mean(axis=-1)                  # float64 (H, W)
+                else:
+                    arr = frame.to_ndarray(format="rgb24")   # keep RGB
+
+                if buf is None:
+                    buf = np.empty((chunk_t,) + arr.shape, dtype=dtype)
+                buf[fill] = arr
+                fill += 1
+
+                if fill == chunk_t:
+                    out_q.put((cur_start, buf[:fill].copy()))
+                    cur_start += fill
+                    fill = 0
+        finally:
+            container.close()
+
+        # Flush the tail (fewer than chunk_t frames).
+        if buf is not None and fill > 0:
+            out_q.put((cur_start, buf[:fill].copy()))
+    except BaseException as exc:  # noqa: BLE001 — propagate to main thread
+        errors.append(exc)
+        stop_event.set()
+    finally:
+        out_q.put((file_idx, _DECODER_DONE))
+
+
+def _writer_loop(
+    store,
+    out_q: "queue.Queue",
+    n_files: int,
+    errors: list,
+    progress=None,
+) -> int:
+    """Consume (start, batch) tuples and write them to `store`.
+
+    Returns total frames written. Exits once `n_files` decoder sentinels
+    have been seen, or once any decoder reports an error.
+    """
+    sentinels_seen = 0
+    total_written = 0
+    while sentinels_seen < n_files:
+        start, batch = out_q.get()
+        if batch is _DECODER_DONE:
+            sentinels_seen += 1
+            continue
+
+        end = start + len(batch)
+        store[start:end] = batch
+        total_written += len(batch)
+        if progress is not None:
+            progress.update(len(batch))
+
+    if errors:
+        raise errors[0]
+    return total_written
+
+
+def concat_avis_to_zarr(
+    folder: "str | Path",
+    output_path: "str | Path | None" = None,
+    pattern: str = "*.avi",
+    chunk_t: int = 100,
+    dtype: str = "uint8",
+    grayscale: bool = True,
+    skip_if_exists: bool = False,
+    n_jobs: "int | None" = None,
+    grayscale_method: str = "luma",
+    queue_maxsize: "int | None" = None,
+    verbose: bool = True,
+):
+    """Concatenate numbered AVIs in `folder` into a single time-chunked zarr.
+
+    AVI files are sorted by the integer in their filename stem (so 2.avi
+    comes before 10.avi). Files whose stem isn't purely numeric are skipped.
+
+    For multi-file sessions the parallel path (N decoder threads + 1 writer)
+    gives a roughly N× speed-up on intra-coded codecs (MJPEG / motion-JPEG —
+    the common miniscope case), capped by IO and memory bandwidth.
+
+    Args:
+        folder: Directory containing the AVI files.
+        output_path: Output zarr path. Default: `<folder>/movie.zarr`.
+        pattern: Glob pattern. Default `"*.avi"`. Use e.g. `"realistic_*.avi"`
+            to pick a subset.
+        chunk_t: Frames per time chunk in the output zarr.
+        dtype: On-disk dtype. Default `"uint8"` (matches 8-bit miniscope AVIs).
+            Use `"float32"` for already-corrected/float intermediates.
+        grayscale: Convert RGB → gray at read time. Default True.
+        skip_if_exists: If True and output_path already exists, open and
+            return it instead of raising / overwriting. Useful for notebook
+            idempotency.
+        n_jobs: Number of parallel decoder threads. ``1`` keeps the original
+            serial path (single decoder + inline writes). ``>=2`` enables the
+            producer-consumer pipeline. ``None`` (default) picks
+            ``min(cpu_count, len(avis), 4)`` — beyond ~4 the speedup
+            plateaus because of IO / memory bandwidth.
+        grayscale_method: ``"luma"`` (default, fast) decodes directly to a
+            ``(H, W) uint8`` Y-plane via pyav's ``format="gray8"``.
+            ``"mean"`` decodes RGB and averages channels (the historical
+            behaviour). For grayscale-encoded sources (R==G==B; all
+            miniscope data) the two produce identical pixels.
+        queue_maxsize: Bounded-queue depth for the parallel pipeline.
+            ``None`` (default) = ``2 * n_jobs``. Larger uses more RAM, smaller
+            risks starving the writer.
+        verbose: Print progress lines.
+
+    Returns:
+        Open zarr.Array with shape (T_total, H, W).
+
+    Raises:
+        FileNotFoundError: `folder` is not a directory.
+        ValueError: no matching numerically-named AVIs found, or spatial
+            dimensions disagree across files, or unknown ``grayscale_method``.
+        FileExistsError: output exists and `skip_if_exists` is False.
+    """
+    if grayscale_method not in ("luma", "mean"):
+        raise ValueError(
+            f"grayscale_method must be 'luma' or 'mean', got {grayscale_method!r}"
+        )
+    folder = Path(folder).resolve()
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Not a directory: {folder}")
+
+    out_path = Path(output_path) if output_path is not None else folder / "movie.zarr"
+
+    # Early exit if caller wants idempotent behaviour.
+    if out_path.exists():
+        if skip_if_exists:
+            if verbose:
+                print(f"Output already exists, reusing: {out_path}")
+            from cnmfe.io import open_zarr
+            return open_zarr(out_path)
+        raise FileExistsError(
+            f"Output already exists: {out_path}. "
+            f"Delete it or pass skip_if_exists=True to reuse it."
+        )
+
+    # --- Collect AVI files, sort numerically --------------------------------
+    candidates = sorted(folder.glob(pattern), key=_numeric_key)
+    avis = [p for p in candidates if _numeric_key(p) >= 0]
+    if not avis:
+        raise ValueError(
+            f"No numerically-named AVI files found in {folder} "
+            f"matching '{pattern}'. Expected files like 0.avi, 1.avi, ..."
+        )
+
+    if verbose:
+        print(f"Found {len(avis)} AVI files: "
+              f"{avis[0].name} ... {avis[-1].name}")
+
+    # --- Pre-scan: count frames and validate spatial dimensions -------------
+    if verbose:
+        print("Scanning frame counts ...", flush=True)
+    counts: list[int] = []
+    ref_H = ref_W = None
+    for avi in avis:
+        n, H, W = _count_and_shape(avi)
+        if ref_H is None:
+            ref_H, ref_W = H, W
+        elif (H, W) != (ref_H, ref_W):
+            raise ValueError(
+                f"Spatial mismatch: {avi.name} is {H}x{W} "
+                f"but first file is {ref_H}x{ref_W}"
+            )
+        counts.append(n)
+        if verbose:
+            print(f"  {avi.name}: {n} frames  ({H}x{W})", flush=True)
+
+    T_total = sum(counts)
+    if verbose:
+        print(f"\nTotal: {T_total} frames  x  {ref_H}x{ref_W} px")
+
+    # --- Create zarr --------------------------------------------------------
+    from cnmfe.io import _open_array
+    store = _open_array(out_path, "w",
+                        shape=(T_total, ref_H, ref_W),
+                        chunks=(chunk_t, ref_H, ref_W),
+                        dtype=dtype,
+                        compression=True)
+    if verbose:
+        print(f"\nWriting -> {out_path}")
+        print(f"  shape={store.shape}  chunks={store.chunks}  dtype={dtype}",
+              flush=True)
+
+    # --- Pick parallel vs serial path --------------------------------------
+    if n_jobs is None:
+        n_jobs = min(os.cpu_count() or 1, len(avis), 4)
+    n_jobs = max(1, int(n_jobs))
+
+    if n_jobs == 1:
+        write_start = _run_serial(
+            avis, counts, store, chunk_t, dtype, grayscale, grayscale_method,
+            verbose,
+        )
+    else:
+        if queue_maxsize is None:
+            queue_maxsize = 2 * n_jobs
+        write_start = _run_parallel(
+            avis, counts, store, chunk_t, dtype, grayscale, grayscale_method,
+            n_jobs, queue_maxsize, verbose,
+        )
+
+    if verbose:
+        print(f"\nDone. Zarr written to: {out_path}")
+        print(f"  Total frames written: {write_start}")
+
+    return store
+
+
+# ---------------------------------------------------------------------------
+# Serial vs parallel runners
+# ---------------------------------------------------------------------------
+
+def _run_serial(avis, counts, store, chunk_t, dtype, grayscale,
+                grayscale_method, verbose) -> int:
+    """Single-threaded path: same loop as before, plus the luma fast-path.
+
+    Kept as a verbatim alternative to the parallel pipeline for debugging
+    and test reproducibility.
+    """
+    write_start = 0
+    buf: list[np.ndarray] = []
+
+    def _flush(buf: list, start: int) -> int:
+        if not buf:
+            return start
+        batch = np.stack(buf, axis=0).astype(dtype)
+        end = start + len(batch)
+        store[start:end] = batch
+        return end
+
+    # Luma fast-path: use the same direct-to-gray8 decoder as the parallel
+    # path so serial output is byte-equal to parallel output. "mean" falls
+    # back to the imageio iterator (historical behaviour).
+    if grayscale and grayscale_method == "luma":
+        import av
+        for avi_idx, avi in enumerate(avis):
+            if verbose:
+                print(f"  [{avi_idx + 1}/{len(avis)}] {avi.name} ...",
+                      end=" ", flush=True)
+            container = av.open(str(avi))
+            try:
+                stream = container.streams.video[0]
+                stream.thread_type = "FRAME"
+                for frame in container.decode(stream):
+                    buf.append(frame.to_ndarray(format="gray8"))
+                    if len(buf) == chunk_t:
+                        write_start = _flush(buf, write_start)
+                        buf = []
+            finally:
+                container.close()
+            if verbose:
+                print(f"{counts[avi_idx]} frames", flush=True)
+    else:
+        # RGB or "mean" grayscale: go through the imageio iterator.
+        for avi_idx, avi in enumerate(avis):
+            if verbose:
+                print(f"  [{avi_idx + 1}/{len(avis)}] {avi.name} ...",
+                      end=" ", flush=True)
+            for frame in _iter_frames(avi, grayscale=grayscale):
+                buf.append(frame)
+                if len(buf) == chunk_t:
+                    write_start = _flush(buf, write_start)
+                    buf = []
+            if verbose:
+                print(f"{counts[avi_idx]} frames", flush=True)
+
+    write_start = _flush(buf, write_start)
+    return write_start
+
+
+def _run_parallel(avis, counts, store, chunk_t, dtype, grayscale,
+                  grayscale_method, n_jobs, queue_maxsize, verbose) -> int:
+    """Producer-consumer parallel pipeline.
+
+    Spawns up to `n_jobs` decoder threads (one per AVI, capped at `n_jobs`
+    in flight) and one writer thread. Frame batches travel through a
+    bounded `queue.Queue` so RAM is `O(queue_maxsize * chunk_t * H * W)`.
+    """
+    out_q: "queue.Queue" = queue.Queue(maxsize=queue_maxsize)
+    errors: list = []
+    stop_event = threading.Event()
+
+    # Compute each AVI's absolute frame offset from the pre-scan counts.
+    offsets = np.concatenate([[0], np.cumsum(counts[:-1])]).tolist()
+
+    # Spawn decoders. We cap concurrent threads at n_jobs by spawning in
+    # batches; a simple Semaphore controls admission. For typical sessions
+    # (len(avis) ~ n_jobs) all decoders run concurrently from the start.
+    sem = threading.Semaphore(n_jobs)
+
+    def _decode_with_admission(*args):
+        with sem:
+            _decode_avi_worker(*args)
+
+    decoder_threads: list[threading.Thread] = []
+    for i, (path, count, offset) in enumerate(zip(avis, counts, offsets)):
+        t = threading.Thread(
+            target=_decode_with_admission,
+            args=(path, i, offset, chunk_t, grayscale, grayscale_method,
+                  dtype, out_q, errors, stop_event),
+            name=f"decoder-{i}-{path.name}",
+            daemon=True,
+        )
+        decoder_threads.append(t)
+        t.start()
+
+    # Run the writer on the main thread (no extra thread needed; cleaner
+    # exception propagation). Use tqdm for a frames-written progress bar.
+    T_total = int(sum(counts))
+    if verbose:
+        try:
+            from tqdm import tqdm
+            progress = tqdm(total=T_total, unit="frame", desc="decode+write")
+        except ImportError:
+            progress = None
+    else:
+        progress = None
+
+    try:
+        total_written = _writer_loop(store, out_q, n_files=len(avis),
+                                     errors=errors, progress=progress)
+    finally:
+        if progress is not None:
+            progress.close()
+        # All decoders should have finished by now (writer waits for all
+        # sentinels). Join them so any exceptions surface cleanly.
+        for t in decoder_threads:
+            t.join(timeout=5)
+
+    return total_written
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -72,93 +480,43 @@ def main() -> None:
                         help="On-disk dtype (default: uint8; use float32 for float intermediates)")
     parser.add_argument("--color", action="store_true",
                         help="Keep colour channels (default: convert to grayscale)")
+    parser.add_argument("--skip-if-exists", action="store_true",
+                        help="If output zarr already exists, reuse it (default: error)")
+    parser.add_argument("--n-jobs", type=int, default=None,
+                        help="Parallel decoder threads (default: auto = min(cpu, len(avis), 4); "
+                             "1 = original serial path)")
+    parser.add_argument("--grayscale-method", choices=("luma", "mean"),
+                        default="luma",
+                        help="Grayscale conversion: 'luma' (Y-plane, fast, default) or "
+                             "'mean' (RGB average, historical)")
+    parser.add_argument("--queue-maxsize", type=int, default=None,
+                        help="Bounded-queue depth in the parallel pipeline "
+                             "(default: 2 * n_jobs)")
     args = parser.parse_args()
 
-    folder: Path = args.folder.resolve()
-    if not folder.is_dir():
-        parser.error(f"Not a directory: {folder}")
-
-    grayscale = not args.color
-    dtype: str = args.dtype
-
-    # --- Collect AVI files, sort numerically --------------------------------
-    candidates = sorted(folder.glob(args.pattern), key=_numeric_key)
-    avis = [p for p in candidates if _numeric_key(p) >= 0]
-    if not avis:
-        parser.error(
-            f"No numerically-named AVI files found in {folder} "
-            f"matching '{args.pattern}'. Expected files like 0.avi, 1.avi, ..."
+    try:
+        store = concat_avis_to_zarr(
+            folder=args.folder,
+            output_path=args.output,
+            pattern=args.pattern,
+            chunk_t=args.chunk_t,
+            dtype=args.dtype,
+            grayscale=not args.color,
+            skip_if_exists=args.skip_if_exists,
+            n_jobs=args.n_jobs,
+            grayscale_method=args.grayscale_method,
+            queue_maxsize=args.queue_maxsize,
+            verbose=True,
         )
+    except (FileNotFoundError, ValueError, FileExistsError) as exc:
+        parser.error(str(exc))
+        return  # unreachable
 
-    print(f"Found {len(avis)} AVI files: "
-          f"{avis[0].name} ... {avis[-1].name}")
-
-    # --- Pre-scan: count frames and validate spatial dimensions -------------
-    print("Scanning frame counts ...", flush=True)
-    counts: list[int] = []
-    ref_H = ref_W = None
-    for avi in avis:
-        n, H, W = _count_and_shape(avi)
-        if ref_H is None:
-            ref_H, ref_W = H, W
-        elif (H, W) != (ref_H, ref_W):
-            parser.error(
-                f"Spatial mismatch: {avi.name} is {H}x{W} "
-                f"but first file is {ref_H}x{ref_W}"
-            )
-        counts.append(n)
-        print(f"  {avi.name}: {n} frames  ({H}x{W})", flush=True)
-
-    T_total = sum(counts)
-    print(f"\nTotal: {T_total} frames  x  {ref_H}x{ref_W} px")
-
-    # --- Create zarr --------------------------------------------------------
-    out_path: Path = args.output if args.output else folder / "movie.zarr"
-    if out_path.exists():
-        print(f"\nOutput already exists: {out_path}")
-        print("Delete it first if you want to overwrite.")
-        return
-
-    from cnmfe.io import _open_array
-    store = _open_array(out_path, "w",
-                        shape=(T_total, ref_H, ref_W),
-                        chunks=(args.chunk_t, ref_H, ref_W),
-                        dtype=dtype,
-                        compression=True)
-    print(f"\nWriting -> {out_path}")
-    print(f"  shape={store.shape}  chunks={store.chunks}  dtype={dtype}", flush=True)
-
-    # --- Stream each AVI into the zarr -------------------------------------
-    write_start = 0
-    buf: list[np.ndarray] = []
-
-    def _flush(buf: list, start: int) -> int:
-        if not buf:
-            return start
-        batch = np.stack(buf, axis=0).astype(dtype)
-        end = start + len(batch)
-        store[start:end] = batch
-        return end
-
-    for avi_idx, avi in enumerate(avis):
-        print(f"  [{avi_idx + 1}/{len(avis)}] {avi.name} ...", end=" ", flush=True)
-        n_written = 0
-        for frame in _iter_frames(avi, grayscale=grayscale):
-            buf.append(frame)
-            if len(buf) == args.chunk_t:
-                write_start = _flush(buf, write_start)
-                buf = []
-                n_written += args.chunk_t
-        print(f"{counts[avi_idx]} frames", flush=True)
-
-    # flush any remaining frames
-    write_start = _flush(buf, write_start)
-
-    print(f"\nDone. Zarr written to: {out_path}")
-    print(f"  Total frames written: {write_start}")
+    out_path = args.output if args.output else args.folder.resolve() / "movie.zarr"
     print(f"\nLoad lazily with:")
     print(f"  from cnmfe.io import open_zarr")
     print(f"  z = open_zarr('{out_path}')")
+    _ = store  # silence linters
 
 
 if __name__ == "__main__":
