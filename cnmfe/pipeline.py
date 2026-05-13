@@ -35,6 +35,10 @@ class CNMFeParams:
     upsample_factor: int = 10
     mc_niter_rig: int = 1              # number of rigid MC passes (CaImAn default is 1)
     mc_gSig_filt: float | None = None  # 1p high-pass sigma; set ≈ sigma to enable
+    mc_batch_size: int = 200           # frames per streaming/parallel batch in MC
+    mc_template_max_frames: int = 2000 # cap on frames sampled to build the MC template
+    mc_output_chunk_t: "int | None" = None   # output zarr chunk on time axis (None = match source)
+    mc_output_dtype: str = "float32"   # output zarr dtype for the corrected movie
 
     # --- Spatial filtering / PSF ---
     sigma: float = 3.0        # Gaussian sigma in pixels (neuron size)
@@ -128,31 +132,49 @@ class CNMFe:
 
         Stores self.shifts and self.dims.
 
-        When output_dir is given: saves mc.zarr to disk and returns the zarr
-        handle so the in-memory corrected buffer is freed after this call.
-        When output_dir is None: returns a float32 numpy array in memory.
+        - If ``output_dir`` is given **or** the input is a zarr.Array, runs the
+          streaming MC path: reads/writes batches of frames, peak RAM is
+          ``(mc_batch_size + mc_template_max_frames) * H * W * 4`` bytes
+          regardless of T. The corrected movie is written to
+          ``<output_dir>/mc.zarr`` and the zarr handle is returned.
+        - Otherwise (numpy input, no output_dir): returns a float32 numpy array
+          in memory. Per-frame work is parallelized over ``params.n_jobs``.
 
-        Call model.fit(mc, do_motion_correction=False) afterward to run
+        Call ``model.fit(mc, do_motion_correction=False)`` afterward to run
         extraction without re-running correction.
 
         Args:
             movie: Input movie, shape (T, H, W). zarr or numpy array.
-            output_dir: If given, write mc.zarr here and return zarr handle.
+            output_dir: If given, write ``mc.zarr`` here and return zarr handle.
 
         Returns:
-            Corrected movie — zarr handle (if output_dir given) or np.ndarray.
+            Corrected movie — zarr handle (if output_dir given / zarr input)
+            or np.ndarray (if numpy input + no output_dir).
         """
         p = self.params
-        movie_arr = np.asarray(movie, dtype=np.float32)
-        T, H, W = movie_arr.shape
+
+        # Read shape without materializing the full movie when it's a zarr.
+        T, H, W = int(movie.shape[0]), int(movie.shape[1]), int(movie.shape[2])
         self.dims = (H, W)
 
+        output_path: "Path | None" = None
+        if output_dir is not None:
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = output_dir / "mc.zarr"
+
         corrected, self.shifts = motion_correction_rigid(
-            movie_arr,
+            movie,
+            output_path=output_path,
             max_shift=p.max_shift,
             gSig_filt=p.mc_gSig_filt,
             upsample_factor=p.upsample_factor,
             niter_rig=p.mc_niter_rig,
+            batch_size=p.mc_batch_size,
+            n_jobs=p.n_jobs,
+            template_max_frames=p.mc_template_max_frames,
+            output_chunk_t=p.mc_output_chunk_t,
+            output_dtype=p.mc_output_dtype,
         )
         return corrected
 
@@ -181,12 +203,19 @@ class CNMFe:
 
         # --- Step 1: Motion correction ---
         if do_motion_correction:
+            # In-memory path here: extraction steps below need the full movie
+            # in RAM anyway, so streaming-to-zarr would only add disk IO.
+            # Use fit_mc(zarr, output_dir=...) directly when the input is too
+            # big to materialize.
             movie_arr, self.shifts = motion_correction_rigid(
                 movie_arr,
                 max_shift=p.max_shift,
                 gSig_filt=p.mc_gSig_filt,
                 upsample_factor=p.upsample_factor,
                 niter_rig=p.mc_niter_rig,
+                batch_size=p.mc_batch_size,
+                n_jobs=p.n_jobs,
+                template_max_frames=p.mc_template_max_frames,
             )
 
         # --- Steps 2-3: sample frames for statistics if T > sample_frames ---
