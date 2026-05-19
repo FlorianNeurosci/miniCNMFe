@@ -319,14 +319,17 @@ def _compute_w_streaming(
             raw_results.extend(_process_batch(start, end))
         return raw_results
 
-    # Joblib's pickling can't ship the zarr handle to worker processes
-    # cheaply, and the per-batch IO is the dominant cost — parallel
-    # workers would deserialise the whole store per call. For now the
-    # streaming path runs serially regardless of n_jobs. Marked here so
-    # we can revisit with a shared-memory or chunk-aware backend later.
-    raw_results = []
-    for start, end in batches:
-        raw_results.extend(_process_batch(start, end))
+    # Thread-based parallelism. Process-based (loky) would have to ship
+    # A, C_sub, b0, and the zarr handle to every worker per call — that's
+    # ~12 MB × n_batches of IPC, more expensive than the compute itself.
+    # The heavy ops in _process_batch (zarr reads, np.linalg.solve, einsum,
+    # sparse mat-vec) all release the GIL, so threads get real speedup
+    # without the serialisation tax.
+    from joblib import Parallel, delayed
+    per_batch = Parallel(n_jobs=n_jobs, prefer="threads")(
+        delayed(_process_batch)(start, end) for start, end in batches
+    )
+    raw_results = [item for batch_out in per_batch for item in batch_out]
     return raw_results
 
 

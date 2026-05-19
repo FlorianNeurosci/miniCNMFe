@@ -592,7 +592,18 @@ def _motion_correction_streaming(
         except OSError:
             pass
     # shutil.move is portable across filesystems; same-fs rename is atomic.
-    shutil.move(str(final_scratch), str(output_path))
+    # If the move fails (cross-fs error, permission, AV lock), make sure both
+    # scratch zarrs are removed so we don't accrue 2-3x the movie size on disk
+    # across retries.
+    try:
+        shutil.move(str(final_scratch), str(output_path))
+    finally:
+        for p in (scratch_a, scratch_b):
+            if p != output_path and p.exists():
+                try:
+                    shutil.rmtree(p)
+                except OSError:
+                    pass
 
     import zarr
     return zarr.open_array(str(output_path), mode="r+"), shifts_total

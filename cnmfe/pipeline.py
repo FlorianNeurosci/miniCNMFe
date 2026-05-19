@@ -18,11 +18,29 @@ from cnmfe._utils import make_2d
 from cnmfe.background import BackgroundSubtractor, compute_W
 from cnmfe.evaluate import auto_evaluate_components
 from cnmfe.initialization import greedy_corr_pnr
+from cnmfe.io import transpose_zarr_to_pixel_major
 from cnmfe.merging import merge_components
 from cnmfe.motion_correction import motion_correction_rigid
 from cnmfe.preprocess import correlation_pnr, estimate_noise
 from cnmfe.spatial import update_spatial
 from cnmfe.temporal import estimate_ar_params, update_temporal
+
+
+def _zarr_store_path(arr) -> "str | None":
+    """Best-effort: return the on-disk path backing ``arr`` (a zarr.Array).
+
+    Returns None if the array is in-memory or has no resolvable path —
+    callers should fall back to materialisation in that case.
+    """
+    store = getattr(arr, "store", None)
+    if store is None:
+        return None
+    # zarr v3 LocalStore exposes .root; FsspecStore exposes .path.
+    for attr in ("root", "path"):
+        val = getattr(store, attr, None)
+        if val is not None:
+            return str(val)
+    return None
 
 if TYPE_CHECKING:
     import zarr
@@ -377,7 +395,35 @@ class CNMFe:
         """
         p = self.params
 
-        # --- Streaming mode (Y_flat_zarr supplied) ----------------------------
+        # --- Auto-derive Y_flat_zarr from a zarr movie + output_dir -----------
+        # Passing a zarr.Array `movie` without Y_flat_zarr used to silently
+        # asarray() the whole thing into RAM (86 GB for 60k×600×600). When
+        # the user also gives an `output_dir` we know where to put a derived
+        # pixel-major store: transpose once (idempotent — skip_if_exists),
+        # then route through the existing streaming branch below.
+        auto_derived_y_flat = False
+        if Y_flat_zarr is None and not do_motion_correction:
+            try:
+                import zarr as _zarr_pkg
+                is_zarr_movie = isinstance(movie, _zarr_pkg.Array)
+            except ImportError:
+                is_zarr_movie = False
+            if is_zarr_movie and output_dir is not None:
+                src_path = _zarr_store_path(movie)
+                if src_path is None:
+                    raise ValueError(
+                        "Cannot auto-derive Y_flat_zarr: the input zarr has no "
+                        "resolvable on-disk path. Pass Y_flat_zarr= explicitly "
+                        "(e.g. via cnmfe.io.transpose_zarr_to_pixel_major)."
+                    )
+                pixel_path = Path(output_dir) / "Y_flat_pixel.zarr"
+                pixel_path.parent.mkdir(parents=True, exist_ok=True)
+                Y_flat_zarr = transpose_zarr_to_pixel_major(
+                    src_path, pixel_path, verbose=True,
+                )
+                auto_derived_y_flat = True
+
+        # --- Streaming mode (Y_flat_zarr supplied or auto-derived) ------------
         streaming = Y_flat_zarr is not None
         if streaming:
             try:
@@ -407,6 +453,21 @@ class CNMFe:
 
         dims = (H, W)
         self.dims = dims
+
+        # --- Log effective config so users can see what they got ---
+        if streaming:
+            stream_str = f"yes (Y_flat_zarr={'auto-derived' if auto_derived_y_flat else 'user-supplied'})"
+        else:
+            stream_str = "no (movie materialised in RAM)"
+        print(
+            f"Extraction config: n_jobs={p.n_jobs} device={p.device} "
+            f"T={T} H={H} W={W} streaming={stream_str}"
+        )
+        if p.n_jobs == 1:
+            print(
+                "  Note: n_jobs=1 (serial). "
+                "Set CNMFeParams(n_jobs=-1) to use all CPU cores."
+            )
 
         # --- Step 1: Motion correction ---
         if do_motion_correction:
@@ -728,6 +789,9 @@ class CNMFe:
 
         if A.shape[1] == 0:
             print("All components rejected by auto-evaluation.")
+            assert C_raw.shape[0] == A.shape[1], (
+                f"C_raw/A K mismatch: C_raw has {C_raw.shape[0]} rows, A has {A.shape[1]} cols"
+            )
             self.A = A
             self.C = np.empty((0, T), dtype=np.float32)
             self.S = np.empty((0, T), dtype=np.float32)
@@ -761,6 +825,9 @@ class CNMFe:
         crosstalk = AA_final @ C - np.diag(AA_final)[:, None] * C        # (K, T)
         YrA = (YA_final.T - crosstalk) / nA_final[:, None] - C           # (K, T)
 
+        assert C_raw.shape[0] == A.shape[1], (
+            f"C_raw/A K mismatch: C_raw has {C_raw.shape[0]} rows, A has {A.shape[1]} cols"
+        )
         self.A = A
         self.C = C
         self.S = S

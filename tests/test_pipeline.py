@@ -341,6 +341,124 @@ class TestCNMFePipeline:
         )
         np.testing.assert_allclose(m_str.C, m_mem.C, atol=1e-3, rtol=1e-3)
 
+    def test_fit_Y_flat_zarr_full_pipeline_matches_in_memory(self, synth, tmp_path):
+        """Streaming extraction must match the in-memory path through the deep
+        pipeline (merge + auto-eval + final deconvolution), not just the
+        trivial n_iter_main=1 case. Also pins that ``model.C_raw`` ends up
+        aligned with ``model.A`` (Fix 1) on the streaming path.
+        """
+        from cnmfe.io import save_zarr, transpose_zarr_to_pixel_major
+        import zarr as _zarr
+
+        movie_np = synth["movie"].astype(np.float32)
+        T, H, W = movie_np.shape
+
+        src_path = tmp_path / "src.zarr"
+        save_zarr(movie_np, str(src_path))
+        src_zarr = _zarr.open_array(str(src_path), mode="r")
+
+        pixel_path = tmp_path / "pixel.zarr"
+        Y_flat_zarr = transpose_zarr_to_pixel_major(
+            src_path, pixel_path,
+            pixel_chunk=256, time_chunk=200,
+            verbose=False,
+        )
+
+        # Same params as test_temporal_correlation_against_truth — loose
+        # init thresholds so we exercise the auto-eval ghost-rejection path,
+        # plus n_iter_main=2 and merge.
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.7, min_pnr=3.0,
+            n_iter_main=2, n_iter_temporal=2,
+        )
+        m_mem = CNMFe(params).fit(movie_np, do_motion_correction=False)
+        m_str = CNMFe(params).fit(
+            src_zarr, do_motion_correction=False, Y_flat_zarr=Y_flat_zarr,
+        )
+
+        # Same K recovered after merge + auto-eval.
+        assert m_str.A.shape == m_mem.A.shape, (
+            f"K mismatch: streaming={m_str.A.shape[1]}, in-mem={m_mem.A.shape[1]}"
+        )
+
+        # Footprints, denoised traces, and spike trains match.
+        np.testing.assert_allclose(
+            np.asarray(m_str.A.todense()),
+            np.asarray(m_mem.A.todense()),
+            atol=1e-3, rtol=1e-3,
+        )
+        np.testing.assert_allclose(m_str.C, m_mem.C, atol=1e-3, rtol=1e-3)
+        np.testing.assert_allclose(m_str.S, m_mem.S, atol=1e-3, rtol=1e-3)
+
+        # Fix 1: C_raw must align with A column-for-column on BOTH paths.
+        assert m_str.C_raw.shape[0] == m_str.A.shape[1], (
+            f"streaming C_raw/A K mismatch: C_raw={m_str.C_raw.shape[0]}, "
+            f"A={m_str.A.shape[1]}"
+        )
+        assert m_mem.C_raw.shape[0] == m_mem.A.shape[1], (
+            f"in-memory C_raw/A K mismatch: C_raw={m_mem.C_raw.shape[0]}, "
+            f"A={m_mem.A.shape[1]}"
+        )
+        # And the contracted C_raw matches across paths.
+        np.testing.assert_allclose(m_str.C_raw, m_mem.C_raw, atol=1e-3, rtol=1e-3)
+
+    def test_fit_zarr_movie_with_output_dir_auto_streams(self, synth_small, tmp_path):
+        """Passing a zarr movie + output_dir without Y_flat_zarr must auto-derive
+        the pixel-major store and route through the streaming branch, instead
+        of materialising the entire movie into RAM (the old default).
+
+        Pins the auto-streaming convenience layer and its idempotency.
+        """
+        from cnmfe.io import save_zarr
+        import zarr as _zarr
+
+        movie_np = synth_small["movie"].astype(np.float32)
+
+        src_path = tmp_path / "src.zarr"
+        save_zarr(movie_np, str(src_path))
+        src_zarr = _zarr.open_array(str(src_path), mode="r")
+
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.5, min_pnr=3.0,
+            n_iter_main=1, n_iter_temporal=1,
+        )
+
+        # Baseline: in-memory fit on the numpy array.
+        m_mem = CNMFe(params).fit(movie_np, do_motion_correction=False)
+
+        # Auto-streamed: zarr movie + output_dir, no Y_flat_zarr.
+        out_dir = tmp_path / "results"
+        m_auto = CNMFe(params).fit(
+            src_zarr, do_motion_correction=False, output_dir=out_dir,
+        )
+
+        # The pixel-major zarr must have been created.
+        pixel_zarr_path = out_dir / "Y_flat_pixel.zarr"
+        assert pixel_zarr_path.exists(), (
+            f"Auto-derived Y_flat_pixel.zarr not found at {pixel_zarr_path}"
+        )
+
+        # Results must equal the in-memory baseline.
+        assert m_auto.A.shape == m_mem.A.shape
+        np.testing.assert_allclose(
+            np.asarray(m_auto.A.todense()),
+            np.asarray(m_mem.A.todense()),
+            atol=1e-3, rtol=1e-3,
+        )
+        np.testing.assert_allclose(m_auto.C, m_mem.C, atol=1e-3, rtol=1e-3)
+
+        # Second call: idempotent — the existing pixel-major store is reused,
+        # not re-written. Capture mtime to verify.
+        first_mtime = pixel_zarr_path.stat().st_mtime
+        m_again = CNMFe(params).fit(
+            src_zarr, do_motion_correction=False, output_dir=out_dir,
+        )
+        second_mtime = pixel_zarr_path.stat().st_mtime
+        assert second_mtime == first_mtime, (
+            "Pixel-major zarr was rewritten on second call (should be idempotent)"
+        )
+        assert m_again.A.shape == m_mem.A.shape
+
     def test_fit_Y_flat_zarr_rejects_bad_shape(self, synth_small, tmp_path):
         """Shape mismatch between Y_flat_zarr and the movie must raise."""
         from cnmfe.io import save_zarr
