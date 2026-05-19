@@ -105,6 +105,53 @@ class TestCNMFePipeline:
         # Default params may find 0 neurons on small movie, that's ok
         model.fit(movie, do_motion_correction=False)
 
+    def test_init_stride_recovers_footprints(self):
+        """Strided greedy init must still recover spatially-comparable
+        footprints to non-strided init on a longer movie.
+
+        Phase D regression: pipeline.fit() runs greedy init on a strided
+        sample (when init_stride > 1) to bound the (T,H,W) data_filtered /
+        data_raw RAM cost. Footprints are spatial — independent of T — so
+        recovery should be near-identical. Traces are re-projected at full T
+        downstream.
+        """
+        from tests.conftest import make_synthetic_movie
+
+        synth = make_synthetic_movie(
+            n_neurons=4, dims=(48, 48), T=600, noise_std=0.4, seed=2,
+        )
+        movie = synth["movie"]
+        K_true = synth["A_true"].shape[1]
+
+        common = dict(sigma=3.0, min_corr=0.5, min_pnr=3.0,
+                      n_iter_main=1, n_iter_temporal=1)
+        # Baseline: stride=1 (no striding).
+        m1 = CNMFe(CNMFeParams(**common, init_stride=1)).fit(
+            movie, do_motion_correction=False
+        )
+        # Strided: stride=3 (init runs on T_init=200 frames).
+        m3 = CNMFe(CNMFeParams(**common, init_stride=3)).fit(
+            movie, do_motion_correction=False
+        )
+
+        # Both should find roughly the same neurons.
+        assert m1.A.shape[1] >= K_true - 1, f"stride=1 missed: K={m1.A.shape[1]}"
+        assert m3.A.shape[1] >= K_true - 1, f"stride=3 missed: K={m3.A.shape[1]}"
+
+        # Spatial recovery — each ground-truth neuron should match at least
+        # one footprint in BOTH models with high correlation.
+        matches_1 = match_components(m1.A, synth["A_true"])
+        matches_3 = match_components(m3.A, synth["A_true"])
+        for k_true in range(K_true):
+            _, _, r1 = matches_1[k_true]
+            _, _, r3 = matches_3[k_true]
+            assert r1 > 0.7, f"stride=1 poor spatial match on neuron {k_true}: r={r1:.3f}"
+            assert r3 > 0.7, f"stride=3 poor spatial match on neuron {k_true}: r={r3:.3f}"
+
+        # Full-T traces always; strided init recovers C at full T via the
+        # post-init projection. Check shape.
+        assert m3.C.shape == (m3.A.shape[1], movie.shape[0])
+
     def test_fit_accepts_zarr_input(self, synth_small, tmp_path):
         """fit() should accept a zarr.Array directly and produce identical
         results to passing the same data as a numpy array.

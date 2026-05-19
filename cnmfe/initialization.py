@@ -345,8 +345,13 @@ def greedy_corr_pnr(
             C_raw_list.append(ci)
             centers_list.append((row, col))
 
-            # Subtract component from data (vectorised: no per-frame loop)
-            sub = ai_patch[np.newaxis] * c_clean[:, np.newaxis, np.newaxis]  # (T, ph, pw)
+            # Subtract component from data. Use the raw trace `ci`, NOT the
+            # OASIS-deconvolved `c_clean`. OASIS smooths brief transients
+            # forward in time (the c[t] >= g*c[t-1] constraint), so subtracting
+            # c_clean leaves structured residuals at the spike locations and
+            # feeds halo-driven re-seeding. Subtracting ci is the faithful
+            # least-squares residual of the per-pixel OLS extraction.
+            sub = ai_patch[np.newaxis] * ci[:, np.newaxis, np.newaxis]       # (T, ph, pw)
             data_raw[:, r0:r1, c0:c1] -= sub
             data_filtered[:, r0:r1, c0:c1] -= sub
 

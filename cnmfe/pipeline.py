@@ -54,6 +54,7 @@ class CNMFeParams:
     init_max_corr_bg: float = 0.4             # "Background pixel" threshold inside extract_spatial_temporal
     seed_suppress_factor: float = 2.0         # Suppression disk radius after extraction = factor * sigma
     circular_max_dist_factor: float = 2.5     # circular_constraint cutoff = factor * estimated_radius
+    init_stride: "int | None" = None          # Temporal stride for greedy init (None = auto: max(1, T//5000))
 
     # --- Background (ring model) ---
     ring_size_factor: float = 1.5  # ring radius = ring_size_factor * (2*sigma+1)
@@ -239,9 +240,26 @@ class CNMFe:
         # )
 
         # --- Step 4: Initialization ---
-        print("Running greedy CORR-PNR initialization...")
-        A, C, C_raw, centers = greedy_corr_pnr(
-            movie_arr,
+        # Greedy init allocates two full (T, H, W) float32 copies inside
+        # (`data_filtered` after PSF + `data_raw`). On a 10k × 600 × 600
+        # movie that is ~28 GB of transient overhead. Running init on a
+        # strided sample cuts this by `stride`. The footprints A are
+        # spatial — independent of T — so spatial recovery is unaffected;
+        # the temporal traces are then re-projected at full T below.
+        init_stride = p.init_stride
+        if init_stride is None:
+            init_stride = max(1, T // 5000)
+
+        if init_stride > 1:
+            print(f"Running greedy CORR-PNR initialization on strided sample "
+                  f"(stride={init_stride}, T_init={T // init_stride})...")
+            init_movie = movie_arr[::init_stride]
+        else:
+            print("Running greedy CORR-PNR initialization...")
+            init_movie = movie_arr
+
+        A, _, _, centers = greedy_corr_pnr(
+            init_movie,
             sigma=p.sigma,
             min_corr=p.min_corr,
             min_pnr=p.min_pnr,
@@ -256,19 +274,33 @@ class CNMFe:
             seed_suppress_factor=p.seed_suppress_factor,
             circular_max_dist_factor=p.circular_max_dist_factor,
         )
+        # Free the strided init movie before allocating C_raw at full T.
+        if init_stride > 1:
+            del init_movie
         print(f"  Found {A.shape[1]} initial components.")
 
         if A.shape[1] == 0:
             print("No neurons found. Try lowering min_corr or min_pnr.")
             self.A = A
-            self.C = C
+            self.C = np.empty((0, T), dtype=np.float32)
             self.S = np.empty((0, T), dtype=np.float32)
-            self.C_raw = C_raw
+            self.C_raw = np.empty((0, T), dtype=np.float32)
             return self
 
         # Flatten movie to (H*W, T) for all subsequent steps
         Y_flat = make_2d(movie_arr)     # (H*W, T)
         sn_flat = self.sn.ravel()       # (H*W,)
+
+        # Recover full-T temporal traces by projecting the full-resolution
+        # movie onto each footprint:
+        #     C[k, t] = (Y[:, t] @ A[:, k]) / ||A[:, k]||^2
+        # Greedy returned C at the strided resolution (stride > 1) or full T
+        # (stride == 1). Re-projecting at full T uniformly handles both.
+        AA_init = (A.T @ A).toarray()
+        nA_init = np.maximum(np.diag(AA_init), 1e-10).astype(np.float32)
+        YA_init = np.asarray(Y_flat.T @ A, dtype=np.float32)          # (T, K)
+        C_raw = (YA_init / nA_init[None, :]).T.astype(np.float32)     # (K, T)
+        C = C_raw.copy()
 
         # Estimate the AR coefficient `g` ONCE from the pooled raw traces.
         #
