@@ -223,7 +223,7 @@ class CNMFe:
         stride = max(1, T // p.sample_frames)
         if stride > 1:
             t_idx = np.arange(0, T, stride)
-            stats_movie = np.stack(movie_arr[t_idx])
+            stats_movie = movie_arr[t_idx]  # advanced indexing already copies
         else:
             stats_movie = movie_arr
 

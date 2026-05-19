@@ -105,6 +105,36 @@ class TestCNMFePipeline:
         # Default params may find 0 neurons on small movie, that's ok
         model.fit(movie, do_motion_correction=False)
 
+    def test_fit_accepts_zarr_input(self, synth_small, tmp_path):
+        """fit() should accept a zarr.Array directly and produce identical
+        results to passing the same data as a numpy array.
+
+        Phase C regression: zarr support is currently via np.asarray()
+        materialisation (no streaming yet — that requires disk transpose).
+        This test pins the API and the round-trip equivalence.
+        """
+        from cnmfe.io import save_zarr
+
+        movie_np = synth_small["movie"].astype(np.float32)
+        zarr_path = tmp_path / "movie.zarr"
+        z = save_zarr(movie_np, str(zarr_path))
+
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.5, min_pnr=3.0,
+            n_iter_main=1, n_iter_temporal=1,
+        )
+        model_np = CNMFe(params).fit(movie_np, do_motion_correction=False)
+        model_zarr = CNMFe(params).fit(z, do_motion_correction=False)
+
+        # Same number of components, identical footprints / traces.
+        assert model_zarr.A.shape == model_np.A.shape
+        np.testing.assert_allclose(
+            np.asarray(model_zarr.A.todense()),
+            np.asarray(model_np.A.todense()),
+            atol=1e-4, rtol=1e-4,
+        )
+        np.testing.assert_allclose(model_zarr.C, model_np.C, atol=1e-4, rtol=1e-4)
+
     def test_with_motion_correction(self, synth_small):
         """Motion correction pass should complete without errors."""
         movie = synth_small["movie"]
