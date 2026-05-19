@@ -266,14 +266,17 @@ def greedy_corr_pnr(
         )
     else:
         from joblib import Parallel, delayed
+        from threadpoolctl import threadpool_limits
         # Threads: ndi.convolve is pure C and releases the GIL. Each frame is
         # ~1.4 MB; with T_init=5000 frames loky would pickle ~7 GB per call.
-        data_filtered = np.stack(
-            Parallel(n_jobs=n_jobs, prefer="threads")(
-                delayed(ndi.convolve)(frame, psf, mode="reflect") for frame in movie
-            ),
-            axis=0,
-        )
+        # Cap inner BLAS to 1 -- see spatial.py for the rationale.
+        with threadpool_limits(limits=1, user_api="blas"):
+            data_filtered = np.stack(
+                Parallel(n_jobs=n_jobs, prefer="threads")(
+                    delayed(ndi.convolve)(frame, psf, mode="reflect") for frame in movie
+                ),
+                axis=0,
+            )
     data_raw = movie.copy()
 
     # Summary images. Subsample time when corrpnr_stride > 1 — CORR/PNR are

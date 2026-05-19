@@ -227,15 +227,18 @@ def correlation_pnr(
                 )
             else:
                 from joblib import Parallel, delayed
+                from threadpoolctl import threadpool_limits
                 # Threads: ndi.convolve is pure C and releases the GIL; loky
                 # would pickle ~1.4 MB per frame x T_init frames per call.
-                filtered = np.stack(
-                    Parallel(n_jobs=n_jobs, prefer="threads")(
-                        delayed(ndi.convolve)(frame, psf, mode="reflect")
-                        for frame in movie
-                    ),
-                    axis=0,
-                )
+                # Cap inner BLAS to 1 -- see spatial.py for the rationale.
+                with threadpool_limits(limits=1, user_api="blas"):
+                    filtered = np.stack(
+                        Parallel(n_jobs=n_jobs, prefer="threads")(
+                            delayed(ndi.convolve)(frame, psf, mode="reflect")
+                            for frame in movie
+                        ),
+                        axis=0,
+                    )
         else:
             if n_jobs == 1:
                 filtered = np.stack(
@@ -243,13 +246,16 @@ def correlation_pnr(
                 )
             else:
                 from joblib import Parallel, delayed
-                filtered = np.stack(
-                    Parallel(n_jobs=n_jobs, prefer="threads")(
-                        delayed(ndi.gaussian_filter)(frame, sigma)
-                        for frame in movie
-                    ),
-                    axis=0,
-                )
+                from threadpoolctl import threadpool_limits
+                # Cap inner BLAS to 1 -- see spatial.py for the rationale.
+                with threadpool_limits(limits=1, user_api="blas"):
+                    filtered = np.stack(
+                        Parallel(n_jobs=n_jobs, prefer="threads")(
+                            delayed(ndi.gaussian_filter)(frame, sigma)
+                            for frame in movie
+                        ),
+                        axis=0,
+                    )
     else:
         filtered = movie.copy()
 

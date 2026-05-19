@@ -326,9 +326,14 @@ def _compute_w_streaming(
     # sparse mat-vec) all release the GIL, so threads get real speedup
     # without the serialisation tax.
     from joblib import Parallel, delayed
-    per_batch = Parallel(n_jobs=n_jobs, prefer="threads")(
-        delayed(_process_batch)(start, end) for start, end in batches
-    )
+    from threadpoolctl import threadpool_limits
+
+    # See spatial.py for the rationale: cap inner BLAS to 1 so the n_jobs
+    # worker threads don't each spawn n_cores OpenMP threads.
+    with threadpool_limits(limits=1, user_api="blas"):
+        per_batch = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(_process_batch)(start, end) for start, end in batches
+        )
     raw_results = [item for batch_out in per_batch for item in batch_out]
     return raw_results
 
@@ -453,14 +458,19 @@ def compute_W(
                 )
         else:
             from joblib import Parallel, delayed
+            from threadpoolctl import threadpool_limits
+
             # Threads: each call passes a per-batch slice of X_fit plus the
             # full X_fit (for ring lookups). loky would pickle the full X_fit
             # per call -- threads share it. Inner ops (linalg.solve, einsum)
             # release the GIL.
-            batch_lists = Parallel(n_jobs=n_jobs, prefer="threads")(
-                delayed(_ring_pixel_batch)(start, X_fit[start:end], ring_idx[start:end], X_fit, lambda_reg)
-                for start, end in batches
-            )
+            # threadpool_limits caps BLAS to 1 thread per worker -- see
+            # spatial.py for the rationale.
+            with threadpool_limits(limits=1, user_api="blas"):
+                batch_lists = Parallel(n_jobs=n_jobs, prefer="threads")(
+                    delayed(_ring_pixel_batch)(start, X_fit[start:end], ring_idx[start:end], X_fit, lambda_reg)
+                    for start, end in batches
+                )
             raw_results = [item for batch in batch_lists for item in batch]
 
         rows_list = [np.full(len(ring), p, dtype=np.int32) for p, ring, _ in raw_results]

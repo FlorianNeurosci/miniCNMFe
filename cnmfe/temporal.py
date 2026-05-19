@@ -352,14 +352,19 @@ def update_temporal(
         for _ in range(n_iter):
             traces = [(YrA[:, k] / nA[k] + C[k]).astype(np.float32) for k in range(K)]
             if deconvolve:
+                from threadpoolctl import threadpool_limits
+
                 # Threads avoid loky's per-call pickling. OASIS's C extension
                 # (from oasis-deconvolution) releases the GIL during deconv;
                 # users on the pure-Python fallback get no parallelism either
                 # way -- the threads path doesn't make that worse.
-                results = Parallel(n_jobs=n_jobs, prefer="threads")(
-                    delayed(_deconvolve_with)(traces[k], g_per_k[k], float(sn_per_k[k]))
-                    for k in range(K)
-                )
+                # threadpool_limits caps inner BLAS to 1 so n_jobs worker
+                # threads x n_cores BLAS threads doesn't oversubscribe.
+                with threadpool_limits(limits=1, user_api="blas"):
+                    results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                        delayed(_deconvolve_with)(traces[k], g_per_k[k], float(sn_per_k[k]))
+                        for k in range(K)
+                    )
             else:
                 results = [
                     (np.maximum(traces[k], 0.0), np.zeros_like(traces[k]))

@@ -9,6 +9,7 @@ dependencies = [
     "scikit-image >= 0.20",
     "scikit-learn >= 1.2",
     "joblib >= 1.2",
+    "threadpoolctl >= 3.0",
     "zarr >= 3.0",
     "imageio >= 2.28",
     "imageio-ffmpeg >= 0.4",

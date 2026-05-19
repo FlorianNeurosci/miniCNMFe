@@ -260,23 +260,32 @@ def update_spatial(
             )
     else:
         from joblib import Parallel, delayed
+        from threadpoolctl import threadpool_limits
 
         # Threads, not processes: loky would pickle ~10 MB of Y_flat[start:end]
         # plus the full C per batch -- with ~1400 batches on a 600x600 movie
-        # that's ~25 GB of IPC overhead drowning the LASSO compute. LassoLars
-        # internally uses numpy linalg / BLAS which release the GIL, so threads
-        # get real concurrency without the pickling tax.
-        batch_lists = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(_spatial_pixel_batch)(
-                start,
-                Y_flat[start:end],
-                C,
-                support[start:end],
-                sn[start:end],
-                T,
+        # that's ~25 GB of IPC overhead drowning the compute. The Cython CD
+        # solver releases the GIL during its inner loop, so threads get real
+        # concurrency without the pickling tax.
+        #
+        # threadpool_limits caps inner BLAS threads to 1 for the duration
+        # of the parallel section. Without this cap, on Linux each worker
+        # thread's BLAS calls (the small Gram matmul, the CD inner solve)
+        # try to spawn up to n_cores OpenMP threads, producing
+        # n_jobs * n_cores OS threads competing for n_cores. Observed:
+        # 20+ min update_spatial on 16-core Ubuntu vs minutes when capped.
+        with threadpool_limits(limits=1, user_api="blas"):
+            batch_lists = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(_spatial_pixel_batch)(
+                    start,
+                    Y_flat[start:end],
+                    C,
+                    support[start:end],
+                    sn[start:end],
+                    T,
+                )
+                for start, end in batches
             )
-            for start, end in batches
-        )
         all_results = [item for batch in batch_lists for item in batch]
 
     # Accumulate per-component pixel values
