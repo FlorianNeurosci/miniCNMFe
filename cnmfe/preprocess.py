@@ -116,8 +116,14 @@ def local_correlations_fft(movie: np.ndarray, xp=np) -> np.ndarray:
     Edge pixels are divided by their actual neighbor count (5 at corners,
     8 in the bulk), not always 8.
 
+    The function self-recenters (subtracts the per-pixel time-mean) before
+    dividing by std, matching CaImAn's reference implementation. This makes
+    the result a proper Pearson correlation regardless of the input's mean,
+    so the output is bounded in [-1, 1]. Callers (e.g. ``correlation_pnr``)
+    that pass thresholded inputs no longer need to pre-center.
+
     Args:
-        movie: (T, H, W) float32, with time-mean already subtracted.
+        movie: (T, H, W) float32. No pre-conditions on the time-mean.
         xp: Array module — numpy (default) or cupy for GPU computation.
 
     Returns:
@@ -126,9 +132,14 @@ def local_correlations_fft(movie: np.ndarray, xp=np) -> np.ndarray:
     Y = xp.asarray(movie, dtype=xp.float32)
     T, H, W = Y.shape
 
+    # Self-recenter so the formula reduces to Pearson r regardless of caller
+    # preprocessing. Without this, thresholded inputs (e.g. the 3*sn step in
+    # correlation_pnr) yield biased products that can exceed 1.
+    Y = Y - Y.mean(axis=0, keepdims=True)
+
     std = Y.std(axis=0, keepdims=True)
     std[std == 0] = 1.0
-    Y = Y / std  # (T, H, W), unit-std traces
+    Y = Y / std  # (T, H, W), zero-mean unit-std traces
 
     cn = xp.zeros((H, W), dtype=xp.float32)
     counts = xp.zeros((H, W), dtype=xp.float32)
@@ -216,8 +227,10 @@ def correlation_pnr(
                 )
             else:
                 from joblib import Parallel, delayed
+                # Threads: ndi.convolve is pure C and releases the GIL; loky
+                # would pickle ~1.4 MB per frame x T_init frames per call.
                 filtered = np.stack(
-                    Parallel(n_jobs=n_jobs)(
+                    Parallel(n_jobs=n_jobs, prefer="threads")(
                         delayed(ndi.convolve)(frame, psf, mode="reflect")
                         for frame in movie
                     ),
@@ -231,7 +244,7 @@ def correlation_pnr(
             else:
                 from joblib import Parallel, delayed
                 filtered = np.stack(
-                    Parallel(n_jobs=n_jobs)(
+                    Parallel(n_jobs=n_jobs, prefer="threads")(
                         delayed(ndi.gaussian_filter)(frame, sigma)
                         for frame in movie
                     ),

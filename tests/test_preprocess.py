@@ -91,6 +91,27 @@ class TestLocalCorrelationsFFT:
         cn = local_correlations_fft(movie)
         assert cn.shape == (20, 30)
 
+    def test_bounded_with_thresholded_input(self):
+        """CORR must stay in [-1, 1] even when the input has a non-zero mean.
+
+        Regression: ``correlation_pnr`` thresholds at ``3*sn`` before calling
+        this function, which leaves a positive mean (mostly zeros plus
+        occasional spikes). Without self-recentering, the formula evaluates
+        to ``1/(1-f)`` for two pixels sharing a fraction ``f`` of spike
+        times, exceeding 1 for any non-trivial spike rate. Self-recenter
+        inside the function fixes this so callers don't have to worry.
+        """
+        rng = np.random.default_rng(0)
+        T, H, W = 200, 10, 10
+        # Sparse positive spikes shared across all pixels — f = 0.2,
+        # large enough to make the bug obvious (1/(1-0.2) = 1.25).
+        movie = np.zeros((T, H, W), dtype=np.float32)
+        spike_t = rng.choice(T, size=40, replace=False)
+        movie[spike_t] = rng.uniform(2.0, 5.0, size=(40, H, W))
+        cn = local_correlations_fft(movie)
+        assert (cn <= 1.0 + 1e-5).all(), f"CORR exceeded 1: max = {cn.max():.4f}"
+        assert (cn >= -1.0 - 1e-5).all(), f"CORR below -1: min = {cn.min():.4f}"
+
 
 class TestCorrelationPNR:
     def test_output_shapes(self, synth_small):
