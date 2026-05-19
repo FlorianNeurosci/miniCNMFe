@@ -291,7 +291,13 @@ def update_temporal(
     K, T = C.shape
     xp = get_xp(device)
 
-    if xp is not np:
+    # If Y_flat is a streaming subtractor, use its project_onto so we never
+    # materialise the full (H*W, T) residual. GPU path requires a dense
+    # numpy input — fall back to CPU projection when given a subtractor.
+    if hasattr(Y_flat, "project_onto"):
+        YA = Y_flat.project_onto(A)
+        AA = (A.T @ A).toarray() if sp.issparse(A) else np.asarray(A.T @ A)
+    elif xp is not np:
         # GPU: convert A to dense for fast matmul (K is small; A is H*W × K)
         A_dense_xp = xp.asarray(A.toarray())
         Y_xp = xp.asarray(Y_flat)

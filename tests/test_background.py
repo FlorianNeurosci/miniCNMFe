@@ -4,7 +4,12 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from cnmfe.background import build_ring_indices, compute_W, subtract_background
+from cnmfe.background import (
+    BackgroundSubtractor,
+    build_ring_indices,
+    compute_W,
+    subtract_background,
+)
 
 
 class TestBuildRingIndices:
@@ -114,3 +119,81 @@ class TestSubtractBackground:
         b0 = np.zeros(H * W, dtype=np.float32)
         Y_res = subtract_background(Y, W_mat, b0)
         np.testing.assert_allclose(Y_res, Y, rtol=1e-5)
+
+
+class TestBackgroundSubtractor:
+    """Streaming subtractor must agree with dense subtract_background.
+
+    These tests pin the math: BackgroundSubtractor must be a drop-in
+    replacement that returns identical (within float32 tolerance) pixel
+    rows and projections.
+    """
+
+    def _make_data(self, H=20, W=20, T=180, seed=0):
+        rng = np.random.default_rng(seed)
+        Y = rng.standard_normal((H * W, T)).astype(np.float32) * 1.5
+        A0 = sp.csc_matrix((H * W, 0), dtype=np.float32)
+        C0 = np.empty((0, T), dtype=np.float32)
+        W_mat, b0 = compute_W(Y, A0, C0, (H, W), radius=3)
+        return Y, W_mat, b0, (H, W, T)
+
+    def test_full_slice_matches_dense(self):
+        Y, W_mat, b0, _ = self._make_data()
+        dense = subtract_background(Y, W_mat, b0)
+        bg = BackgroundSubtractor(Y, W_mat, b0)
+        np.testing.assert_allclose(bg[:], dense, atol=1e-4, rtol=1e-4)
+
+    def test_partial_slice_matches_dense(self):
+        Y, W_mat, b0, dims = self._make_data()
+        H, W, _ = dims
+        dense = subtract_background(Y, W_mat, b0)
+        bg = BackgroundSubtractor(Y, W_mat, b0)
+        # A few non-trivial slices
+        for start, end in [(0, 64), (32, 96), (H * W - 50, H * W)]:
+            np.testing.assert_allclose(
+                bg.slice(start, end), dense[start:end], atol=1e-4, rtol=1e-4
+            )
+
+    def test_getitem_matches_slice_method(self):
+        Y, W_mat, b0, _ = self._make_data()
+        bg = BackgroundSubtractor(Y, W_mat, b0)
+        np.testing.assert_array_equal(bg[10:42], bg.slice(10, 42))
+
+    def test_shape_and_dtype(self):
+        Y, W_mat, b0, dims = self._make_data()
+        H, W, T = dims
+        bg = BackgroundSubtractor(Y, W_mat, b0)
+        assert bg.shape == (H * W, T)
+        assert bg.dtype == np.float32
+        assert bg.slice(0, 8).dtype == np.float32
+
+    def test_project_onto_matches_dense(self):
+        """bg.project_onto(A) must equal subtract_background(...).T @ A."""
+        rng = np.random.default_rng(2)
+        Y, W_mat, b0, dims = self._make_data(seed=3)
+        H, W, T = dims
+        # Synthesize a couple of overlapping sparse footprints.
+        K = 4
+        A_dense = np.zeros((H * W, K), dtype=np.float32)
+        for k in range(K):
+            centre = rng.integers(0, H * W)
+            A_dense[centre, k] = 1.0
+            for nbr in rng.choice(H * W, size=6, replace=False):
+                A_dense[nbr, k] += 0.3
+        A = sp.csc_matrix(A_dense)
+
+        dense_proj = subtract_background(Y, W_mat, b0).T @ A
+        bg = BackgroundSubtractor(Y, W_mat, b0)
+        stream_proj = bg.project_onto(A, batch_size=64)
+        np.testing.assert_allclose(
+            stream_proj, np.asarray(dense_proj, dtype=np.float32),
+            atol=1e-3, rtol=1e-3,
+        )
+
+    def test_project_onto_empty_K(self):
+        """K=0 must return a (T, 0) array without errors."""
+        Y, W_mat, b0, dims = self._make_data()
+        _, _, T = dims
+        bg = BackgroundSubtractor(Y, W_mat, b0)
+        proj = bg.project_onto(sp.csc_matrix((Y.shape[0], 0), dtype=np.float32))
+        assert proj.shape == (T, 0)

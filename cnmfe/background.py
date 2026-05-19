@@ -289,6 +289,97 @@ def subtract_background(
 
     Returns:
         Y_res: (H*W, T) background-subtracted movie.
+
+    Note:
+        This materialises the full (H*W, T) result and allocates two more
+        full-size temporaries. For large T use ``BackgroundSubtractor`` and
+        request pixel-row slices on demand instead.
     """
     X = Y_flat - b0[:, np.newaxis]
     return X - W.dot(X)
+
+
+class BackgroundSubtractor:
+    """Lazy ring-background subtractor — on-demand pixel-row slices.
+
+    Computes pixel-row slices of ``Y_bg = (I - W) @ (Y - b0[:, None])``
+    without materialising the full ``(H*W, T)`` result. Used by extraction
+    to bound peak RAM.
+
+    Mathematical identity used per slice:
+
+        Y_bg[start:end] = Y[start:end]
+                        - b0[start:end, None]
+                        - W[start:end] @ Y
+                        + (W[start:end] @ b0)[:, None]
+
+    The two W matmuls are sparse-dense and sparse@vector — they never need
+    a materialised ``X = Y - b0`` intermediate.
+
+    Supports ``bg[start:end]`` (equivalent to ``bg.slice(start, end)``) and
+    ``bg.project_onto(A)`` (streaming ``Y_bg.T @ A``) so existing call sites
+    that read ``Y_bg`` only via slicing and matmul can swap a numpy array
+    for this object without other changes.
+
+    Args:
+        Y_flat: (H*W, T) source movie. numpy array or zarr.Array.
+        W: (H*W, H*W) sparse ring weight matrix.
+        b0: (H*W,) per-pixel baseline.
+    """
+
+    def __init__(
+        self,
+        Y_flat: np.ndarray,
+        W: sp.csr_matrix,
+        b0: np.ndarray,
+    ) -> None:
+        self.Y_flat = Y_flat
+        self.W = W if sp.isspmatrix_csr(W) else W.tocsr()
+        self.b0 = np.asarray(b0, dtype=np.float32)
+        self.shape = (int(Y_flat.shape[0]), int(Y_flat.shape[1]))
+        self.dtype = np.dtype(np.float32)
+
+    def slice(self, start: int, end: int) -> np.ndarray:
+        """Return ``Y_bg[start:end, :]`` as a fresh ``(end-start, T)`` array."""
+        Y_chunk = np.asarray(self.Y_flat[start:end], dtype=np.float32)
+        W_chunk = self.W[start:end]
+        W_Y = np.asarray(W_chunk @ self.Y_flat, dtype=np.float32)        # (B, T)
+        W_b0 = np.asarray(W_chunk @ self.b0, dtype=np.float32)            # (B,)
+        out = Y_chunk - self.b0[start:end, None] - W_Y
+        out += W_b0[:, None]
+        return out
+
+    def __getitem__(self, key) -> np.ndarray:
+        if isinstance(key, slice):
+            start = 0 if key.start is None else int(key.start)
+            stop = self.shape[0] if key.stop is None else int(key.stop)
+            if key.step not in (None, 1):
+                raise ValueError("BackgroundSubtractor only supports contiguous slices")
+            return self.slice(start, stop)
+        raise TypeError(
+            f"BackgroundSubtractor supports only slice indexing, got {type(key).__name__}"
+        )
+
+    def project_onto(
+        self,
+        A: "sp.spmatrix | np.ndarray",
+        batch_size: int = 4096,
+    ) -> np.ndarray:
+        """Streaming ``Y_bg.T @ A``  →  ``(T, K)`` without materialising Y_bg.
+
+        Iterates over pixel batches, accumulating partial contributions to
+        the projection. Equivalent to ``self[:].T @ A`` but bounded RAM.
+        """
+        T = self.shape[1]
+        K = int(A.shape[1])
+        YA = np.zeros((T, K), dtype=np.float32)
+        if K == 0:
+            return YA
+        A_csr = A.tocsr() if sp.issparse(A) else A
+        n_pix = self.shape[0]
+        for start in range(0, n_pix, batch_size):
+            end = min(start + batch_size, n_pix)
+            Y_chunk = self.slice(start, end)        # (B, T)
+            A_chunk = A_csr[start:end]               # (B, K), sparse or dense
+            YA += np.asarray(Y_chunk.T @ A_chunk, dtype=np.float32)
+        return YA

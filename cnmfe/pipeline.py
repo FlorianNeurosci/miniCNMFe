@@ -14,7 +14,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from cnmfe._utils import make_2d
-from cnmfe.background import compute_W, subtract_background
+from cnmfe.background import BackgroundSubtractor, compute_W
 from cnmfe.initialization import greedy_corr_pnr
 from cnmfe.merging import merge_components
 from cnmfe.motion_correction import motion_correction_rigid
@@ -355,7 +355,7 @@ class CNMFe:
                 if n_pre_merged:
                     print(f"  {A.shape[1]} components ({n_pre_merged} pre-merged).")
 
-            Y_bg = subtract_background(Y_flat, W_mat, b0)  # (H*W, T)
+            Y_bg = BackgroundSubtractor(Y_flat, W_mat, b0)  # lazy (H*W, T)
 
             print("  Updating spatial footprints...")
             A = update_spatial(Y_bg, C, A, sn_flat, dims, p.dilation_radius, p.n_jobs, p.spatial_max_thr)
@@ -412,7 +412,7 @@ class CNMFe:
 
         # Final deconvolution pass to get spike trains
         print("Final temporal update...")
-        Y_bg = subtract_background(Y_flat, W_mat, b0)
+        Y_bg = BackgroundSubtractor(Y_flat, W_mat, b0)
         C, S, g_per_k, sn_per_k = update_temporal(
             Y_bg, A, C, sn_flat, p.ar_order, p.n_iter_temporal,
             n_jobs=p.n_jobs, device=p.device,
@@ -428,7 +428,7 @@ class CNMFe:
         # noisy projection preserves shape and typically correlates > 0.9.
         AA_final = (A.T @ A).toarray()
         nA_final = np.maximum(np.diag(AA_final), 1e-10)
-        YA_final = np.asarray(Y_bg.T @ A, dtype=np.float32)              # (T, K)
+        YA_final = Y_bg.project_onto(A)                                   # (T, K)
         crosstalk = AA_final @ C - np.diag(AA_final)[:, None] * C        # (K, T)
         YrA = (YA_final.T - crosstalk) / nA_final[:, None] - C           # (K, T)
 
