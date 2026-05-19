@@ -15,7 +15,12 @@ from __future__ import annotations
 import numpy as np
 import scipy.ndimage as ndi
 import scipy.sparse as sp
-from sklearn.linear_model import LassoLars
+from sklearn.linear_model._cd_fast import enet_coordinate_descent_gram
+
+# Cyclic CD doesn't need randomness, but the Cython entry point still wants
+# a RandomState object. Build one once at import time and pass it on every
+# call -- never mutated when random=0.
+_CD_RNG = np.random.RandomState(0)
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +50,20 @@ def _spatial_pixel_batch(
         List of (global_pixel_idx, component_idx, coefficient_value) tuples
         with coefficient_value > 0.
     """
+    # Call the underlying Cython CD solver directly instead of going
+    # through sklearn's Lasso estimator. The estimator's .fit() path
+    # spends ~30% of its time in input validation (validate_data,
+    # check_X_y, _assert_all_finite, ...) -- pure-Python overhead that
+    # also holds the GIL and defeats thread-based parallelism. The
+    # Cython solver (enet_coordinate_descent_gram) is what Lasso ends up
+    # calling anyway; we just skip the wrapper. It releases the GIL
+    # during the CD inner loop so joblib threads now actually parallelise.
+    #
+    # Math match with `Lasso(alpha=lam, positive=True, fit_intercept=False)`:
+    #   sklearn parameterises Lasso as
+    #     (1/(2*n_samples)) * ||y - Xw||^2 + alpha * |w|_1
+    #   The Cython entry takes the un-normalised L1 penalty as its first
+    #   arg, so we pass `lam * T` to match `Lasso(alpha=lam)`.
     results: list[tuple[int, int, float]] = []
     for i, active in enumerate(support_batch):
         if len(active) == 0:
@@ -53,18 +72,36 @@ def _spatial_pixel_batch(
         y_p = Y_batch[i]                  # (T,)
         sn_p = float(sn_batch[i])
 
-        gram = C_active @ C_active.T
+        # X = C_active.T  (samples x features), so Gram = X.T @ X.
+        # Cython solver is float64-only; the casts are cheap (small Gram /
+        # Xy / coef arrays, n_active typically 1-5).
+        gram = np.ascontiguousarray(C_active @ C_active.T, dtype=np.float64)
         max_energy = float(np.max(np.diag(gram))) if gram.size > 0 else 1.0
         lam = 0.5 * sn_p * np.sqrt(max(max_energy, 1e-10)) / T
         if lam == 0:
             continue
 
+        Xy = np.ascontiguousarray(C_active @ y_p, dtype=np.float64)
+        y_p_64 = np.ascontiguousarray(y_p, dtype=np.float64)
+        w = np.zeros(len(active), dtype=np.float64)
+
         try:
-            reg = LassoLars(alpha=lam, positive=True, fit_intercept=False, max_iter=200)
-            reg.fit(C_active.T, y_p)
-            coef = reg.coef_
+            w, _, _, _ = enet_coordinate_descent_gram(
+                w,                       # initial coef, mutated in place
+                float(lam) * T,          # alpha * n_samples
+                0.0,                     # beta (no L2 / no Elastic-Net)
+                gram,                    # Q = X.T @ X
+                Xy,                      # q = X.T @ y
+                y_p_64,                  # y (for dual-gap check)
+                1000,                    # max_iter
+                1e-4,                    # tol
+                _CD_RNG,                 # rng (unused with cyclic CD)
+                0,                       # random=0 -> cyclic, deterministic
+                1,                       # positive
+            )
+            coef = w
         except Exception:
-            coef = np.zeros(len(active), dtype=np.float32)
+            coef = np.zeros(len(active), dtype=np.float64)
 
         p_global = pixel_start + i
         for idx, k in enumerate(active):
