@@ -20,7 +20,7 @@ class CNMFeParams:
     # Motion correction
     max_shift: tuple[int, int] = (20, 20)     # Max (dy, dx) shift in pixels
     upsample_factor: int = 10                  # Subpixel precision = 1/upsample_factor
-    mc_n_iter: int = 2                         # Number of correction passes
+    mc_n_iter: int = 1                         # Number of correction passes (CaImAn default is 1)
 
     # Spatial filtering / PSF
     sigma: float = 3.0                         # Neuron Gaussian radius in pixels

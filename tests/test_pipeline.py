@@ -113,7 +113,7 @@ class TestCNMFePipeline:
             min_corr=0.4,
             min_pnr=2.0,
             n_iter_main=1,
-            mc_niter_rig=1,
+            mc_n_iter=1,
         )
         model = CNMFe(params).fit(movie, do_motion_correction=True)
         assert model.shifts is not None

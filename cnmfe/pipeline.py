@@ -33,7 +33,7 @@ class CNMFeParams:
     # --- Motion correction ---
     max_shift: tuple[int, int] = (20, 20)
     upsample_factor: int = 10
-    mc_niter_rig: int = 1              # number of rigid MC passes (CaImAn default is 1)
+    mc_n_iter: int = 1                 # number of rigid MC passes (CaImAn default is 1)
     mc_gSig_filt: float | None = None  # 1p high-pass sigma; set ≈ sigma to enable
     mc_batch_size: int = 200           # frames per streaming/parallel batch in MC
     mc_template_max_frames: int = 2000 # cap on frames sampled to build the MC template
@@ -169,7 +169,7 @@ class CNMFe:
             max_shift=p.max_shift,
             gSig_filt=p.mc_gSig_filt,
             upsample_factor=p.upsample_factor,
-            niter_rig=p.mc_niter_rig,
+            niter_rig=p.mc_n_iter,
             batch_size=p.mc_batch_size,
             n_jobs=p.n_jobs,
             template_max_frames=p.mc_template_max_frames,
@@ -212,7 +212,7 @@ class CNMFe:
                 max_shift=p.max_shift,
                 gSig_filt=p.mc_gSig_filt,
                 upsample_factor=p.upsample_factor,
-                niter_rig=p.mc_niter_rig,
+                niter_rig=p.mc_n_iter,
                 batch_size=p.mc_batch_size,
                 n_jobs=p.n_jobs,
                 template_max_frames=p.mc_template_max_frames,
