@@ -155,6 +155,7 @@ def correlation_pnr(
     noise_range: tuple[float, float] = (0.25, 0.5),
     n_jobs: int = 1,
     device: str = "cpu",
+    stride: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute local correlation (CORR) and peak-to-noise ratio (PNR) images.
 
@@ -172,12 +173,21 @@ def correlation_pnr(
         n_jobs: Number of parallel workers for per-frame filtering (-1 = all CPUs).
                 Ignored when device='cuda' (GPU handles parallelism internally).
         device: 'cpu' or 'cuda' — where to run filtering and correlation.
+        stride: Subsample time before computing CORR/PNR. The reductions
+            (per-pixel mean / max / neighbour correlation) only need a
+            representative slice of frames; ``stride=2-5`` typically halves
+            to fifths the wall time with negligible impact on the seed map.
+            Default ``1`` keeps the current behaviour (no subsampling).
 
     Returns:
         cn: (H, W) local correlation image.
         pnr: (H, W) peak-to-noise ratio image.
     """
     movie = np.asarray(movie, dtype=np.float32)
+    if stride > 1:
+        # Strided view is non-contiguous — materialise contiguously so the
+        # downstream per-frame loops and FFTs aren't bottlenecked on cache misses.
+        movie = np.ascontiguousarray(movie[::stride])
     xp = get_xp(device)
 
     # --- Spatial filtering ---
@@ -239,8 +249,10 @@ def correlation_pnr(
     pnr[pnr < 0] = 0.0
 
     # --- Local correlation (GPU-aware via xp) ---
-    thresh_data = filtered.copy()
-    thresh_data[thresh_data < 3 * sn[np.newaxis]] = 0.0
-    cn = local_correlations_fft(thresh_data, xp=xp)
+    # Threshold ``filtered`` in place. Its pristine values are no longer
+    # needed after the PNR step above, so we skip the second ``(T, H, W)``
+    # copy this used to do.
+    filtered[filtered < 3 * sn[np.newaxis]] = 0.0
+    cn = local_correlations_fft(filtered, xp=xp)
 
     return cn, pnr

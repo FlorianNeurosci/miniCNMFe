@@ -152,6 +152,44 @@ class TestCNMFePipeline:
         # post-init projection. Check shape.
         assert m3.C.shape == (m3.A.shape[1], movie.shape[0])
 
+    def test_init_corrpnr_stride_recovers_footprints(self):
+        """init_corrpnr_stride must not break neuron recovery.
+
+        The initial CORR/PNR sweep inside greedy init runs on a strided
+        slice of the (already strided) init_movie. Spatial reductions
+        survive moderate subsampling; we verify each ground-truth neuron
+        still matches an extracted footprint at r > 0.7.
+        """
+        from tests.conftest import make_synthetic_movie
+
+        synth = make_synthetic_movie(
+            n_neurons=4, dims=(48, 48), T=600, noise_std=0.4, seed=2,
+        )
+        movie = synth["movie"]
+        K_true = synth["A_true"].shape[1]
+        common = dict(sigma=3.0, min_corr=0.5, min_pnr=3.0,
+                      n_iter_main=1, n_iter_temporal=1, init_stride=1)
+
+        # Baseline (no extra CORR/PNR stride) and accelerated (stride=3).
+        m1 = CNMFe(CNMFeParams(**common, init_corrpnr_stride=1)).fit(
+            movie, do_motion_correction=False
+        )
+        m3 = CNMFe(CNMFeParams(**common, init_corrpnr_stride=3)).fit(
+            movie, do_motion_correction=False
+        )
+
+        assert m1.A.shape[1] >= K_true - 1, f"stride=1 missed: K={m1.A.shape[1]}"
+        assert m3.A.shape[1] >= K_true - 1, (
+            f"corrpnr_stride=3 missed: K={m3.A.shape[1]}"
+        )
+
+        matches_3 = match_components(m3.A, synth["A_true"])
+        for k_true in range(K_true):
+            _, _, r3 = matches_3[k_true]
+            assert r3 > 0.7, (
+                f"corrpnr_stride=3 poor spatial match on neuron {k_true}: r={r3:.3f}"
+            )
+
     def test_fit_accepts_zarr_input(self, synth_small, tmp_path):
         """fit() should accept a zarr.Array directly and produce identical
         results to passing the same data as a numpy array.

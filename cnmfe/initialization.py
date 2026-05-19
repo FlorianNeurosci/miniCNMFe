@@ -213,6 +213,7 @@ def greedy_corr_pnr(
     max_corr_bg: float = 0.4,
     seed_suppress_factor: float = 2.0,
     circular_max_dist_factor: float = 2.5,
+    corrpnr_stride: int = 1,
 ) -> tuple[sp.csc_matrix, np.ndarray, np.ndarray, np.ndarray]:
     """Find initial neurons using a greedy CORR-PNR strategy.
 
@@ -273,8 +274,14 @@ def greedy_corr_pnr(
         )
     data_raw = movie.copy()
 
-    # Summary images
-    cn, pnr = correlation_pnr(data_filtered, sigma=None, center_psf=False)
+    # Summary images. Subsample time when corrpnr_stride > 1 — CORR/PNR are
+    # per-pixel reductions, so a strided slice gives a near-identical seed
+    # map at a fraction of the cost. The greedy loop's local CORR/PNR
+    # updates (after each detection) still run on the full-T patch so
+    # extraction stays sharp.
+    cn, pnr = correlation_pnr(
+        data_filtered, sigma=None, center_psf=False, stride=corrpnr_stride,
+    )
 
     # Border mask
     if border_px > 0:

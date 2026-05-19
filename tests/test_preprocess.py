@@ -125,3 +125,37 @@ class TestCorrelationPNR:
             assert neuron_pnr.mean() > np.mean(bg_pixels), (
                 "Neuron centres should have higher PNR than background"
             )
+
+    def test_stride_one_unchanged(self, synth_small):
+        """stride=1 must produce bit-equivalent results to the no-stride API."""
+        movie = synth_small["movie"]
+        cn_a, pnr_a = correlation_pnr(movie, sigma=3.0)
+        cn_b, pnr_b = correlation_pnr(movie, sigma=3.0, stride=1)
+        np.testing.assert_array_equal(cn_a, cn_b)
+        np.testing.assert_array_equal(pnr_a, pnr_b)
+
+    def test_stride_speeds_up(self, synth):
+        """stride > 1 should be noticeably faster than stride=1.
+
+        Loose threshold (1.3x) to avoid CI flakes; real-world speedup
+        is closer to ``stride``.
+        """
+        import time
+        movie = synth["movie"]
+        # Warm caches.
+        correlation_pnr(movie, sigma=3.0, stride=1)
+
+        t0 = time.perf_counter()
+        for _ in range(2):
+            correlation_pnr(movie, sigma=3.0, stride=1)
+        t_full = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        for _ in range(2):
+            correlation_pnr(movie, sigma=3.0, stride=3)
+        t_stride = time.perf_counter() - t0
+
+        assert t_stride < t_full / 1.3, (
+            f"stride=3 took {t_stride*1e3:.0f}ms vs stride=1 {t_full*1e3:.0f}ms — "
+            f"expected at least 1.3x speedup"
+        )

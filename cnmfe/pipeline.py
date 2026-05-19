@@ -57,6 +57,10 @@ class CNMFeParams:
     seed_suppress_factor: float = 2.0         # Suppression disk radius after extraction = factor * sigma
     circular_max_dist_factor: float = 2.5     # circular_constraint cutoff = factor * estimated_radius
     init_stride: "int | None" = None          # Temporal stride for greedy init (None = auto: max(1, T//5000))
+    init_corrpnr_stride: "int | None" = None  # Extra stride applied to the *initial* CORR/PNR sweep inside greedy init.
+                                              # CORR/PNR are per-pixel reductions, so a strided slice gives a
+                                              # near-identical seed map at a fraction of the cost. None auto-selects
+                                              # max(1, T_init // 2000) so the sweep sees ~2000 frames regardless of T.
 
     # --- Background (ring model) ---
     ring_size_factor: float = 1.5  # ring radius = ring_size_factor * (2*sigma+1)
@@ -454,12 +458,27 @@ class CNMFe:
             init_stride = max(1, T // 5000)
 
         if init_stride > 1:
-            print(f"Running greedy CORR-PNR initialization on strided sample "
-                  f"(stride={init_stride}, T_init={T // init_stride})...")
             init_movie = movie_arr[::init_stride]
         else:
-            print("Running greedy CORR-PNR initialization...")
             init_movie = movie_arr
+        T_init = int(init_movie.shape[0])
+
+        # Resolve the secondary stride for the initial CORR/PNR sweep.
+        # Independent of init_stride: the greedy extraction loop reads the
+        # full T_init array, but the global CORR/PNR map only needs a
+        # representative slice. Default cap ~2000 frames.
+        corrpnr_stride = p.init_corrpnr_stride
+        if corrpnr_stride is None:
+            corrpnr_stride = max(1, T_init // 2000)
+
+        if init_stride > 1 or corrpnr_stride > 1:
+            print(
+                f"Running greedy CORR-PNR initialization "
+                f"(init_stride={init_stride}, T_init={T_init}; "
+                f"corrpnr_stride={corrpnr_stride}, T_corrpnr={T_init // corrpnr_stride})..."
+            )
+        else:
+            print("Running greedy CORR-PNR initialization...")
 
         A, _, _, centers = greedy_corr_pnr(
             init_movie,
@@ -476,6 +495,7 @@ class CNMFe:
             max_corr_bg=p.init_max_corr_bg,
             seed_suppress_factor=p.seed_suppress_factor,
             circular_max_dist_factor=p.circular_max_dist_factor,
+            corrpnr_stride=corrpnr_stride,
         )
         # Free the strided init movie before allocating C_raw at full T.
         if init_stride > 1:
@@ -602,6 +622,12 @@ class CNMFe:
                     centre_dist_factor=p.merge_centre_dist_factor,
                 )
                 _cache_after_merge(members_per_group)
+                # Keep C_raw aligned with A's new column order: merge groups
+                # become the mean of their members' rows (matches what
+                # merge_components does for C).
+                C_raw = np.vstack([
+                    C_raw[m].mean(axis=0).clip(0) for m in members_per_group
+                ]).astype(np.float32)
                 if n_pre_merged:
                     print(f"  {A.shape[1]} components ({n_pre_merged} pre-merged).")
 
@@ -616,6 +642,7 @@ class CNMFe:
             if not alive.all():
                 A = A[:, alive]
                 C = C[alive]
+                C_raw = C_raw[alive]
                 alive_idx = np.where(alive)[0]
                 g_per_k = [g_per_k[i] for i in alive_idx]
                 sn_per_k = sn_per_k[alive_idx]
@@ -644,6 +671,9 @@ class CNMFe:
                 centre_dist_factor=p.merge_centre_dist_factor,
             )
             _cache_after_merge(members_per_group)
+            C_raw = np.vstack([
+                C_raw[m].mean(axis=0).clip(0) for m in members_per_group
+            ]).astype(np.float32)
             if n_merged:
                 C, S, g_per_k, sn_per_k = update_temporal(
                     Y_bg, A, C, sn_flat, p.ar_order, 1,
@@ -685,6 +715,7 @@ class CNMFe:
                 keep_idx = np.where(keep)[0]
                 A = A[:, keep_idx]
                 C = C[keep_idx]
+                C_raw = C_raw[keep_idx]
                 g_per_k = [g_per_k[i] for i in keep_idx]
                 sn_per_k = sn_per_k[keep_idx]
                 n_px_fail = int((~eval_info["pixel_pass"]).sum())
