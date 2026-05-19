@@ -403,11 +403,16 @@ class CNMFe:
                 )
             print(f"  {A.shape[1]} components ({n_merged} merged).")
 
-            # Refit background with refined components (W solve is fast with bg_tsub)
+            # Refresh the per-pixel baseline b0 from the refined (A, C).
+            # Reuse the ring weight matrix W from the initial solve — the
+            # ring's spatial structure is a property of the data, not of A/C,
+            # so it remains valid across BCD iterations. Saves the expensive
+            # per-pixel BTB solve every iteration (speedup.md Change 2).
             W_mat, b0 = compute_W(
                 Y_flat, A, C, dims, ring_radius,
                 lambda_reg=p.ring_lambda, n_jobs=p.n_jobs, device=p.device,
                 tsub=p.bg_tsub,
+                W_cached=W_mat,
             )
 
         # Final deconvolution pass to get spike trains

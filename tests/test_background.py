@@ -79,6 +79,83 @@ class TestComputeW:
         n = dims[0] * dims[1]
         assert W_mat.shape == (n, n)
 
+    def test_streaming_b0_matches_legacy(self):
+        """b0 from (Y_sum - A @ C_sum) / T must equal (Y - A@C).mean(axis=1)."""
+        rng = np.random.default_rng(7)
+        H, W, T = 18, 22, 240
+        Y = rng.standard_normal((H * W, T)).astype(np.float32) * 1.3
+        K = 3
+        A_dense = np.zeros((H * W, K), dtype=np.float32)
+        for k in range(K):
+            for p in rng.choice(H * W, size=15, replace=False):
+                A_dense[p, k] = rng.uniform(0.1, 0.6)
+        A = sp.csc_matrix(A_dense)
+        C = rng.standard_normal((K, T)).astype(np.float32) * 0.7
+
+        # Legacy formulation
+        b0_legacy = (Y - A.dot(C)).mean(axis=1).astype(np.float32)
+
+        # New streaming computation (same math, no full X intermediate)
+        _, b0_new = compute_W(Y, A, C, (H, W), radius=3, tsub=1)
+
+        np.testing.assert_allclose(b0_new, b0_legacy, atol=1e-4, rtol=1e-4)
+
+    def test_W_cached_returns_cached_W_and_refit_b0(self):
+        """W_cached=W returns the same W and recomputes b0 from current (A, C)."""
+        rng = np.random.default_rng(11)
+        H, W, T = 18, 22, 240
+        Y = rng.standard_normal((H * W, T)).astype(np.float32) * 1.3
+        A0 = sp.csc_matrix((H * W, 0), dtype=np.float32)
+        C0 = np.empty((0, T), dtype=np.float32)
+
+        # First call: full solve.
+        W_mat, b0_initial = compute_W(Y, A0, C0, (H, W), radius=3)
+
+        # Second call with a *different* (A, C) but the cached W.
+        K = 2
+        A_dense = np.zeros((H * W, K), dtype=np.float32)
+        A_dense[rng.choice(H * W, size=10, replace=False), 0] = 0.4
+        A_dense[rng.choice(H * W, size=10, replace=False), 1] = 0.4
+        A = sp.csc_matrix(A_dense)
+        C = rng.standard_normal((K, T)).astype(np.float32) * 0.7
+
+        W_returned, b0_refit = compute_W(
+            Y, A, C, (H, W), radius=3, W_cached=W_mat,
+        )
+
+        # W is the same object (no resolve)
+        assert W_returned is W_mat
+        # b0 reflects the new (A, C)
+        expected_b0 = (Y - A.dot(C)).mean(axis=1).astype(np.float32)
+        np.testing.assert_allclose(b0_refit, expected_b0, atol=1e-4, rtol=1e-4)
+        # And b0 changed compared to the (A=empty) initial fit
+        assert not np.allclose(b0_refit, b0_initial)
+
+    def test_W_cached_skips_solve_for_large_pixels(self):
+        """W_cached path must skip the per-pixel solve entirely (fast)."""
+        import time
+        rng = np.random.default_rng(13)
+        H, W, T = 40, 40, 400
+        Y = rng.standard_normal((H * W, T)).astype(np.float32)
+        A = sp.csc_matrix((H * W, 0), dtype=np.float32)
+        C = np.empty((0, T), dtype=np.float32)
+
+        t0 = time.perf_counter()
+        W_mat, _ = compute_W(Y, A, C, (H, W), radius=3)
+        t_solve = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        W_returned, _ = compute_W(Y, A, C, (H, W), radius=3, W_cached=W_mat)
+        t_cached = time.perf_counter() - t0
+
+        # The cached path should be dramatically faster — solve dominates.
+        # Generous factor to avoid CI flakes; the real difference is ~50-100x.
+        assert t_cached < t_solve / 5, (
+            f"cached path ({t_cached*1e3:.1f}ms) not enough faster than "
+            f"solve ({t_solve*1e3:.1f}ms)"
+        )
+        assert W_returned is W_mat
+
     def test_subtract_background_reduces_variance(self):
         """Background subtraction should reduce variance in background-dominated pixels."""
         rng = np.random.default_rng(1)

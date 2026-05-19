@@ -185,6 +185,7 @@ def compute_W(
     n_jobs: int = 1,
     device: str = "cpu",
     tsub: int = 1,
+    W_cached: "sp.csr_matrix | None" = None,
 ) -> tuple[sp.csr_matrix, np.ndarray]:
     """Fit ring-model weights W and per-pixel baseline b0.
 
@@ -205,6 +206,12 @@ def compute_W(
                 Ignored when device='cuda'.
         device: 'cpu' or 'cuda'. GPU uses batched linalg.solve (fast for
                 large movies with many interior pixels).
+        tsub: Subsample factor along time for the expensive BTB solve.
+        W_cached: If given, reuse this ring weight matrix instead of solving.
+                  Only b0 is refit from the current (A, C). Use this when
+                  W has already been computed on similar (A, C) earlier
+                  in the same fit() call and only the baseline needs to
+                  track residual changes.
 
     Returns:
         W: Sparse (H*W, H*W) weight matrix (row i = weights for pixel i).
@@ -214,16 +221,34 @@ def compute_W(
     n_pixels, T = Y_flat.shape
     xp = get_xp(device)
 
-    X = Y_flat - A.dot(C)
-    b0 = X.mean(axis=1)
-    X -= b0[:, np.newaxis]
+    # Streaming b0: (Y.sum(axis=1) - A @ C.sum(axis=1)) / T is identically
+    # (Y - A @ C).mean(axis=1) by linearity, without ever materialising the
+    # full (H*W, T) residual.
+    C_sum = np.asarray(C.sum(axis=1), dtype=np.float32)
+    Y_sum = np.asarray(Y_flat.sum(axis=1), dtype=np.float32)
+    AC_sum = np.asarray(A @ C_sum, dtype=np.float32).ravel()
+    b0 = ((Y_sum - AC_sum) / float(T)).astype(np.float32)
+
+    if W_cached is not None:
+        # Reuse the ring weight matrix; only b0 needs refreshing as A, C drift.
+        return W_cached, b0
 
     # Optionally subsample time for the expensive BTB = B @ B.T solve.
     # b0 is kept from the full T; only the ring regression uses fewer frames.
     # Cap tsub so at least 200 frames are used (prevents noisy W on short movies).
-    n_T = X.shape[1]
-    actual_tsub = max(1, min(tsub, n_T // 200)) if tsub > 1 else 1
-    X_fit = X[:, ::actual_tsub] if actual_tsub > 1 else X
+    actual_tsub = max(1, min(tsub, T // 200)) if tsub > 1 else 1
+    if actual_tsub > 1:
+        Y_sub = np.asarray(Y_flat[:, ::actual_tsub], dtype=np.float32)
+        C_sub = C[:, ::actual_tsub]
+    else:
+        Y_sub = np.asarray(Y_flat, dtype=np.float32)
+        C_sub = C
+    # Build X_fit at the subsampled time resolution only — the full-T X is
+    # never materialised. AC_sub is the dominant remaining allocation; Phase C
+    # will stream this too once Y_flat becomes a zarr-aware reader.
+    AC_sub = np.asarray(A.dot(C_sub), dtype=np.float32)
+    X_fit = Y_sub - AC_sub - b0[:, np.newaxis]
+    del Y_sub, AC_sub
 
     ring_idx = build_ring_indices(dims, radius)
 
