@@ -573,25 +573,27 @@ class BackgroundSubtractor:
         W_chunk = self.W[start:end]
         Y_chunk = np.asarray(self.Y_flat[start:end], dtype=np.float32)
 
-        if isinstance(self.Y_flat, np.ndarray):
-            # Numpy: scipy's sparse-dense matmul already reads only the
-            # nonzero-column rows of Y_flat — leave it alone.
-            W_Y = np.asarray(W_chunk @ self.Y_flat, dtype=np.float32)
+        # Extract only the ring-neighbour rows needed for this batch and do the
+        # sparse matmul on that small C-contiguous slab. This avoids the
+        # pathological access pattern of `W_chunk @ self.Y_flat` when Y_flat
+        # is the F-contiguous transposed view produced by make_2d(): scipy's
+        # CSR matmul would access Y_flat[j, :] with 1.44 MB stride per time
+        # step on a 15+ GB array, causing ~99 % DRAM cache miss rate (~94 min
+        # for a 600×600 × 11k movie). Fancy indexing `self.Y_flat[needed]`
+        # always returns a C-contiguous copy, so the subsequent sparse matmul
+        # stays cache-friendly regardless of Y_flat's layout (numpy or zarr).
+        indices = W_chunk.indices
+        if indices.size == 0:
+            W_Y = np.zeros_like(Y_chunk)
         else:
-            # Generic (zarr / memmap / anything supporting fancy indexing):
-            # pull ring-neighbour rows into RAM, remap W's columns.
-            indices = W_chunk.indices
-            if indices.size == 0:
-                W_Y = np.zeros_like(Y_chunk)
-            else:
-                needed = np.unique(indices)
-                Y_needed = np.asarray(self.Y_flat[needed], dtype=np.float32)
-                remap = np.searchsorted(needed, indices)
-                W_chunk_remapped = sp.csr_matrix(
-                    (W_chunk.data, remap, W_chunk.indptr),
-                    shape=(W_chunk.shape[0], needed.size),
-                )
-                W_Y = np.asarray(W_chunk_remapped @ Y_needed, dtype=np.float32)
+            needed = np.unique(indices)
+            Y_needed = np.asarray(self.Y_flat[needed], dtype=np.float32)
+            remap = np.searchsorted(needed, indices)
+            W_chunk_remapped = sp.csr_matrix(
+                (W_chunk.data, remap, W_chunk.indptr),
+                shape=(W_chunk.shape[0], needed.size),
+            )
+            W_Y = np.asarray(W_chunk_remapped @ Y_needed, dtype=np.float32)
 
         W_b0 = np.asarray(W_chunk @ self.b0, dtype=np.float32)
         out = Y_chunk - self.b0[start:end, None] - W_Y
