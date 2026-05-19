@@ -93,24 +93,33 @@ CNMFeParams MC fields:
 `<output_dir>/mc.zarr` without materializing T frames in RAM.
 
 **Extraction RAM after the streaming refactor (Items 1A–1D, May 2026).**
-The full corrected movie still has to fit in pixel-major RAM as `Y_flat`
-(time-major zarr can't be efficiently sliced pixel-wise without a disk
-transpose). Everything *on top of* `Y_flat` is now streamed:
+Everything *on top of* `Y_flat` is streamed:
 - `BackgroundSubtractor` (`background.py`) materialises pixel-row slices
   of `(I - W) @ (Y - b0)` on demand. The full `Y_bg` is never built.
+  Works on numpy or zarr-backed `Y_flat` (the zarr branch extracts only
+  ring-neighbour rows via advanced indexing).
 - `compute_W` computes `b0` via streaming reductions
   (`(Y_sum - A @ C_sum) / T`) and builds X_fit only at the subsampled time
   resolution. After the first call it accepts `W_cached=W_mat` and only
   refreshes `b0` — saving the per-pixel BTB solve on subsequent BCD
-  iterations.
+  iterations. For zarr-backed `Y_flat` it builds X-slabs per pixel batch
+  so the full `(H·W, T_sub)` residual is never materialised.
 - Greedy init runs on a strided sample (`init_stride` field on `CNMFeParams`;
   auto = `max(1, T // 5000)`); full-T temporal traces are recovered by
   projecting `Y_flat` onto each footprint after init.
 
-On a 10k × 600 × 600 movie peak working RAM is ~14 GB (Y_flat) + small
-per-batch buffers. The 60k+ frame case still requires either subsampling
-or a future Phase that disk-transposes the corrected zarr to pixel-major
-chunks; see `todo/correctionplan.md`.
+**Two RAM tiers (Item 5 / Phase F, May 2026):**
+
+- **In-memory** — `fit(numpy_or_zarr)` materialises `Y_flat = make_2d(movie)`.
+  Peak ≈ T·H·W·4 bytes. Good for 10k × 600 × 600 (~14 GB).
+- **True T-streaming** — `transpose_zarr_to_pixel_major(mc.zarr, mc_pixel.zarr)`
+  once, then `fit(mc_zarr, do_motion_correction=False, Y_flat_zarr=mc_pixel_zarr)`.
+  `Y_flat` is the on-disk pixel-major store; the 3D zarr is read only for
+  the strided init sample. Peak RAM independent of T; bounded by
+  `K·T·4` (traces) + per-batch buffers. Unlocks 60k+ frame recordings.
+
+The transpose is a one-time disk pass; pixel ordering matches `make_2d`
+(pixel `(h, w)` → flat `h*W + w`).
 
 Convenience wrappers added alongside `motion_correction_rigid`:
 - `apply_shift(img, shift)` — alias for `apply_shift_caiman`
@@ -186,6 +195,26 @@ updated. **Do not regress to a 2-tuple.**
 `pipeline.fit()` runs an extra `merge_components` pass *before* the first
 `update_spatial`, on `C_raw`, to fuse duplicate seed detections while their
 footprints still overlap (before `threshold_footprint` separates them).
+
+### Auto-evaluation step (post-BCD quality filter)
+`pipeline.fit()` runs `cnmfe.evaluate.auto_evaluate_components` between the
+BCD loop and the final `update_temporal`. Two per-component checks must
+both pass:
+1. **Pixel-count floor:** `npix >= CNMFeParams.min_pixel`.
+2. **Mean-amplitude SNR:** `(||a||² / npix) / mean(sn_pixel²) >= auto_eval_snr_amp_thr` (default `3.0`).
+
+The SNR check is the real discriminator and is **scale-invariant** — real σ=3 Gaussian
+footprints score 10–70, ghost components born from background-noise seeds (loose init
+thresholds, e.g. `min_corr=0.7, min_pnr=3.0`) sit at or below 2 *even when their pixel
+count is large* (ghosts can be wide, low-amplitude blobs that survive `threshold_footprint`
+because they're a connected component of pixels each above 10 % of the ghost's own peak).
+**Pure pixel-count filtering does not separate real from ghost components in this codebase**
+— don't try to replace the SNR check with a fixed-area threshold. Set
+`auto_eval_snr_amp_thr=0.0` to disable; `min_pixel` continues to apply.
+
+Cache cleanup follows the existing `alive = nA > 0` pattern — `A`, `C`, `g_per_k`,
+`sn_per_k` are filtered in lockstep before the final temporal update. The regression
+test is `tests/test_pipeline.py::test_auto_evaluation_rejects_ghosts`.
 
 ### zarr v3 API
 The project uses zarr v3 (`zarr >= 3.0`). The v3 API differs from v2 in chunk

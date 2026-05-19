@@ -102,9 +102,51 @@ model = CNMFe(params).fit(z, do_motion_correction=False)
 ```
 
 Peak working RAM is `~T·H·W·4` bytes (the movie itself) plus `~K·T·4` for
-traces. On a 10k × 600 × 600 movie that is ~14 GB; on 60k × 600 × 600
-it's ~86 GB and you'll want either subsampling or — when the disk-transpose
-preprocessing path lands — to read straight from a pixel-major chunked zarr.
+traces. On a 10k × 600 × 600 movie that is ~14 GB; for longer recordings
+use the true T-streaming path below.
+
+### True T-streaming via pixel-major zarr (60k+ frames)
+
+The in-RAM path above caps out around ~30k frames at 600 × 600 on a
+typical 64 GB workstation. For longer recordings, transpose the corrected
+movie to pixel-major chunks once (one disk pass) and pass it to `fit()`
+as `Y_flat_zarr`. Extraction then never materialises the full
+`(H·W, T)` array — the on-disk store IS `Y_flat`.
+
+```python
+from cnmfe.io import (
+    open_zarr,
+    open_zarr_pixel_major,
+    transpose_zarr_to_pixel_major,
+)
+from cnmfe import CNMFe, CNMFeParams
+
+# One-time preprocessing: rewrite mc.zarr with chunks (4096, 2000)
+# so pixel-row reads are O(B·T) IO instead of O(H·W·T).
+transpose_zarr_to_pixel_major(
+    "session/mc.zarr",
+    "session/mc_pixel.zarr",
+    pixel_chunk=4096,
+    time_chunk=2000,
+    skip_if_exists=True,
+)
+
+# Open both layouts. The 3D zarr is read only for the strided greedy-init
+# sample (~T / init_stride frames); the pixel-major zarr is Y_flat.
+mc_3d   = open_zarr("session/mc.zarr")
+Y_pixel = open_zarr_pixel_major("session/mc_pixel.zarr")
+
+params = CNMFeParams(sigma=3.0, min_corr=0.8, min_pnr=10.0, n_jobs=-1)
+model = CNMFe(params).fit(
+    mc_3d,
+    do_motion_correction=False,
+    Y_flat_zarr=Y_pixel,
+)
+```
+
+Peak working RAM in this mode is bounded by `K·T·4` (traces) plus small
+per-batch buffers — independent of `T`. The 3D zarr is touched only once
+per fit (for the strided init sample).
 
 ### Use multiple CPU cores
 

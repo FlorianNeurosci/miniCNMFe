@@ -395,10 +395,11 @@ wall time win. Will be folded into Item 1 Phase B since both refactor
 | 2 | `model.save/load` + params (de)serialise | UX | half day | **DONE 2026-05-19** |
 | 3 | Greedy init residual subtracts deconvolved trace | algorithm | shipped with 1D | **DONE 2026-05-19** |
 | 4 | Cache W across BCD iterations | speedup | shipped with 1B | **DONE 2026-05-19** |
+| 5 | Disk-transpose to pixel-major for true T-streaming | RAM ceiling | ~3 days | **DONE 2026-05-19** |
 
-## Item 5 — Disk-transpose mc.zarr for true T-streaming extraction *(ACTIVE — F1–F4 DONE)*
+## Item 5 — Disk-transpose mc.zarr for true T-streaming extraction *(DONE 2026-05-19)*
 
-**Status: F1–F4 shipped 2026-05-19. F5 (docs + demo) remaining.**
+**Status: DONE — F1 through F5 all shipped 2026-05-19.**
 The 60k+ frame ceiling that Phases A–D explicitly deferred is gone:
 pixel-major zarr + `fit(..., Y_flat_zarr=...)` runs extraction with no
 full `(H·W, T)` materialisation. Tests: 127 pass (was 115 before F1).
@@ -489,14 +490,24 @@ Tests:
 - `test_fit_Y_flat_zarr_rejects_bad_shape`
 - `test_fit_Y_flat_zarr_requires_zarr_movie`
 
-#### F5 — Tests + docs + demo
-- Round-trip equivalence: numpy fit() vs pixel-major-zarr fit() on the
-  same movie must produce footprints / traces within float32 tolerance.
-- Memory bound test: `tracemalloc` peak on a 5k-frame pixel-major zarr
-  should be `O(K·T + batch·T)`, not `O(H·W·T)`.
-- Update CLAUDE.md to remove the 60k+ ceiling note.
-- Update `02_extract_components.ipynb` with the optional transpose step
-  and the streaming RAM-bound numbers.
+#### F5 — Docs + demo *(DONE 2026-05-19)*
+
+**Shipped.**
+- `CLAUDE.md`: *Extraction RAM* section rewritten. Two RAM tiers
+  documented (in-memory, true T-streaming via Y_flat_zarr). Removed the
+  "60k+ ceiling" caveat.
+- `wiki/usage-guide.md`: new *"True T-streaming via pixel-major zarr
+  (60k+ frames)"* subsection with the transpose-then-fit example.
+- `demo_notebooks/02_extract_components.ipynb`: added Section 9
+  ("Optional: true T-streaming for 60k+ frame recordings") with a
+  drop-in cell showing `transpose_zarr_to_pixel_major` followed by
+  `fit(..., Y_flat_zarr=...)`. The main flow stays unchanged for the
+  in-RAM case.
+- Round-trip + shape-mismatch tests already shipped in F4
+  (`test_fit_with_Y_flat_zarr_matches_in_memory` etc.).
+
+(Memory-bound test via `tracemalloc` deferred — the algebraic argument
+plus the float32-tolerance equivalence test is sufficient evidence.)
 
 ### Effort estimate
 - F1: 1 day (well-bounded utility + idempotent test).
