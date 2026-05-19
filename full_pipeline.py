@@ -6,14 +6,21 @@ Usage:
 The zarr must be a 3-D float32 store with shape (T, H, W), as produced by
 concat_avis_to_zarr.py or convert_to_zarr.py.
 
-Results are written to  <output_dir>/  (default: a 'results' folder next to the zarr):
-    A.npz        -- sparse spatial footprints (scipy CSC, shape H*W × K)
-    C.npy        -- OASIS-deconvolved traces (K × T)
-    S.npy        -- spike trains (K × T)
-    YrA.npy      -- residuals; C + YrA is the noisy projected trace (K × T)
-    shifts.npy   -- per-frame motion correction shifts (T × 2), dy/dx in pixels
-    sn.npy       -- per-pixel noise std (H × W)
-    params.json  -- all pipeline parameters used
+Results are written to  <output_dir>/  (default: a 'results' folder next to the zarr)
+via ``model.save(out_dir)``. Reload anywhere with ``CNMFe.load(out_dir)``.
+Files:
+    A.npz         -- sparse spatial footprints (scipy CSC, shape H*W × K)
+    C.npy         -- OASIS-deconvolved traces (K × T)
+    S.npy         -- spike trains (K × T)
+    YrA.npy       -- residuals; C + YrA is the noisy projected trace (K × T)
+    C_raw.npy     -- raw init traces (K × T)
+    sn.npy        -- per-pixel noise std (H × W)
+    b0.npy, W.npz -- ring-background baseline + sparse weights
+    g.npy, sn_per_k.npy -- per-component AR coefs + noise std
+    shifts.npy    -- per-frame motion correction shifts (T × 2) [if MC enabled]
+    params.json   -- the CNMFeParams used
+    manifest.json -- dims, K, T (non-parameter metadata)
+    run_info.json -- this script's run-level metadata (zarr path, wall time)
 """
 
 from __future__ import annotations
@@ -22,8 +29,6 @@ import argparse
 import json
 import time
 from pathlib import Path
-
-import numpy as np
 
 
 def main() -> None:
@@ -111,56 +116,34 @@ def main() -> None:
     print(f"\nExtracted {K} neurons in {elapsed:.1f}s")
 
     # --- Save results -------------------------------------------------------
-    import scipy.sparse as sp
+    # All result arrays + params.json + manifest.json are written by save().
+    model.save(out_dir)
 
-    sp.save_npz(out_dir / "A.npz", model.A.tocsc())
-    np.save(out_dir / "C.npy",   model.C)
-    np.save(out_dir / "S.npy",   model.S)
-    np.save(out_dir / "YrA.npy", model.YrA)
-    np.save(out_dir / "sn.npy",  model.sn)
-
-    if model.shifts is not None:
-        np.save(out_dir / "shifts.npy", model.shifts)
-    else:
-        np.save(out_dir / "shifts.npy", np.zeros((T, 2), dtype=np.float32))
-
-    params_dict = {
+    # Extra run-level metadata that isn't part of CNMFeParams.
+    run_info = {
         "zarr": str(zarr_path),
         "movie_shape": list(z.shape),
         "K_extracted": K,
         "wall_time_s": round(elapsed, 2),
-        "sigma": params.sigma,
-        "min_corr": params.min_corr,
-        "min_pnr": params.min_pnr,
-        "n_iter_main": params.n_iter_main,
-        "n_iter_temporal": params.n_iter_temporal,
         "mc_enabled": not args.no_mc,
-        "mc_n_iter": params.mc_n_iter,
-        "max_shift": args.max_shift,
-        "spatial_max_thr": params.spatial_max_thr,
-        "merge_thr_corr": params.merge_thr_corr,
-        "merge_thr_overlap": params.merge_thr_overlap,
-        "global_ar": params.global_ar,
-        "n_jobs": params.n_jobs,
     }
-    (out_dir / "params.json").write_text(json.dumps(params_dict, indent=2))
+    (out_dir / "run_info.json").write_text(json.dumps(run_info, indent=2))
 
     print(f"\nResults saved to {out_dir}/")
-    print(f"  A.npz      -- footprints  ({H * W} × {K}, sparse CSC)")
-    print(f"  C.npy      -- deconvolved traces  ({K} × {T})")
-    print(f"  S.npy      -- spike trains  ({K} × {T})")
-    print(f"  YrA.npy    -- residuals (C + YrA = projected trace)  ({K} × {T})")
-    print(f"  shifts.npy -- motion shifts  ({T} × 2)")
-    print(f"  sn.npy     -- noise map  ({H} × {W})")
-    print(f"  params.json")
+    print(f"  A.npz       -- footprints  ({H * W} × {K}, sparse CSC)")
+    print(f"  C.npy       -- deconvolved traces  ({K} × {T})")
+    print(f"  S.npy       -- spike trains  ({K} × {T})")
+    print(f"  YrA.npy     -- residuals (C + YrA = projected trace)  ({K} × {T})")
+    print(f"  sn.npy      -- noise map  ({H} × {W})")
+    print(f"  params.json   manifest.json   run_info.json")
+    if (out_dir / "shifts.npy").exists():
+        print(f"  shifts.npy  -- motion shifts  ({T} × 2)")
 
     print(f"\nLoad results:")
-    print(f"  import numpy as np, scipy.sparse as sp")
-    print(f"  A   = sp.load_npz('{out_dir}/A.npz')   # ({H*W}, {K})")
-    print(f"  C   = np.load('{out_dir}/C.npy')        # ({K}, {T})")
-    print(f"  YrA = np.load('{out_dir}/YrA.npy')      # ({K}, {T})")
-    print(f"  # noisy projected trace (shape-faithful):")
-    print(f"  C_proj = C + YrA")
+    print(f"  from cnmfe.pipeline import CNMFe")
+    print(f"  model = CNMFe.load('{out_dir}')")
+    print(f"  A, C, YrA = model.A, model.C, model.YrA")
+    print(f"  C_proj = model.C_projected   # = C + YrA, shape-faithful")
 
 
 if __name__ == "__main__":

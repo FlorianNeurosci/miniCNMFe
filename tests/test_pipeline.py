@@ -182,6 +182,86 @@ class TestCNMFePipeline:
         )
         np.testing.assert_allclose(model_zarr.C, model_np.C, atol=1e-4, rtol=1e-4)
 
+    def test_save_load_roundtrip(self, synth_small, tmp_path):
+        """model.save() then CNMFe.load() must restore all fitted state.
+
+        Pins the on-disk layout (A.npz, C.npy, ..., params.json, manifest.json)
+        and the round-trip equivalence so downstream analysis scripts can
+        rely on it.
+        """
+        movie = synth_small["movie"]
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.5, min_pnr=3.0,
+            n_iter_main=1, n_iter_temporal=1,
+            mc_gSig_filt=2.5,                  # exercises a non-default float|None
+        )
+        model = CNMFe(params).fit(movie, do_motion_correction=False)
+
+        save_dir = tmp_path / "model"
+        model.save(save_dir)
+
+        # Spot-check the on-disk layout — these files anchor full_pipeline.py
+        # and the demo notebook's save cell.
+        for name in (
+            "A.npz", "C.npy", "S.npy", "YrA.npy",
+            "params.json", "manifest.json",
+        ):
+            assert (save_dir / name).exists(), f"{name} missing from save dir"
+
+        loaded = CNMFe.load(save_dir)
+
+        # Params survived intact (including the tuple field).
+        assert loaded.params.sigma == params.sigma
+        assert loaded.params.max_shift == params.max_shift
+        assert isinstance(loaded.params.max_shift, tuple)
+        assert loaded.params.mc_gSig_filt == params.mc_gSig_filt
+
+        # All result arrays match bit-for-bit (np.save is lossless).
+        np.testing.assert_array_equal(
+            np.asarray(loaded.A.todense()), np.asarray(model.A.todense())
+        )
+        np.testing.assert_array_equal(loaded.C, model.C)
+        np.testing.assert_array_equal(loaded.S, model.S)
+        np.testing.assert_array_equal(loaded.YrA, model.YrA)
+        np.testing.assert_array_equal(loaded.sn, model.sn)
+        assert loaded.dims == model.dims
+
+        # Optional fields that should be present after a normal fit.
+        assert loaded.W is not None and loaded.b0 is not None
+        assert loaded.g is not None and len(loaded.g) == model.A.shape[1]
+        assert loaded.sn_per_k is not None
+
+        # C_projected property = C + YrA.
+        np.testing.assert_array_equal(loaded.C_projected, loaded.C + loaded.YrA)
+
+    def test_C_projected_raises_before_fit(self):
+        """C_projected before fit() should fail loudly, not silently None+None."""
+        model = CNMFe()
+        with pytest.raises(RuntimeError, match="not been fit"):
+            _ = model.C_projected
+
+    def test_save_raises_before_fit(self, tmp_path):
+        """save() before fit() should fail loudly."""
+        with pytest.raises(RuntimeError, match="not been fit"):
+            CNMFe().save(tmp_path / "model")
+
+    def test_params_to_from_json_unknown_keys_dropped(self, tmp_path):
+        """from_json must ignore keys not on the current dataclass, so old
+        save dirs keep loading after a field is added or removed."""
+        p = CNMFeParams(sigma=2.5)
+        path = tmp_path / "params.json"
+        p.to_json(path)
+
+        # Inject a stray field that the dataclass doesn't know about.
+        import json as _json
+        raw = _json.loads(path.read_text())
+        raw["i_do_not_exist"] = "hello"
+        path.write_text(_json.dumps(raw))
+
+        loaded = CNMFeParams.from_json(path)
+        assert loaded.sigma == 2.5
+        assert not hasattr(loaded, "i_do_not_exist")
+
     def test_with_motion_correction(self, synth_small):
         """Motion correction pass should complete without errors."""
         movie = synth_small["movie"]
@@ -227,6 +307,46 @@ class TestCNMFePipeline:
         assert np.mean(rs_oasis) > 0.85, f"Mean r(C) = {np.mean(rs_oasis):.3f}"
         assert np.mean(rs_proj) > 0.85, f"Mean r(C+YrA) = {np.mean(rs_proj):.3f}"
         assert min(rs_proj) > 0.70, f"Min r(C+YrA) = {min(rs_proj):.3f}"
+
+    def test_auto_evaluation_rejects_ghosts(self, synth):
+        """Loose init thresholds must not produce ghost components.
+
+        Regression: with min_corr=0.7, min_pnr=3.0 on the 6-neuron synthetic
+        fixture the pipeline used to return ~26 components — 6 real neurons
+        plus ~20 ghost components at scattered background-noise locations
+        7-26 px from any true neuron. Ghosts had tiny footprints (~11-29 px)
+        compared to real sigma=3 Gaussians (~130 px after threshold_footprint
+        at max_thr=0.1). The matching-based tests
+        (test_temporal_correlation_against_truth etc.) pair each *true*
+        neuron with its best estimate and so silently ignored the extras.
+
+        Fix: the auto-evaluation step (cnmfe.evaluate.auto_evaluate_components,
+        called from CNMFe.fit after the BCD loop) drops components with fewer
+        than ceil(0.5*pi*sigma^2) pixels.
+        """
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.7, min_pnr=3.0,
+            n_iter_main=2, n_iter_temporal=2,
+        )
+        model = CNMFe(params).fit(synth["movie"], do_motion_correction=False)
+
+        K_true = synth["A_true"].shape[1]
+        K_recovered = model.A.shape[1]
+
+        # Pre-fix: K_recovered == 26 for K_true=6. Post-fix expectation: 6-7.
+        assert K_recovered <= K_true + 2, (
+            f"Over-detection: recovered {K_recovered} components for "
+            f"K_true={K_true} (pre-fix this was ~26 ghost-laden runs)."
+        )
+
+        # Ghost rejection must not trade away real neurons.
+        matches = match_components(model.A, synth["A_true"])
+        well_matched = sum(1 for m in matches if m[2] > 0.7)
+        assert well_matched == K_true, (
+            f"Lost real neurons: only {well_matched}/{K_true} matched with "
+            f"spatial r > 0.7. Per-neuron r: "
+            f"{[round(m[2], 3) for m in matches]}"
+        )
 
     def test_per_neuron_ar_temporal_correlation(self, synth):
         """Per-neuron AR estimation (global_ar=False) should recover traces as well as global."""

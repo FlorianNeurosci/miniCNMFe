@@ -6,7 +6,8 @@ ring background → iterative spatial/temporal refinement.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -15,6 +16,7 @@ import scipy.sparse as sp
 
 from cnmfe._utils import make_2d
 from cnmfe.background import BackgroundSubtractor, compute_W
+from cnmfe.evaluate import auto_evaluate_components
 from cnmfe.initialization import greedy_corr_pnr
 from cnmfe.merging import merge_components
 from cnmfe.motion_correction import motion_correction_rigid
@@ -88,6 +90,35 @@ class CNMFeParams:
     skip_first_deconv: bool = True  # Use NNLS (p=0) for first temporal pass; OASIS on all others
     bg_tsub: int = 5                # Temporal subsampling factor for ring-background W solve
 
+    # --- Auto evaluation (post-BCD quality filter) ---
+    # `min_pixel` above is reused as a hard floor on footprint extent.
+    # `auto_eval_snr_amp_thr` is the threshold on the mean-amplitude SNR
+    # mean(a^2) / mean(sn_pixel^2) — a scale-invariant check that catches
+    # ghost components whose footprint sits at the pixel-noise floor.
+    # Set to 0 to disable.
+    auto_eval_snr_amp_thr: float = 3.0
+
+    # --- Serialisation ---------------------------------------------------------
+
+    def to_json(self, path: "str | Path") -> None:
+        """Write all parameters to a JSON file."""
+        Path(path).write_text(json.dumps(asdict(self), indent=2))
+
+    @classmethod
+    def from_json(cls, path: "str | Path") -> "CNMFeParams":
+        """Construct ``CNMFeParams`` from a JSON file written by ``to_json``.
+
+        Tuple fields (e.g. ``max_shift``) come back as lists from JSON; this
+        method restores their declared types. Unknown keys are dropped so old
+        save dirs remain loadable after fields are added or removed.
+        """
+        raw = json.loads(Path(path).read_text())
+        valid_names = {f.name for f in fields(cls)}
+        data = {k: v for k, v in raw.items() if k in valid_names}
+        if "max_shift" in data and isinstance(data["max_shift"], list):
+            data["max_shift"] = tuple(data["max_shift"])
+        return cls(**data)
+
 
 class CNMFe:
     """Clean CNMFe for 1-photon calcium imaging.
@@ -123,6 +154,138 @@ class CNMFe:
         self.g: list[np.ndarray] | None = None    # per-component AR coefs
         self.sn_per_k: np.ndarray | None = None   # per-component noise std
         self.mc_roi: "tuple[slice, slice] | None" = None  # ROI used for shift estimation
+
+    # ------------------------------------------------------------------
+    # Convenience accessors
+    # ------------------------------------------------------------------
+
+    @property
+    def C_projected(self) -> np.ndarray:
+        """The shape-faithful "noisy projected trace" ``C + YrA``.
+
+        - ``self.C`` is OASIS-deconvolved (clean AR(1) shape); use it for
+          spike-event detection or smooth amplitude features where the
+          shape constraint ``c[t] >= g·c[t-1]`` is acceptable.
+        - ``self.C + self.YrA`` is the residual at each footprint added
+          back to ``C``; it has the same shape as the underlying data
+          and typically correlates >0.9 with ground truth, vs ~0.6–0.85
+          for ``C`` alone. Use it for cross-correlation, regression
+          against external signals, or any shape-sensitive analysis.
+
+        Raises:
+            RuntimeError: if ``fit()`` has not been called yet.
+        """
+        if self.C is None or self.YrA is None:
+            raise RuntimeError("Model has not been fit; C and YrA are unset.")
+        return self.C + self.YrA
+
+    # ------------------------------------------------------------------
+    # Serialisation
+    # ------------------------------------------------------------------
+
+    def save(self, output_dir: "str | Path") -> None:
+        """Persist results + params to ``output_dir`` as standalone files.
+
+        Layout (mirrors ``full_pipeline.py`` so existing analysis scripts
+        keep working):
+
+        - ``A.npz``        sparse CSC footprints ``(H*W, K)``
+        - ``C.npy``        OASIS-deconvolved traces ``(K, T)``
+        - ``S.npy``        spike trains ``(K, T)``
+        - ``YrA.npy``      residual; ``C + YrA`` is the noisy projection
+        - ``C_raw.npy``    raw init traces (when available)
+        - ``sn.npy``       per-pixel noise std ``(H, W)``
+        - ``shifts.npy``   per-frame motion shifts ``(T, 2)`` (when available)
+        - ``b0.npy``       per-pixel ring-bg baseline (when available)
+        - ``W.npz``        sparse CSR ring weights (when available)
+        - ``g.npy``        ``(K, ar_order)`` stacked AR coefs (when available)
+        - ``sn_per_k.npy`` ``(K,)`` per-component noise std (when available)
+        - ``params.json``  the ``CNMFeParams`` dataclass
+        - ``manifest.json`` non-parameter metadata: ``dims``, ``K``, ``T``.
+
+        Raises:
+            RuntimeError: if ``fit()`` has not been called yet.
+        """
+        if self.A is None or self.C is None:
+            raise RuntimeError("Cannot save a model that has not been fit.")
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        sp.save_npz(output_dir / "A.npz", self.A.tocsc())
+        np.save(output_dir / "C.npy", self.C)
+        np.save(output_dir / "S.npy", self.S)
+        np.save(output_dir / "YrA.npy", self.YrA)
+        if self.C_raw is not None:
+            np.save(output_dir / "C_raw.npy", self.C_raw)
+        if self.sn is not None:
+            np.save(output_dir / "sn.npy", self.sn)
+        if self.shifts is not None:
+            np.save(output_dir / "shifts.npy", self.shifts)
+        if self.b0 is not None:
+            np.save(output_dir / "b0.npy", self.b0)
+        if self.W is not None:
+            sp.save_npz(output_dir / "W.npz", self.W.tocsr())
+        if self.g is not None and len(self.g) > 0:
+            np.save(output_dir / "g.npy", np.stack(self.g))
+        if self.sn_per_k is not None:
+            np.save(output_dir / "sn_per_k.npy", self.sn_per_k)
+
+        self.params.to_json(output_dir / "params.json")
+
+        manifest = {
+            "dims": list(self.dims) if self.dims is not None else None,
+            "K": int(self.A.shape[1]),
+            "T": int(self.C.shape[1]),
+        }
+        (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+    @classmethod
+    def load(cls, output_dir: "str | Path") -> "CNMFe":
+        """Reconstruct a ``CNMFe`` from a directory written by ``save``.
+
+        All result attributes (``A``, ``C``, ``S``, ``YrA``, ``sn``, etc.)
+        are restored. Optional files (``shifts``, ``b0``, ``W``, ``g``,
+        ``sn_per_k``, ``C_raw``) are loaded if present; otherwise the
+        corresponding attribute stays ``None``.
+        """
+        output_dir = Path(output_dir)
+        if not output_dir.is_dir():
+            raise FileNotFoundError(f"Save directory not found: {output_dir}")
+
+        params = CNMFeParams.from_json(output_dir / "params.json")
+        model = cls(params)
+
+        manifest = json.loads((output_dir / "manifest.json").read_text())
+        if manifest.get("dims") is not None:
+            model.dims = tuple(manifest["dims"])
+
+        model.A = sp.load_npz(output_dir / "A.npz").tocsc()
+        model.C = np.load(output_dir / "C.npy")
+        model.S = np.load(output_dir / "S.npy")
+        model.YrA = np.load(output_dir / "YrA.npy")
+
+        if (output_dir / "C_raw.npy").exists():
+            model.C_raw = np.load(output_dir / "C_raw.npy")
+        if (output_dir / "sn.npy").exists():
+            model.sn = np.load(output_dir / "sn.npy")
+        if (output_dir / "shifts.npy").exists():
+            model.shifts = np.load(output_dir / "shifts.npy")
+        if (output_dir / "b0.npy").exists():
+            model.b0 = np.load(output_dir / "b0.npy")
+        if (output_dir / "W.npz").exists():
+            model.W = sp.load_npz(output_dir / "W.npz").tocsr()
+        if (output_dir / "g.npy").exists():
+            g_arr = np.load(output_dir / "g.npy")
+            model.g = [g_arr[k] for k in range(g_arr.shape[0])]
+        if (output_dir / "sn_per_k.npy").exists():
+            model.sn_per_k = np.load(output_dir / "sn_per_k.npy")
+
+        return model
+
+    # ------------------------------------------------------------------
+    # Pipeline
+    # ------------------------------------------------------------------
 
     def fit_mc(
         self,
@@ -446,6 +609,49 @@ class CNMFe:
                 tsub=p.bg_tsub,
                 W_cached=W_mat,
             )
+
+        # --- Step 7: Auto-evaluation ---
+        # Drop components failing per-component quality checks before the
+        # final deconvolution. Combines a hard pixel-count floor with a
+        # scale-invariant mean-amplitude SNR check (mean(a^2)/mean(sn^2));
+        # see cnmfe/evaluate.py for the rationale. Catches ghost components
+        # born from background-noise seeds under loose init thresholds —
+        # their footprints can be wide but are at the pixel-noise floor.
+        if A.shape[1] > 0:
+            keep, eval_info = auto_evaluate_components(
+                A,
+                sn_flat=sn_flat,
+                min_pixel=p.min_pixel,
+                snr_amp_thr=p.auto_eval_snr_amp_thr,
+            )
+            n_drop = int((~keep).sum())
+            if n_drop:
+                K_before = A.shape[1]
+                keep_idx = np.where(keep)[0]
+                A = A[:, keep_idx]
+                C = C[keep_idx]
+                g_per_k = [g_per_k[i] for i in keep_idx]
+                sn_per_k = sn_per_k[keep_idx]
+                n_px_fail = int((~eval_info["pixel_pass"]).sum())
+                n_snr_fail = int((~eval_info["snr_pass"]).sum())
+                print(
+                    f"Auto-evaluation: kept {A.shape[1]}/{K_before} "
+                    f"(rejected {n_drop}: {n_px_fail} fail pixel_count<{p.min_pixel}, "
+                    f"{n_snr_fail} fail snr_amp<{p.auto_eval_snr_amp_thr})."
+                )
+
+        if A.shape[1] == 0:
+            print("All components rejected by auto-evaluation.")
+            self.A = A
+            self.C = np.empty((0, T), dtype=np.float32)
+            self.S = np.empty((0, T), dtype=np.float32)
+            self.C_raw = C_raw
+            self.YrA = np.empty((0, T), dtype=np.float32)
+            self.W = W_mat
+            self.b0 = b0
+            self.g = g_per_k
+            self.sn_per_k = sn_per_k
+            return self
 
         # Final deconvolution pass to get spike trains
         print("Final temporal update...")

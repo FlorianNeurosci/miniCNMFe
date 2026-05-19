@@ -329,34 +329,34 @@ missed by the stride.
 
 ## Item 2 — `model.save()` / `CNMFe.load()` + `CNMFeParams` (de)serialise
 
-**Status: TODO.**
+**Status: DONE (2026-05-19).**
 
-Save logic duplicated across `full_pipeline.py:113-163`,
-`demo_notebooks/02_extract_components.ipynb` (the save cell), and any user
-downstream script. No load helper at all.
-
-**Sketch.**
-```python
-class CNMFeParams:
-    def to_json(self, path: Path) -> None: ...
-    @classmethod
-    def from_json(cls, path: Path) -> "CNMFeParams": ...
-
-class CNMFe:
-    def save(self, output_dir: Path) -> None:
-        """Write A.npz, C.npy, S.npy, YrA.npy, sn.npy, shifts.npy, params.json."""
-    @classmethod
-    def load(cls, output_dir: Path) -> "CNMFe":
-        """Reconstruct from save() output. Returns a CNMFe with all results set."""
-
-    @property
-    def C_projected(self) -> np.ndarray:
-        """C + YrA — the shape-faithful noisy projected trace."""
-        return self.C + self.YrA
-```
-
-**Verification.** Round-trip test: `m1.save(tmp); m2 = CNMFe.load(tmp);
-np.allclose(m1.C, m2.C); ...`. `full_pipeline.py` refactored; CLI output identical.
+**Shipped.**
+- `cnmfe/pipeline.py`:
+  - `CNMFeParams.to_json(path)` / `CNMFeParams.from_json(path)`. The
+    classmethod drops unknown keys so old save dirs keep loading after a
+    field is added or removed; tuple fields like `max_shift` round-trip
+    correctly.
+  - `CNMFe.save(output_dir)` writes the full result set as standalone
+    files: A.npz, C.npy, S.npy, YrA.npy, C_raw.npy, sn.npy, shifts.npy,
+    b0.npy, W.npz, g.npy, sn_per_k.npy, params.json, manifest.json
+    (dims, K, T).
+  - `CNMFe.load(output_dir)` classmethod restores everything. Optional
+    files are loaded only if present; unfit-model attributes stay None.
+  - `CNMFe.C_projected` property — `model.C + model.YrA`, the shape-
+    faithful noisy projected trace. Raises if called before fit().
+- `full_pipeline.py`: save block collapsed to `model.save(out_dir)` +
+  a tiny `run_info.json` for non-parameter run metadata. Docstring file
+  list updated. The "load results" block now shows the one-line
+  `CNMFe.load(...)` API.
+- `demo_notebooks/02_extract_components.ipynb`: save cell + adjacent
+  "Save results to disk" markdown + "What's next" markdown all updated
+  to use `model.save` / `CNMFe.load` / `model.C_projected`.
+- `tests/test_pipeline.py`: 4 new tests
+  (`test_save_load_roundtrip`, `test_C_projected_raises_before_fit`,
+  `test_save_raises_before_fit`,
+  `test_params_to_from_json_unknown_keys_dropped`).
+- All 115 tests pass.
 
 ---
 
@@ -392,7 +392,7 @@ wall time win. Will be folded into Item 1 Phase B since both refactor
 |---|---|---|---|---|
 | 0 | `mc_n_iter` rename (Item 1 prereq) | bug | 30 min | **DONE 2026-05-19** |
 | 1 | Stream extraction from zarr | blocking for scale | shipped 1 session | **DONE 2026-05-19** |
-| 2 | `model.save/load` + params (de)serialise | UX | half day | TODO |
+| 2 | `model.save/load` + params (de)serialise | UX | half day | **DONE 2026-05-19** |
 | 3 | Greedy init residual subtracts deconvolved trace | algorithm | shipped with 1D | **DONE 2026-05-19** |
 | 4 | Cache W across BCD iterations | speedup | shipped with 1B | **DONE 2026-05-19** |
 
