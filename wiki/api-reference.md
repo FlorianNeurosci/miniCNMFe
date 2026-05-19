@@ -527,6 +527,40 @@ The centre-distance fallback catches duplicate detections of the same neuron who
 
 ---
 
+## `cnmfe.evaluate`
+
+### `auto_evaluate_components`
+
+```python
+def auto_evaluate_components(
+    A: sp.csc_matrix,
+    sn_flat: np.ndarray,
+    min_pixel: int = 1,
+    snr_amp_thr: float = 3.0,
+) -> tuple[np.ndarray, dict]
+```
+
+Post-extraction quality filter. Called inside `CNMFe.fit()` between the BCD loop and the final temporal update; also usable standalone.
+
+**Returns** `(keep_mask, info)` — `keep_mask` is a `(K,)` bool, `info` carries the per-component statistics (`pixel_count`, `snr_amp`, `pixel_pass`, `snr_pass`, plus the thresholds applied).
+
+Two checks must both pass:
+
+1. **Pixel-count floor.** `npix[k] >= min_pixel`.
+2. **Mean-amplitude SNR.** A scale-invariant test against the per-pixel noise floor:
+
+   ```
+   snr_amp[k] = (||a_k||^2 / npix[k]) / mean(sn_flat[support_k]^2)
+   ```
+
+   Real σ=3 Gaussian footprints typically score 10–70 here; ghost components born from background-noise seeds (e.g. under loose `min_corr` / `min_pnr` thresholds) sit at or below 2 even when their pixel count is large. At `snr_amp_thr=3.0` the test cleanly separates real and ghost components.
+
+`sn_flat` is the same per-pixel noise std produced by `cnmfe.preprocess.estimate_noise(...).ravel()` — the pipeline reuses its own `self.sn` for this call.
+
+Pipeline-level knob: `CNMFeParams.auto_eval_snr_amp_thr` (default `3.0`). Setting it to `0.0` disables the SNR check; `min_pixel` continues to apply.
+
+---
+
 ## `cnmfe._utils`
 
 ### `make_2d`
