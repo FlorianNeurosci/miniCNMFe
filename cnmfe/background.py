@@ -33,6 +33,7 @@ def _ring_pixel_batch(
     ring_indices: list,
     X_full: np.ndarray,
     lambda_reg: float,
+    constrain_sum: bool = False,
 ) -> list[tuple[int, np.ndarray, np.ndarray]]:
     """Process one batch of pixels for ring-model weight estimation.
 
@@ -43,6 +44,8 @@ def _ring_pixel_batch(
                       ring pixels around global pixel pixel_start + i.
         X_full: (H*W, T) — full centred residual (needed to read ring pixels).
         lambda_reg: Ridge regularization strength.
+        constrain_sum: If True, enforce Σ_j w_j = 1 via Lagrangian (non-standard
+                       CNMF-E extension; see compute_W).
 
     Returns:
         List of (pixel_idx, ring_flat_indices, weights) for pixels that have
@@ -56,10 +59,23 @@ def _ring_pixel_batch(
         BTB = B @ B.T                          # (n_ring, n_ring)
         reg = lambda_reg * np.trace(BTB)
         BTB.flat[:: len(ring) + 1] += reg
-        try:
-            w = np.linalg.solve(BTB, B @ X_batch[i])
-        except np.linalg.LinAlgError:
-            w = np.linalg.lstsq(BTB, B @ X_batch[i], rcond=None)[0]
+        By = B @ X_batch[i]
+        if constrain_sum:
+            ones = np.ones(len(ring), dtype=BTB.dtype)
+            rhs = np.column_stack([By, ones])
+            try:
+                sols = np.linalg.solve(BTB, rhs)
+            except np.linalg.LinAlgError:
+                sols = np.linalg.lstsq(BTB, rhs, rcond=None)[0]
+            w_unc, w_corr = sols[:, 0], sols[:, 1]
+            denom = w_corr.sum()
+            mu = (1.0 - w_unc.sum()) / denom if abs(denom) > 1e-12 else 0.0
+            w = w_unc + mu * w_corr
+        else:
+            try:
+                w = np.linalg.solve(BTB, By)
+            except np.linalg.LinAlgError:
+                w = np.linalg.lstsq(BTB, By, rcond=None)[0]
         results.append((pixel_start + i, ring, w.astype(np.float32)))
     return results
 
@@ -71,6 +87,7 @@ def _ring_pixel_batch_slab(
     ring_global_indices: list,
     X_slab: np.ndarray,
     lambda_reg: float,
+    constrain_sum: bool = False,
 ) -> list[tuple[int, np.ndarray, np.ndarray]]:
     """Like ``_ring_pixel_batch`` but reads from a local slab of pixels.
 
@@ -99,10 +116,23 @@ def _ring_pixel_batch_slab(
         BTB = B @ B.T
         reg = lambda_reg * np.trace(BTB)
         BTB.flat[:: len(ring_local) + 1] += reg
-        try:
-            w = np.linalg.solve(BTB, B @ target_row)
-        except np.linalg.LinAlgError:
-            w = np.linalg.lstsq(BTB, B @ target_row, rcond=None)[0]
+        By = B @ target_row
+        if constrain_sum:
+            ones = np.ones(len(ring_local), dtype=BTB.dtype)
+            rhs = np.column_stack([By, ones])
+            try:
+                sols = np.linalg.solve(BTB, rhs)
+            except np.linalg.LinAlgError:
+                sols = np.linalg.lstsq(BTB, rhs, rcond=None)[0]
+            w_unc, w_corr = sols[:, 0], sols[:, 1]
+            denom = w_corr.sum()
+            mu = (1.0 - w_unc.sum()) / denom if abs(denom) > 1e-12 else 0.0
+            w = w_unc + mu * w_corr
+        else:
+            try:
+                w = np.linalg.solve(BTB, By)
+            except np.linalg.LinAlgError:
+                w = np.linalg.lstsq(BTB, By, rcond=None)[0]
         results.append((int(pixel_starts[i]), ring_global_indices[i], w.astype(np.float32)))
     return results
 
@@ -156,6 +186,7 @@ def _compute_W_gpu(
     ring_idx: list,
     lambda_reg: float,
     xp,
+    constrain_sum: bool = False,
 ) -> tuple[list, list, list]:
     """Vectorized GPU ring regression using batched linalg.solve.
 
@@ -203,11 +234,26 @@ def _compute_W_gpu(
         X_targets = X_xp[pixel_arr]                      # (n_batch, T)
         Bx = xp.einsum("brt,bt->br", B, X_targets)
 
-        # Batched solve: BTB[i] @ w[i] = Bx[i]
-        try:
-            w = xp.linalg.solve(BTB, Bx)                # (n_batch, ring_size)
-        except Exception:
-            w = xp.stack([xp.linalg.solve(BTB[i], Bx[i]) for i in range(n_batch)])
+        if constrain_sum:
+            # Solve two RHSs jointly: Bx (unconstrained) and ones (correction).
+            ones = xp.ones((n_batch, ring_size), dtype=BTB.dtype)
+            rhs = xp.stack([Bx, ones], axis=-1)         # (n_batch, ring_size, 2)
+            try:
+                sols = xp.linalg.solve(BTB, rhs)        # (n_batch, ring_size, 2)
+            except Exception:
+                sols = xp.stack([xp.linalg.solve(BTB[i], rhs[i]) for i in range(n_batch)])
+            w_unc = sols[..., 0]
+            w_corr = sols[..., 1]
+            denom = w_corr.sum(axis=1)
+            denom = xp.where(xp.abs(denom) > 1e-12, denom, xp.ones_like(denom))
+            mu = (1.0 - w_unc.sum(axis=1)) / denom
+            w = w_unc + mu[:, None] * w_corr
+        else:
+            # Batched solve: BTB[i] @ w[i] = Bx[i]
+            try:
+                w = xp.linalg.solve(BTB, Bx)            # (n_batch, ring_size)
+            except Exception:
+                w = xp.stack([xp.linalg.solve(BTB[i], Bx[i]) for i in range(n_batch)])
 
         w_cpu = to_numpy(w).astype(np.float32)
         for i, p in enumerate(pixel_list):
@@ -227,6 +273,7 @@ def _compute_w_streaming(
     actual_tsub: int,
     lambda_reg: float,
     n_jobs: int,
+    constrain_sum: bool = False,
 ) -> list:
     """Per-pixel-batch ring weight solve against a zarr-backed Y_flat.
 
@@ -308,6 +355,7 @@ def _compute_w_streaming(
             ring_global_indices,
             X_slab,
             lambda_reg,
+            constrain_sum,
         )
 
     batches = [(s, min(s + batch_size, n_pixels))
@@ -349,6 +397,7 @@ def compute_W(
     device: str = "cpu",
     tsub: int = 1,
     W_cached: "sp.csr_matrix | None" = None,
+    constrain_sum: bool = False,
 ) -> tuple[sp.csr_matrix, np.ndarray]:
     """Fit ring-model weights W and per-pixel baseline b0.
 
@@ -375,6 +424,15 @@ def compute_W(
                   W has already been computed on similar (A, C) earlier
                   in the same fit() call and only the baseline needs to
                   track residual changes.
+        constrain_sum: NON-STANDARD CNMF-E. If True, add the equality constraint
+                  Σ_j W[i, j] = 1 to each per-pixel ridge solve (via Lagrangian,
+                  one extra RHS — negligible cost). Then any spatially-uniform
+                  intensity change cancels exactly in the residual
+                  ``(I - W)(Y - b0)`` because ``D - Σ_j W[i, j]·D = 0``. Useful
+                  when the data has global brightness events (LED flicker,
+                  uniform photobleaching) that the unconstrained ring leaks
+                  into the extracted traces. Standard CNMF-E (Zhou et al. 2018)
+                  uses unconstrained ridge LS, i.e. ``constrain_sum=False``.
 
     Returns:
         W: Sparse (H*W, H*W) weight matrix (row i = weights for pixel i).
@@ -431,13 +489,16 @@ def compute_W(
 
     if xp is not np and Y_is_numpy:
         # GPU path: vectorized batched solve grouped by ring size (in-memory only).
-        rows_list, cols_list, data_list = _compute_W_gpu(X_fit, ring_idx, lambda_reg, xp)
+        rows_list, cols_list, data_list = _compute_W_gpu(
+            X_fit, ring_idx, lambda_reg, xp, constrain_sum,
+        )
     elif not Y_is_numpy:
         # Streaming CPU path for zarr-backed Y_flat.
         # Per pixel batch: pull only ring-neighbour rows into a small slab,
         # build X_fit just for those rows, run the per-pixel solve.
         raw_results = _compute_w_streaming(
             Y_flat, A, C_sub, b0, ring_idx, actual_tsub, lambda_reg, n_jobs,
+            constrain_sum=constrain_sum,
         )
         rows_list = [np.full(len(ring), p, dtype=np.int32) for p, ring, _ in raw_results]
         cols_list = [ring for _, ring, _ in raw_results]
@@ -454,7 +515,7 @@ def compute_W(
             raw_results: list[tuple[int, np.ndarray, np.ndarray]] = []
             for start, end in batches:
                 raw_results.extend(
-                    _ring_pixel_batch(start, X_fit[start:end], ring_idx[start:end], X_fit, lambda_reg)
+                    _ring_pixel_batch(start, X_fit[start:end], ring_idx[start:end], X_fit, lambda_reg, constrain_sum)
                 )
         else:
             from joblib import Parallel, delayed
@@ -468,7 +529,7 @@ def compute_W(
             # spatial.py for the rationale.
             with threadpool_limits(limits=1, user_api="blas"):
                 batch_lists = Parallel(n_jobs=n_jobs, prefer="threads")(
-                    delayed(_ring_pixel_batch)(start, X_fit[start:end], ring_idx[start:end], X_fit, lambda_reg)
+                    delayed(_ring_pixel_batch)(start, X_fit[start:end], ring_idx[start:end], X_fit, lambda_reg, constrain_sum)
                     for start, end in batches
                 )
             raw_results = [item for batch in batch_lists for item in batch]

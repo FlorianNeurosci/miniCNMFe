@@ -48,7 +48,18 @@ if TYPE_CHECKING:
 
 @dataclass
 class CNMFeParams:
-    """All CNMFe algorithm parameters."""
+    """All CNMFe algorithm parameters.
+
+    Deviations from standard CNMF-E (Zhou et al. 2018) are tagged
+    ``[NON-STANDARD]`` next to the field. With every ``[NON-STANDARD]``
+    *algorithm* flag at its default, the math matches the published CNMF-E.
+    Fields tagged ``[NON-STANDARD speed]`` are speed/memory trade-offs
+    (subsampling, parallelism, etc.) that converge to the standard
+    algorithm at their slow-but-faithful settings (``tsub=1``,
+    ``stride=1``, ``skip_first_deconv=False``, ``sample_frames=T``).
+    Implementation mechanics like ``n_jobs``, ``device``, and ``mc_*``
+    are not tagged.
+    """
 
     # --- Motion correction ---
     max_shift: tuple[int, int] = (20, 20)
@@ -74,15 +85,25 @@ class CNMFeParams:
     init_max_corr_bg: float = 0.4             # "Background pixel" threshold inside extract_spatial_temporal
     seed_suppress_factor: float = 2.0         # Suppression disk radius after extraction = factor * sigma
     circular_max_dist_factor: float = 2.5     # circular_constraint cutoff = factor * estimated_radius
-    init_stride: "int | None" = None          # Temporal stride for greedy init (None = auto: max(1, T//5000))
-    init_corrpnr_stride: "int | None" = None  # Extra stride applied to the *initial* CORR/PNR sweep inside greedy init.
-                                              # CORR/PNR are per-pixel reductions, so a strided slice gives a
-                                              # near-identical seed map at a fraction of the cost. None auto-selects
-                                              # max(1, T_init // 2000) so the sweep sees ~2000 frames regardless of T.
+    # [NON-STANDARD speed] Temporal stride for greedy init (None = auto: max(1, T//5000)).
+    init_stride: "int | None" = None
+    # [NON-STANDARD speed] Extra stride applied to the *initial* CORR/PNR sweep inside greedy init.
+    # CORR/PNR are per-pixel reductions, so a strided slice gives a
+    # near-identical seed map at a fraction of the cost. None auto-selects
+    # max(1, T_init // 2000) so the sweep sees ~2000 frames regardless of T.
+    init_corrpnr_stride: "int | None" = None
 
     # --- Background (ring model) ---
     ring_size_factor: float = 1.5  # ring radius = ring_size_factor * (2*sigma+1)
     ring_lambda: float = 1e-5      # Ridge regularization for ring regression
+    # [NON-STANDARD] Enforce Σ_j W[i, j] = 1 per row of the ring weight matrix
+    # (Lagrangian-constrained ridge LS). Cancels spatially-uniform brightness
+    # events (LED flicker, uniform photobleaching) exactly in the residual —
+    # the unconstrained ring shrinks row sums below 1, so a fraction of every
+    # global event leaks into the extracted traces. Standard CNMF-E uses
+    # unconstrained ridge LS (i.e. False). Negligible cost (one extra RHS in
+    # the same per-pixel solve).
+    ring_constrain_sum: bool = False
 
     # --- Spatial update ---
     dilation_radius: int = 3
@@ -96,7 +117,11 @@ class CNMFeParams:
     # --- Merging ---
     merge_thr_corr: float = 0.85
     merge_thr_overlap: float = 0.5  # Min Jaccard spatial overlap to consider merging
-    merge_centre_dist_factor: float = 2.0  # Centre-distance fallback = factor * sigma (in pixels)
+    # [NON-STANDARD] Centre-distance fallback for merging: pairs whose footprints
+    # have ended up disjoint after threshold_footprint can still be merged if
+    # their centres are within `factor * sigma`. Standard CNMF-E merges on spatial
+    # overlap only. Disable by setting factor=0.
+    merge_centre_dist_factor: float = 2.0
 
     # --- Main loop ---
     n_iter_main: int = 2  # Full spatial + temporal + merge cycles
@@ -106,18 +131,25 @@ class CNMFeParams:
     device: str = "cpu"  # 'cpu' or 'cuda' (requires CuPy + CUDA GPU)
 
     # --- Statistics sampling ---
-    sample_frames: int = 1000  # Max frames used for noise + CORR/PNR (evenly sampled when T > this)
+    # [NON-STANDARD speed] Max frames used for noise + CORR/PNR (evenly sampled
+    # when T > this). Standard CNMF-E uses all frames.
+    sample_frames: int = 1000
 
     # --- Speed / accuracy trade-offs ---
-    skip_first_deconv: bool = True  # Use NNLS (p=0) for first temporal pass; OASIS on all others
-    bg_tsub: int = 5                # Temporal subsampling factor for ring-background W solve
+    # [NON-STANDARD speed] Use NNLS (p=0) for the first temporal pass; OASIS on all
+    # others. Saves the dominant cost on iteration 0 with no measurable accuracy hit.
+    skip_first_deconv: bool = True
+    # [NON-STANDARD speed] Temporal subsampling factor for the ring W solve. The b0
+    # baseline still uses the full T; only the per-pixel BTB regression sees a strided
+    # slice. Standard CNMF-E uses tsub=1.
+    bg_tsub: int = 5
 
     # --- Auto evaluation (post-BCD quality filter) ---
-    # `min_pixel` above is reused as a hard floor on footprint extent.
+    # [NON-STANDARD] `min_pixel` above is reused as a hard floor on footprint extent.
     # `auto_eval_snr_amp_thr` is the threshold on the mean-amplitude SNR
     # mean(a^2) / mean(sn_pixel^2) — a scale-invariant check that catches
     # ghost components whose footprint sits at the pixel-noise floor.
-    # Set to 0 to disable.
+    # Set to 0 to disable. Standard CNMF-E has no comparable post-BCD quality filter.
     auto_eval_snr_amp_thr: float = 3.0
 
     # --- Serialisation ---------------------------------------------------------
@@ -649,6 +681,7 @@ class CNMFe:
             Y_flat, A, C, dims, ring_radius,
             lambda_reg=p.ring_lambda, n_jobs=p.n_jobs, device=p.device,
             tsub=p.bg_tsub,
+            constrain_sum=p.ring_constrain_sum,
         )
 
         def _cache_after_merge(members_per_group: list[np.ndarray]) -> None:
@@ -754,6 +787,7 @@ class CNMFe:
                 lambda_reg=p.ring_lambda, n_jobs=p.n_jobs, device=p.device,
                 tsub=p.bg_tsub,
                 W_cached=W_mat,
+                constrain_sum=p.ring_constrain_sum,
             )
 
         # --- Step 7: Auto-evaluation ---

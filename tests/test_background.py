@@ -435,3 +435,122 @@ class TestBackgroundSubtractor:
         np_proj = BackgroundSubtractor(Y, W_mat, b0).project_onto(A, batch_size=40)
         z_proj = BackgroundSubtractor(z, W_mat, b0).project_onto(A, batch_size=40)
         np.testing.assert_allclose(z_proj, np_proj, atol=1e-3, rtol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# Constrained-ring (NON-STANDARD CNMF-E) tests
+# ---------------------------------------------------------------------------
+
+class TestRingConstrainSum:
+    """Tests for ``compute_W(..., constrain_sum=True)`` — the sum-to-one
+    Lagrangian constraint that makes spatially-uniform brightness events
+    cancel exactly in the ring-subtracted residual.
+    """
+
+    def _make_data(self, H=20, W=20, T=200, seed=0):
+        rng = np.random.default_rng(seed)
+        Y_flat = rng.standard_normal((H * W, T)).astype(np.float32) * 2
+        A = sp.csc_matrix((H * W, 0), dtype=np.float32)
+        C = np.empty((0, T), dtype=np.float32)
+        return Y_flat, A, C, (H, W)
+
+    def test_row_sums_are_one(self):
+        """Every non-empty row of W must sum to 1 within float tolerance."""
+        Y, A, C, dims = self._make_data()
+        W_mat, _ = compute_W(Y, A, C, dims, radius=3, constrain_sum=True)
+        W_csr = W_mat.tocsr()
+        row_sums = np.asarray(W_csr.sum(axis=1)).ravel()
+        # Pixels with empty rings produce no entries in W (sum == 0).
+        # All other rows must sum to ~1.
+        nz_rows = np.diff(W_csr.indptr) > 0
+        assert nz_rows.any(), "Expected at least some non-empty rows"
+        np.testing.assert_allclose(
+            row_sums[nz_rows], 1.0, atol=1e-4, rtol=0,
+            err_msg="Constrained ring rows should sum to 1",
+        )
+
+    def test_unconstrained_rows_do_not_sum_to_one(self):
+        """Sanity check: without the constraint, ridge shrinks row sums below 1.
+
+        This is what makes the constrained version necessary — it directly
+        explains the leakage of global brightness events.
+        """
+        Y, A, C, dims = self._make_data()
+        W_mat, _ = compute_W(Y, A, C, dims, radius=3, constrain_sum=False)
+        row_sums = np.asarray(W_mat.tocsr().sum(axis=1)).ravel()
+        nz_rows = np.diff(W_mat.tocsr().indptr) > 0
+        # Mean row sum should be visibly < 1 (typically ~0.5–0.9 for ridge).
+        assert row_sums[nz_rows].mean() < 0.99
+
+    def test_global_pulse_cancels(self):
+        """A spatially-uniform brightness change ``D`` must cancel exactly
+        in the constrained-ring residual: leakage = ``D · (1 − Σ_j W[i, j])``
+        is identically zero when row sums are 1, vs ``D · (1 − s)`` for some
+        ``s < 1`` in the unconstrained case.
+
+        Strategy: fit W and b0 once on a clean (no-pulse) movie, then apply
+        the same W and b0 to both the clean and pulse-perturbed movies. The
+        difference in residuals at the pulse frame isolates the pulse leakage
+        from everything else (noise, b0 effects).
+        """
+        from cnmfe.background import subtract_background
+
+        H_dim = W_dim = 24
+        T = 200
+        dims = (H_dim, W_dim)
+        rng = np.random.default_rng(7)
+        Y_clean = rng.standard_normal((H_dim * W_dim, T)).astype(np.float32) * 1.5
+
+        t0 = T // 2
+        delta = 5.0
+        Y_pulse = Y_clean.copy()
+        Y_pulse[:, t0] -= delta
+
+        A = sp.csc_matrix((H_dim * W_dim, 0), dtype=np.float32)
+        C = np.empty((0, T), dtype=np.float32)
+
+        # Fit W on the *clean* movie — same W applied to both inputs.
+        W_unc, b0_unc = compute_W(Y_clean, A, C, dims, radius=3, constrain_sum=False)
+        W_con, b0_con = compute_W(Y_clean, A, C, dims, radius=3, constrain_sum=True)
+
+        leak_unc = (
+            subtract_background(Y_pulse, W_unc, b0_unc)[:, t0]
+            - subtract_background(Y_clean, W_unc, b0_unc)[:, t0]
+        )
+        leak_con = (
+            subtract_background(Y_pulse, W_con, b0_con)[:, t0]
+            - subtract_background(Y_clean, W_con, b0_con)[:, t0]
+        )
+
+        rms_unc = float(np.sqrt(np.mean(leak_unc ** 2)))
+        rms_con = float(np.sqrt(np.mean(leak_con ** 2)))
+
+        # Constrained leak should be at the float-precision floor (only pixels
+        # with empty rings, near the corners, see any leakage).
+        assert rms_con < 1e-4, (
+            f"Constrained-ring pulse leak should be near zero. "
+            f"Got rms_con={rms_con:.6f}."
+        )
+        # Unconstrained leak should be a sizeable fraction of `delta`.
+        assert rms_unc > 0.5, (
+            f"Unconstrained-ring pulse leak should be visible. "
+            f"Got rms_unc={rms_unc:.6f}."
+        )
+        # And the constrained version must be vastly better.
+        assert rms_con < 1e-3 * rms_unc, (
+            f"Constrained pulse leak should be >1000x smaller than "
+            f"unconstrained. Got rms_con={rms_con:.6f}, rms_unc={rms_unc:.6f}."
+        )
+
+    def test_default_is_unconstrained(self):
+        """Standard CNMF-E behaviour (constrain_sum=False) must remain the
+        default — confirms we did not accidentally flip the global default.
+        """
+        Y, A, C, dims = self._make_data()
+        W_default, _ = compute_W(Y, A, C, dims, radius=3)
+        W_explicit, _ = compute_W(Y, A, C, dims, radius=3, constrain_sum=False)
+        # Identical matrices: same rows, same data.
+        d_default = W_default.tocsr()
+        d_explicit = W_explicit.tocsr()
+        np.testing.assert_array_equal(d_default.indices, d_explicit.indices)
+        np.testing.assert_allclose(d_default.data, d_explicit.data, atol=0, rtol=0)
