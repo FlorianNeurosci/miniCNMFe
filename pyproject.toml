@@ -42,6 +42,9 @@ include = ["cnmfe*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+# Project root on sys.path so tests can import top-level scripts
+# (`concat_avis_to_zarr`) and the `tests.conftest` namespace package.
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
