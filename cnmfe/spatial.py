@@ -224,7 +224,12 @@ def update_spatial(
     else:
         from joblib import Parallel, delayed
 
-        batch_lists = Parallel(n_jobs=n_jobs)(
+        # Threads, not processes: loky would pickle ~10 MB of Y_flat[start:end]
+        # plus the full C per batch -- with ~1400 batches on a 600x600 movie
+        # that's ~25 GB of IPC overhead drowning the LASSO compute. LassoLars
+        # internally uses numpy linalg / BLAS which release the GIL, so threads
+        # get real concurrency without the pickling tax.
+        batch_lists = Parallel(n_jobs=n_jobs, prefer="threads")(
             delayed(_spatial_pixel_batch)(
                 start,
                 Y_flat[start:end],

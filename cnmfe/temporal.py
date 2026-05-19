@@ -352,7 +352,11 @@ def update_temporal(
         for _ in range(n_iter):
             traces = [(YrA[:, k] / nA[k] + C[k]).astype(np.float32) for k in range(K)]
             if deconvolve:
-                results = Parallel(n_jobs=n_jobs)(
+                # Threads avoid loky's per-call pickling. OASIS's C extension
+                # (from oasis-deconvolution) releases the GIL during deconv;
+                # users on the pure-Python fallback get no parallelism either
+                # way -- the threads path doesn't make that worse.
+                results = Parallel(n_jobs=n_jobs, prefer="threads")(
                     delayed(_deconvolve_with)(traces[k], g_per_k[k], float(sn_per_k[k]))
                     for k in range(K)
                 )

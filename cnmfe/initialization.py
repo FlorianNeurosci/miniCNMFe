@@ -266,8 +266,10 @@ def greedy_corr_pnr(
         )
     else:
         from joblib import Parallel, delayed
+        # Threads: ndi.convolve is pure C and releases the GIL. Each frame is
+        # ~1.4 MB; with T_init=5000 frames loky would pickle ~7 GB per call.
         data_filtered = np.stack(
-            Parallel(n_jobs=n_jobs)(
+            Parallel(n_jobs=n_jobs, prefer="threads")(
                 delayed(ndi.convolve)(frame, psf, mode="reflect") for frame in movie
             ),
             axis=0,

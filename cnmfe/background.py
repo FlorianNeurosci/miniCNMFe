@@ -453,7 +453,11 @@ def compute_W(
                 )
         else:
             from joblib import Parallel, delayed
-            batch_lists = Parallel(n_jobs=n_jobs)(
+            # Threads: each call passes a per-batch slice of X_fit plus the
+            # full X_fit (for ring lookups). loky would pickle the full X_fit
+            # per call -- threads share it. Inner ops (linalg.solve, einsum)
+            # release the GIL.
+            batch_lists = Parallel(n_jobs=n_jobs, prefer="threads")(
                 delayed(_ring_pixel_batch)(start, X_fit[start:end], ring_idx[start:end], X_fit, lambda_reg)
                 for start, end in batches
             )
