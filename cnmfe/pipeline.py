@@ -347,21 +347,60 @@ class CNMFe:
         movie: "zarr.Array | np.ndarray",
         do_motion_correction: bool = True,
         output_dir: str | Path | None = None,
+        Y_flat_zarr: "zarr.Array | None" = None,
     ) -> "CNMFe":
         """Run the full CNMFe pipeline on a (T, H, W) movie.
 
         Args:
             movie: Input movie. zarr.Array or numpy array, shape (T, H, W).
+                Always required — used for motion correction (if enabled),
+                noise estimation, and greedy init (the latter on a strided
+                sample so the 3D movie need not fully materialise).
             do_motion_correction: Run rigid motion correction before extraction.
             output_dir: If given, save motion-corrected movie and intermediate
-                        results here as zarr stores.
+                results here as zarr stores.
+            Y_flat_zarr: Optional pixel-major ``(H*W, T)`` zarr produced by
+                ``transpose_zarr_to_pixel_major``. When provided, extraction
+                (compute_W, BackgroundSubtractor, update_spatial,
+                update_temporal) runs directly against this on-disk array
+                so the full ``(H*W, T)`` movie is never held in RAM.
+                ``movie`` must be a zarr.Array in this mode (we need
+                strided 3D access for init); it is **not** materialised.
+                Shape must match the spatial dims of ``movie``.
 
         Returns:
             self (for chaining).
         """
         p = self.params
-        movie_arr = np.asarray(movie, dtype=np.float32)
-        T, H, W = movie_arr.shape
+
+        # --- Streaming mode (Y_flat_zarr supplied) ----------------------------
+        streaming = Y_flat_zarr is not None
+        if streaming:
+            try:
+                import zarr as _zarr_pkg
+                if not isinstance(movie, _zarr_pkg.Array):
+                    raise TypeError(
+                        "Y_flat_zarr requires `movie` to be a zarr.Array (3D) "
+                        "so the strided init sample can be read lazily."
+                    )
+            except ImportError as exc:
+                raise RuntimeError("zarr is required for Y_flat_zarr") from exc
+            if do_motion_correction:
+                raise ValueError(
+                    "Y_flat_zarr is the already-corrected movie; pass "
+                    "do_motion_correction=False (and run fit_mc separately if needed)."
+                )
+            T, H, W = int(movie.shape[0]), int(movie.shape[1]), int(movie.shape[2])
+            if Y_flat_zarr.shape != (H * W, T):
+                raise ValueError(
+                    f"Y_flat_zarr shape {Y_flat_zarr.shape} must equal "
+                    f"(H*W, T) = ({H * W}, {T}) derived from movie {movie.shape}."
+                )
+            movie_arr = movie    # zarr handle; never asarray'd in full
+        else:
+            movie_arr = np.asarray(movie, dtype=np.float32)
+            T, H, W = movie_arr.shape
+
         dims = (H, W)
         self.dims = dims
 
@@ -383,7 +422,8 @@ class CNMFe:
             )
 
         # --- Steps 2-3: sample frames for statistics if T > sample_frames ---
-        T = len(movie_arr)
+        # T can come from a zarr handle (streaming) or a numpy array (in-memory).
+        T = int(movie_arr.shape[0])
         stride = max(1, T // p.sample_frames)
         if stride > 1:
             t_idx = np.arange(0, T, stride)
@@ -450,9 +490,14 @@ class CNMFe:
             self.C_raw = np.empty((0, T), dtype=np.float32)
             return self
 
-        # Flatten movie to (H*W, T) for all subsequent steps
-        Y_flat = make_2d(movie_arr)     # (H*W, T)
-        sn_flat = self.sn.ravel()       # (H*W,)
+        # Flatten movie to (H*W, T) for all subsequent steps. In streaming
+        # mode the user-supplied pixel-major zarr IS our Y_flat — no
+        # materialisation.
+        if streaming:
+            Y_flat = Y_flat_zarr
+        else:
+            Y_flat = make_2d(movie_arr)     # (H*W, T) view
+        sn_flat = self.sn.ravel()           # (H*W,)
 
         # Recover full-T temporal traces by projecting the full-resolution
         # movie onto each footprint:
@@ -461,7 +506,17 @@ class CNMFe:
         # (stride == 1). Re-projecting at full T uniformly handles both.
         AA_init = (A.T @ A).toarray()
         nA_init = np.maximum(np.diag(AA_init), 1e-10).astype(np.float32)
-        YA_init = np.asarray(Y_flat.T @ A, dtype=np.float32)          # (T, K)
+        if isinstance(Y_flat, np.ndarray):
+            YA_init = np.asarray(Y_flat.T @ A, dtype=np.float32)      # (T, K)
+        else:
+            # Streaming Y_flat.T @ A: sum pixel-batched contributions.
+            YA_init = np.zeros((T, A.shape[1]), dtype=np.float32)
+            A_csr = A.tocsr()
+            proj_batch = 4096
+            for s in range(0, H * W, proj_batch):
+                e = min(s + proj_batch, H * W)
+                Y_chunk = np.asarray(Y_flat[s:e], dtype=np.float32)
+                YA_init += np.asarray(Y_chunk.T @ A_csr[s:e], dtype=np.float32)
         C_raw = (YA_init / nA_init[None, :]).T.astype(np.float32)     # (K, T)
         C = C_raw.copy()
 

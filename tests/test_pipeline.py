@@ -262,6 +262,86 @@ class TestCNMFePipeline:
         assert loaded.sigma == 2.5
         assert not hasattr(loaded, "i_do_not_exist")
 
+    def test_fit_with_Y_flat_zarr_matches_in_memory(self, synth_small, tmp_path):
+        """fit(movie, Y_flat_zarr=...) on a pixel-major zarr must produce
+        the same footprints and traces as the in-memory path on the same data.
+
+        Phase F4 regression — pins the streaming-extraction API end-to-end.
+        """
+        from cnmfe.io import save_zarr, transpose_zarr_to_pixel_major
+        import zarr as _zarr
+
+        movie_np = synth_small["movie"].astype(np.float32)
+        T, H, W = movie_np.shape
+
+        # Round-trip through both layouts.
+        src_path = tmp_path / "src.zarr"
+        save_zarr(movie_np, str(src_path))
+        src_zarr = _zarr.open_array(str(src_path), mode="r")
+
+        pixel_path = tmp_path / "pixel.zarr"
+        Y_flat_zarr = transpose_zarr_to_pixel_major(
+            src_path, pixel_path,
+            pixel_chunk=128, time_chunk=200,
+            verbose=False,
+        )
+
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.5, min_pnr=3.0,
+            n_iter_main=1, n_iter_temporal=1,
+        )
+        m_mem = CNMFe(params).fit(movie_np, do_motion_correction=False)
+        m_str = CNMFe(params).fit(
+            src_zarr, do_motion_correction=False, Y_flat_zarr=Y_flat_zarr,
+        )
+
+        assert m_str.A.shape == m_mem.A.shape
+        np.testing.assert_allclose(
+            np.asarray(m_str.A.todense()),
+            np.asarray(m_mem.A.todense()),
+            atol=1e-3, rtol=1e-3,
+        )
+        np.testing.assert_allclose(m_str.C, m_mem.C, atol=1e-3, rtol=1e-3)
+
+    def test_fit_Y_flat_zarr_rejects_bad_shape(self, synth_small, tmp_path):
+        """Shape mismatch between Y_flat_zarr and the movie must raise."""
+        from cnmfe.io import save_zarr
+        import zarr as _zarr
+
+        movie_np = synth_small["movie"].astype(np.float32)
+        T, H, W = movie_np.shape
+
+        src_path = tmp_path / "src.zarr"
+        save_zarr(movie_np, str(src_path))
+        src_zarr = _zarr.open_array(str(src_path), mode="r")
+
+        # Wrong shape — claim 2x as many pixels as the movie has.
+        bogus = _zarr.open_array(
+            str(tmp_path / "bogus.zarr"), mode="w",
+            shape=(H * W * 2, T), chunks=(128, T), dtype="float32",
+        )
+        with pytest.raises(ValueError, match="Y_flat_zarr shape"):
+            CNMFe(CNMFeParams()).fit(
+                src_zarr, do_motion_correction=False, Y_flat_zarr=bogus,
+            )
+
+    def test_fit_Y_flat_zarr_requires_zarr_movie(self, synth_small, tmp_path):
+        """Passing Y_flat_zarr with a numpy movie should error loudly."""
+        from cnmfe.io import save_zarr, transpose_zarr_to_pixel_major
+
+        movie_np = synth_small["movie"].astype(np.float32)
+        src_path = tmp_path / "src.zarr"
+        save_zarr(movie_np, str(src_path))
+        Y_flat_zarr = transpose_zarr_to_pixel_major(
+            src_path, tmp_path / "pixel.zarr",
+            pixel_chunk=128, time_chunk=200,
+            verbose=False,
+        )
+        with pytest.raises(TypeError, match="zarr.Array"):
+            CNMFe(CNMFeParams()).fit(
+                movie_np, do_motion_correction=False, Y_flat_zarr=Y_flat_zarr,
+            )
+
     def test_with_motion_correction(self, synth_small):
         """Motion correction pass should complete without errors."""
         movie = synth_small["movie"]

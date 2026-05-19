@@ -396,11 +396,12 @@ wall time win. Will be folded into Item 1 Phase B since both refactor
 | 3 | Greedy init residual subtracts deconvolved trace | algorithm | shipped with 1D | **DONE 2026-05-19** |
 | 4 | Cache W across BCD iterations | speedup | shipped with 1B | **DONE 2026-05-19** |
 
-## Item 5 — Disk-transpose mc.zarr for true T-streaming extraction *(ACTIVE)*
+## Item 5 — Disk-transpose mc.zarr for true T-streaming extraction *(ACTIVE — F1–F4 DONE)*
 
-**Status: ACTIVE.** The 60k+ frame ceiling that Phases A–D explicitly
-deferred. Pixel-major zarr lets `fit()` stream `Y_flat[start:end]` in
-`O(B·T)` IO instead of `O(H·W·T)`.
+**Status: F1–F4 shipped 2026-05-19. F5 (docs + demo) remaining.**
+The 60k+ frame ceiling that Phases A–D explicitly deferred is gone:
+pixel-major zarr + `fit(..., Y_flat_zarr=...)` runs extraction with no
+full `(H·W, T)` materialisation. Tests: 127 pass (was 115 before F1).
 
 ### Why this is the right next step
 Per `CLAUDE.md` (Motion correction section): *"The full corrected movie
@@ -410,7 +411,16 @@ removes the ceiling without revisiting the BCD math.
 
 ### Sub-plan
 
-#### F1 — `transpose_zarr_to_pixel_major` utility *(io.py)*
+#### F1 — `transpose_zarr_to_pixel_major` utility *(DONE 2026-05-19)*
+
+**Shipped.** New `cnmfe.io.transpose_zarr_to_pixel_major(src, dest, ...)`
++ companion `open_zarr_pixel_major(path)`. Pixel ordering matches
+`make_2d` (pixel `(h, w)` → flat `h*W + w`). Idempotent via
+`skip_if_exists`. Bounded RAM via `src_batch_frames`. Five tests in
+`test_io.py` covering round-trip equivalence, shape/dtype, idempotency,
+slice-vs-source equality, and 3D rejection.
+
+**Original sketch:**
 - Reads a time-major `(T, H, W)` zarr (e.g. mc.zarr from `fit_mc`) in
   time-chunks; writes a pixel-major `(H*W, T)` zarr with chunks like
   `(4096, 2000)`.
@@ -418,7 +428,16 @@ removes the ceiling without revisiting the BCD math.
 - Bounded RAM: one source time-chunk + one dest column-slab.
 - Cost: one O(T·H·W) disk pass; ~30–40 GB for 60k × 600 × 600 with blosc.
 
-#### F2 — `BackgroundSubtractor` on zarr-backed Y_flat
+#### F2 — `BackgroundSubtractor` on zarr-backed Y_flat *(DONE 2026-05-19)*
+
+**Shipped.** `slice()` branches on numpy vs other: for non-numpy
+`Y_flat`, extracts only ring-neighbour rows via fancy indexing,
+remaps sparse column indices, and matmuls on the small dense buffer.
+`project_onto` inherits the change transparently. Two tests in
+`test_background.py` covering slice + project_onto equivalence on a
+zarr-backed Y_flat.
+
+**Original sketch:**
 - Current `W_chunk @ self.Y_flat` would force loading the whole zarr.
   Instead: extract just the ring-neighbour rows via
   `Y_flat.get_orthogonal_selection((needed_pixels, slice(None)))`,
@@ -426,20 +445,49 @@ removes the ceiling without revisiting the BCD math.
   small dense buffer.
 - Tests: parity with the in-memory path within float32 tolerance.
 
-#### F3 — `compute_W` truly streaming
+#### F3 — `compute_W` truly streaming *(DONE 2026-05-19)*
+
+**Shipped.** `compute_W` now branches on `isinstance(Y_flat, np.ndarray)`:
+- Numpy: existing path (materialise X_fit at subsampled time, dispatch
+  per pixel batch).
+- Zarr: per-batch X-slab construction. For each pixel batch we read only
+  the batch + ring-union pixel rows (via fancy / orthogonal indexing),
+  subtract `A[union] @ C_sub` and `b0[union, None]` on the slab, and run
+  a new `_ring_pixel_batch_slab` worker that takes slab-local indices.
+- `Y_sum` for b0 also streamed (chunked pixel-row reductions).
+- `W_cached` short-circuit works on both paths.
+
+Three tests covering streaming-matches-in-memory and W_cached on zarr.
+Runs serially regardless of n_jobs for now (joblib + zarr handles
+don't pickle cheaply); marked in code.
+
+**Original sketch:**
 - `Y_sum` via a chunked sum over pixel batches.
 - Build the X_fit slab per pixel batch (don't materialise full `(H·W, T_sub)`).
 - Pre-extract ring-union rows from zarr per batch.
 - `_ring_pixel_batch` adapted to take per-batch X data (no `X_full`).
 
-#### F4 — `pipeline.fit()` 2D zarr orchestration
-- Detect 2D `(H*W, T)` input; skip the `movie_arr = np.asarray(...)`
-  materialisation. Use the zarr as `Y_flat` directly.
-- Greedy init still needs a small in-RAM sample — use the existing
-  `init_stride`. The 3D source zarr (pre-transpose) is needed for init
-  because greedy expects spatial structure; either accept both inputs or
-  let the user pass the time-major source alongside.
-- Post-init `Y_flat.T @ A` becomes a streaming sum over pixel batches.
+#### F4 — `pipeline.fit()` orchestration *(DONE 2026-05-19)*
+
+**Shipped.** New `fit(..., Y_flat_zarr=<pixel-major zarr>)` kwarg.
+When provided:
+- `movie` MUST be a zarr.Array (3D); it is **not** materialised. We
+  read only the strided init sample (`movie[::init_stride]`, ~5k frames
+  for T=60k) and the stats sample.
+- `Y_flat = Y_flat_zarr` — no `make_2d`, no full-T copy.
+- The post-init projection `Y_flat.T @ A` runs as a streaming sum over
+  4096-pixel batches.
+- `do_motion_correction=False` is enforced (Y_flat_zarr is the
+  already-corrected movie).
+- Shape mismatch between Y_flat_zarr and movie raises loudly.
+- All BCD steps inherit zarr support from F2/F3 transparently.
+
+Tests:
+- `test_fit_with_Y_flat_zarr_matches_in_memory` — round-trip via
+  transpose vs in-memory fit on the same synthetic movie. A, C must match
+  within float32 tolerance.
+- `test_fit_Y_flat_zarr_rejects_bad_shape`
+- `test_fit_Y_flat_zarr_requires_zarr_movie`
 
 #### F5 — Tests + docs + demo
 - Round-trip equivalence: numpy fit() vs pixel-major-zarr fit() on the
