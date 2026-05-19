@@ -64,6 +64,49 @@ def _ring_pixel_batch(
     return results
 
 
+def _ring_pixel_batch_slab(
+    pixel_starts: np.ndarray,
+    target_local_idx: np.ndarray,
+    ring_local_indices: list,
+    ring_global_indices: list,
+    X_slab: np.ndarray,
+    lambda_reg: float,
+) -> list[tuple[int, np.ndarray, np.ndarray]]:
+    """Like ``_ring_pixel_batch`` but reads from a local slab of pixels.
+
+    Used by the streaming (zarr-backed) ``compute_W`` path: rather than
+    pass the full ``(H*W, T_sub)`` residual, the caller pre-extracts just
+    the rows needed for this pixel batch (the batch pixels themselves
+    plus the union of their ring neighbours) into ``X_slab``.
+
+    Args:
+        pixel_starts: (B,) global pixel indices for the batch's targets.
+        target_local_idx: (B,) row index of each batch pixel in ``X_slab``.
+        ring_local_indices: list of length B; each entry is an int array
+            of row indices into ``X_slab`` for that pixel's ring neighbours.
+        ring_global_indices: parallel list — original ring flat indices in
+            the full ``H*W`` array. Carried through so the caller can
+            assemble the global sparse W.
+        X_slab: ``(slab_size, T_sub)`` dense residual for the slab pixels.
+        lambda_reg: Ridge regularization strength.
+    """
+    results = []
+    for i, ring_local in enumerate(ring_local_indices):
+        if len(ring_local) == 0:
+            continue
+        target_row = X_slab[target_local_idx[i]]            # (T_sub,)
+        B = X_slab[ring_local]                              # (n_ring, T_sub)
+        BTB = B @ B.T
+        reg = lambda_reg * np.trace(BTB)
+        BTB.flat[:: len(ring_local) + 1] += reg
+        try:
+            w = np.linalg.solve(BTB, B @ target_row)
+        except np.linalg.LinAlgError:
+            w = np.linalg.lstsq(BTB, B @ target_row, rcond=None)[0]
+        results.append((int(pixel_starts[i]), ring_global_indices[i], w.astype(np.float32)))
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Ring index precomputation
 # ---------------------------------------------------------------------------
@@ -175,6 +218,118 @@ def _compute_W_gpu(
     return rows_list, cols_list, data_list
 
 
+def _compute_w_streaming(
+    Y_flat,
+    A: sp.csc_matrix,
+    C_sub: np.ndarray,
+    b0: np.ndarray,
+    ring_idx: list,
+    actual_tsub: int,
+    lambda_reg: float,
+    n_jobs: int,
+) -> list:
+    """Per-pixel-batch ring weight solve against a zarr-backed Y_flat.
+
+    The in-memory path of ``compute_W`` materialises the entire
+    ``(H*W, T_sub)`` residual X. With zarr-backed input that defeats the
+    point — the whole movie would land in RAM. Here we iterate over pixel
+    batches; for each batch we read only the rows we actually need (the
+    batch's targets plus the union of their ring neighbours), build the
+    local X slab on the fly, and feed it to ``_ring_pixel_batch_slab``.
+
+    Peak RAM per batch ≈ ``slab_size * T_sub * 4`` bytes, with
+    ``slab_size`` bounded by the batch size times the per-pixel ring size
+    plus the batch itself. For batch=256 and typical ring size ≈24 this
+    is ~7k pixels × T_sub × 4 bytes — negligible relative to the full
+    movie.
+    """
+    n_pixels = Y_flat.shape[0]
+    batch_size = 256
+
+    if actual_tsub > 1:
+        time_idx = np.arange(0, Y_flat.shape[1], actual_tsub)
+    else:
+        time_idx = None
+
+    def _process_batch(start: int, end: int):
+        ring_indices_batch = ring_idx[start:end]
+        # Collect the rows we need to read from Y_flat: the batch's targets
+        # plus the union of their ring neighbours. Empty-ring entries are
+        # skipped (those pixels contribute nothing to W).
+        nonempty = [r for r in ring_indices_batch if len(r) > 0]
+        if not nonempty:
+            return []
+        batch_pixels = np.arange(start, end, dtype=np.int64)
+        union = np.unique(np.concatenate([batch_pixels, *nonempty]))
+
+        # Read the slab from Y_flat — orthogonal selection for zarr-style
+        # arrays, falls back to fancy indexing for anything else.
+        if time_idx is not None and hasattr(Y_flat, "get_orthogonal_selection"):
+            Y_slab = np.asarray(
+                Y_flat.get_orthogonal_selection((union, time_idx)),
+                dtype=np.float32,
+            )
+        elif time_idx is not None:
+            # Generic fallback (numpy array): fancy row index + strided cols.
+            Y_slab = np.asarray(Y_flat[union][:, ::actual_tsub], dtype=np.float32)
+        else:
+            Y_slab = np.asarray(Y_flat[union], dtype=np.float32)
+
+        A_slab = A[union] if not sp.issparse(A) else A.tocsr()[union]
+        AC_slab = np.asarray(A_slab @ C_sub, dtype=np.float32)
+        X_slab = Y_slab - AC_slab - b0[union, None]
+
+        # Build slab-local indices: each target pixel's row, and each
+        # ring neighbour's row, expressed as positions in `union`.
+        target_local_idx = np.searchsorted(union, batch_pixels)
+        ring_local_indices = []
+        ring_global_indices = []
+        pixel_starts = []
+        for offset, ring in enumerate(ring_indices_batch):
+            if len(ring) == 0:
+                continue
+            ring_local_indices.append(
+                np.searchsorted(union, ring).astype(np.int32)
+            )
+            ring_global_indices.append(ring)
+            pixel_starts.append(start + offset)
+
+        # Re-key target_local_idx to match only the nonempty entries.
+        kept_offsets = np.array(
+            [i for i, r in enumerate(ring_indices_batch) if len(r) > 0],
+            dtype=np.int64,
+        )
+        target_local_idx_kept = target_local_idx[kept_offsets]
+
+        return _ring_pixel_batch_slab(
+            np.asarray(pixel_starts, dtype=np.int64),
+            target_local_idx_kept,
+            ring_local_indices,
+            ring_global_indices,
+            X_slab,
+            lambda_reg,
+        )
+
+    batches = [(s, min(s + batch_size, n_pixels))
+               for s in range(0, n_pixels, batch_size)]
+
+    if n_jobs == 1:
+        raw_results: list = []
+        for start, end in batches:
+            raw_results.extend(_process_batch(start, end))
+        return raw_results
+
+    # Joblib's pickling can't ship the zarr handle to worker processes
+    # cheaply, and the per-batch IO is the dominant cost — parallel
+    # workers would deserialise the whole store per call. For now the
+    # streaming path runs serially regardless of n_jobs. Marked here so
+    # we can revisit with a shared-memory or chunk-aware backend later.
+    raw_results = []
+    for start, end in batches:
+        raw_results.extend(_process_batch(start, end))
+    return raw_results
+
+
 def compute_W(
     Y_flat: np.ndarray,
     A: sp.csc_matrix,
@@ -220,12 +375,21 @@ def compute_W(
     H, W = dims
     n_pixels, T = Y_flat.shape
     xp = get_xp(device)
+    Y_is_numpy = isinstance(Y_flat, np.ndarray)
 
     # Streaming b0: (Y.sum(axis=1) - A @ C.sum(axis=1)) / T is identically
     # (Y - A @ C).mean(axis=1) by linearity, without ever materialising the
-    # full (H*W, T) residual.
+    # full (H*W, T) residual. For non-numpy Y_flat (e.g. zarr), sum along
+    # axis=1 by streaming pixel batches so we never load the whole store.
     C_sum = np.asarray(C.sum(axis=1), dtype=np.float32)
-    Y_sum = np.asarray(Y_flat.sum(axis=1), dtype=np.float32)
+    if Y_is_numpy:
+        Y_sum = np.asarray(Y_flat.sum(axis=1), dtype=np.float32)
+    else:
+        Y_sum = np.zeros(n_pixels, dtype=np.float32)
+        sum_batch = 4096
+        for s in range(0, n_pixels, sum_batch):
+            e = min(s + sum_batch, n_pixels)
+            Y_sum[s:e] = np.asarray(Y_flat[s:e], dtype=np.float32).sum(axis=1)
     AC_sum = np.asarray(A @ C_sum, dtype=np.float32).ravel()
     b0 = ((Y_sum - AC_sum) / float(T)).astype(np.float32)
 
@@ -237,24 +401,39 @@ def compute_W(
     # b0 is kept from the full T; only the ring regression uses fewer frames.
     # Cap tsub so at least 200 frames are used (prevents noisy W on short movies).
     actual_tsub = max(1, min(tsub, T // 200)) if tsub > 1 else 1
-    if actual_tsub > 1:
-        Y_sub = np.asarray(Y_flat[:, ::actual_tsub], dtype=np.float32)
-        C_sub = C[:, ::actual_tsub]
-    else:
-        Y_sub = np.asarray(Y_flat, dtype=np.float32)
-        C_sub = C
-    # Build X_fit at the subsampled time resolution only — the full-T X is
-    # never materialised. AC_sub is the dominant remaining allocation; Phase C
-    # will stream this too once Y_flat becomes a zarr-aware reader.
-    AC_sub = np.asarray(A.dot(C_sub), dtype=np.float32)
-    X_fit = Y_sub - AC_sub - b0[:, np.newaxis]
-    del Y_sub, AC_sub
-
     ring_idx = build_ring_indices(dims, radius)
 
-    if xp is not np:
-        # GPU path: vectorized batched solve grouped by ring size
+    if Y_is_numpy:
+        # In-memory path: build X_fit once at subsampled time resolution,
+        # then dispatch per-pixel batches over the dense slab.
+        if actual_tsub > 1:
+            Y_sub = np.asarray(Y_flat[:, ::actual_tsub], dtype=np.float32)
+            C_sub = C[:, ::actual_tsub]
+        else:
+            Y_sub = np.asarray(Y_flat, dtype=np.float32)
+            C_sub = C
+        AC_sub = np.asarray(A.dot(C_sub), dtype=np.float32)
+        X_fit = Y_sub - AC_sub - b0[:, np.newaxis]
+        del Y_sub, AC_sub
+    else:
+        # Zarr / on-disk: defer X_fit construction to the per-batch loop
+        # below so the full ``(H*W, T/tsub)`` slab is never materialised.
+        C_sub = C[:, ::actual_tsub] if actual_tsub > 1 else C
+        X_fit = None
+
+    if xp is not np and Y_is_numpy:
+        # GPU path: vectorized batched solve grouped by ring size (in-memory only).
         rows_list, cols_list, data_list = _compute_W_gpu(X_fit, ring_idx, lambda_reg, xp)
+    elif not Y_is_numpy:
+        # Streaming CPU path for zarr-backed Y_flat.
+        # Per pixel batch: pull only ring-neighbour rows into a small slab,
+        # build X_fit just for those rows, run the per-pixel solve.
+        raw_results = _compute_w_streaming(
+            Y_flat, A, C_sub, b0, ring_idx, actual_tsub, lambda_reg, n_jobs,
+        )
+        rows_list = [np.full(len(ring), p, dtype=np.int32) for p, ring, _ in raw_results]
+        cols_list = [ring for _, ring, _ in raw_results]
+        data_list = [w for _, _, w in raw_results]
     else:
         # CPU path: serial or joblib-parallel batches
         batch_size = 500
@@ -365,11 +544,39 @@ class BackgroundSubtractor:
         self.dtype = np.dtype(np.float32)
 
     def slice(self, start: int, end: int) -> np.ndarray:
-        """Return ``Y_bg[start:end, :]`` as a fresh ``(end-start, T)`` array."""
-        Y_chunk = np.asarray(self.Y_flat[start:end], dtype=np.float32)
+        """Return ``Y_bg[start:end, :]`` as a fresh ``(end-start, T)`` array.
+
+        When ``Y_flat`` is a zarr (or any non-numpy array), the
+        ``W_chunk @ Y_flat`` matmul cannot be done directly — it would read
+        the whole on-disk store. Instead we extract just the
+        ring-neighbour rows (the union of nonzero columns of
+        ``W_chunk``), remap the sparse column indices to that small
+        buffer, and do the matmul on the dense slab.
+        """
         W_chunk = self.W[start:end]
-        W_Y = np.asarray(W_chunk @ self.Y_flat, dtype=np.float32)        # (B, T)
-        W_b0 = np.asarray(W_chunk @ self.b0, dtype=np.float32)            # (B,)
+        Y_chunk = np.asarray(self.Y_flat[start:end], dtype=np.float32)
+
+        if isinstance(self.Y_flat, np.ndarray):
+            # Numpy: scipy's sparse-dense matmul already reads only the
+            # nonzero-column rows of Y_flat — leave it alone.
+            W_Y = np.asarray(W_chunk @ self.Y_flat, dtype=np.float32)
+        else:
+            # Generic (zarr / memmap / anything supporting fancy indexing):
+            # pull ring-neighbour rows into RAM, remap W's columns.
+            indices = W_chunk.indices
+            if indices.size == 0:
+                W_Y = np.zeros_like(Y_chunk)
+            else:
+                needed = np.unique(indices)
+                Y_needed = np.asarray(self.Y_flat[needed], dtype=np.float32)
+                remap = np.searchsorted(needed, indices)
+                W_chunk_remapped = sp.csr_matrix(
+                    (W_chunk.data, remap, W_chunk.indptr),
+                    shape=(W_chunk.shape[0], needed.size),
+                )
+                W_Y = np.asarray(W_chunk_remapped @ Y_needed, dtype=np.float32)
+
+        W_b0 = np.asarray(W_chunk @ self.b0, dtype=np.float32)
         out = Y_chunk - self.b0[start:end, None] - W_Y
         out += W_b0[:, None]
         return out

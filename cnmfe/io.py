@@ -180,3 +180,117 @@ def save_zarr(
         end = start + len(batch)
         store[start:end] = batch
     return store
+
+
+# ---------------------------------------------------------------------------
+# Pixel-major layout (for true T-streaming extraction)
+# ---------------------------------------------------------------------------
+
+def open_zarr_pixel_major(path: str | Path, mode: str = "r") -> zarr.Array:
+    """Open a pixel-major zarr (shape ``(H*W, T)``).
+
+    Counterpart to ``open_zarr`` for the layout produced by
+    ``transpose_zarr_to_pixel_major``. Pixel-major zarrs let extraction
+    read a pixel-row batch with ``O(B·T)`` IO instead of
+    ``O(H·W·T)`` for the time-major layout.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Zarr store not found: {path}")
+    arr = zarr.open_array(str(path), mode=mode)
+    if not isinstance(arr, zarr.Array):
+        raise ValueError(f"Expected zarr.Array at {path}, got {type(arr)}")
+    if arr.ndim != 2:
+        raise ValueError(
+            f"Expected 2-D pixel-major zarr (H*W, T), got shape {arr.shape}. "
+            f"Use open_zarr() for time-major (T, H, W) stores."
+        )
+    return arr
+
+
+def transpose_zarr_to_pixel_major(
+    src: str | Path,
+    dest: str | Path,
+    *,
+    pixel_chunk: int = 4096,
+    time_chunk: int = 2000,
+    dtype: str = "float32",
+    compression: bool = True,
+    src_batch_frames: int = 2000,
+    skip_if_exists: bool = True,
+    verbose: bool = True,
+) -> zarr.Array:
+    """Transpose a time-major ``(T, H, W)`` zarr to pixel-major ``(H*W, T)``.
+
+    The pixel ordering matches ``cnmfe._utils.make_2d``: pixel ``(h, w)``
+    lives at flat index ``h * W + w`` (C-order over the spatial axes).
+    Reading ``dest[start:end, :]`` therefore returns the same pixel-row
+    slice that the in-memory pipeline expects.
+
+    The transpose is a one-time disk pass; afterwards extraction can run
+    against ``dest`` without materialising the full movie in RAM.
+
+    Args:
+        src: Path to the source ``(T, H, W)`` zarr (e.g. ``mc.zarr``).
+        dest: Destination zarr path. Created if absent.
+        pixel_chunk: Number of pixels per dest chunk along axis 0.
+        time_chunk: Number of frames per dest chunk along axis 1.
+        dtype: Output dtype (default ``float32`` for downstream extraction).
+        compression: Use blosc lz4+bitshuffle (default ``True``).
+        src_batch_frames: Frames read from the source per IO batch.
+            Peak RAM ≈ ``src_batch_frames * H * W * 4`` bytes.
+        skip_if_exists: If the dest path already exists, return its handle
+            without re-writing.
+        verbose: Print a progress bar.
+
+    Returns:
+        Open zarr.Array with shape ``(H*W, T)``.
+    """
+    src_arr = open_zarr(src)
+    T, H, W = src_arr.shape
+    n_pixels = H * W
+
+    dest_path = Path(dest)
+    if dest_path.exists():
+        if skip_if_exists:
+            if verbose:
+                print(f"Skipping transpose; {dest_path} already exists.")
+            return zarr.open_array(str(dest_path), mode="r")
+        # Caller asked for a fresh write — remove the old store.
+        import shutil
+        shutil.rmtree(dest_path)
+
+    chunks_eff = (min(pixel_chunk, n_pixels), min(time_chunk, T))
+    if verbose:
+        print(
+            f"Transposing {src} -> {dest_path}\n"
+            f"  src.shape={src_arr.shape}  src.chunks={src_arr.chunks}\n"
+            f"  dest.shape=({n_pixels}, {T})  dest.chunks={chunks_eff}  dtype={dtype}"
+        )
+
+    dest_arr = _open_array(
+        dest_path, "w",
+        shape=(n_pixels, T), chunks=chunks_eff,
+        dtype=dtype, compression=compression,
+    )
+
+    try:
+        from tqdm import tqdm as _tqdm
+        iterator = _tqdm(range(0, T, src_batch_frames), disable=not verbose,
+                         desc="transpose")
+    except ImportError:
+        iterator = range(0, T, src_batch_frames)
+
+    for t0 in iterator:
+        t1 = min(t0 + src_batch_frames, T)
+        # Read (B, H, W) -> reshape to (B, H*W) row-major (pixel (h, w) at
+        # index h*W + w, matching make_2d) -> transpose to (H*W, B).
+        chunk_3d = np.asarray(src_arr[t0:t1], dtype=dtype)
+        chunk_2d = chunk_3d.reshape(t1 - t0, n_pixels).T
+        # .T returns an F-order view; .copy() makes it C-contiguous for
+        # efficient slab-write into the dest zarr (which is C-major chunks).
+        dest_arr[:, t0:t1] = np.ascontiguousarray(chunk_2d)
+
+    if verbose:
+        print(f"Done. Pixel-major zarr written to: {dest_path}")
+    return dest_arr

@@ -156,6 +156,75 @@ class TestComputeW:
         )
         assert W_returned is W_mat
 
+    def test_compute_W_streaming_matches_in_memory(self, tmp_path):
+        """compute_W on a zarr-backed Y_flat must match the in-memory path.
+
+        Phase F3 regression. The streaming path constructs X-slabs per
+        pixel batch instead of materialising the full ``(H*W, T_sub)``
+        residual. b0 and W weights must equal the in-memory computation
+        within float32 tolerance.
+        """
+        import zarr as _zarr
+
+        rng = np.random.default_rng(41)
+        H, W, T = 16, 18, 220
+        Y = rng.standard_normal((H * W, T)).astype(np.float32) * 1.4
+        K = 3
+        A_dense = np.zeros((H * W, K), dtype=np.float32)
+        for k in range(K):
+            for p in rng.choice(H * W, size=20, replace=False):
+                A_dense[p, k] = rng.uniform(0.1, 0.5)
+        A = sp.csc_matrix(A_dense)
+        C = rng.standard_normal((K, T)).astype(np.float32) * 0.8
+
+        z_path = tmp_path / "Y_pixel_major.zarr"
+        z = _zarr.open_array(
+            str(z_path), mode="w",
+            shape=Y.shape, chunks=(48, 80), dtype="float32",
+        )
+        z[:] = Y
+
+        W_np, b0_np = compute_W(Y, A, C, (H, W), radius=3, tsub=2)
+        W_zr, b0_zr = compute_W(z, A, C, (H, W), radius=3, tsub=2)
+
+        np.testing.assert_allclose(b0_zr, b0_np, atol=1e-4, rtol=1e-4)
+        # Compare W as dense (small, K=3, n_pixels=288).
+        np.testing.assert_allclose(
+            W_zr.toarray(), W_np.toarray(), atol=1e-3, rtol=1e-3,
+        )
+
+    def test_compute_W_cached_streaming(self, tmp_path):
+        """W_cached must short-circuit on the streaming path too, returning
+        the cached W and a freshly-streamed b0."""
+        import zarr as _zarr
+
+        rng = np.random.default_rng(43)
+        H, W, T = 14, 14, 200
+        Y = rng.standard_normal((H * W, T)).astype(np.float32)
+        z_path = tmp_path / "Y.zarr"
+        z = _zarr.open_array(
+            str(z_path), mode="w",
+            shape=Y.shape, chunks=(32, 80), dtype="float32",
+        )
+        z[:] = Y
+
+        A0 = sp.csc_matrix((H * W, 0), dtype=np.float32)
+        C0 = np.empty((0, T), dtype=np.float32)
+        W_mat, _ = compute_W(z, A0, C0, (H, W), radius=3)
+
+        # Now refit with a non-empty (A, C) on the zarr-backed Y.
+        K = 2
+        A_dense = np.zeros((H * W, K), dtype=np.float32)
+        A_dense[rng.choice(H * W, size=10, replace=False), 0] = 0.3
+        A_dense[rng.choice(H * W, size=10, replace=False), 1] = 0.3
+        A = sp.csc_matrix(A_dense)
+        C = rng.standard_normal((K, T)).astype(np.float32) * 0.5
+
+        W_returned, b0_refit = compute_W(z, A, C, (H, W), radius=3, W_cached=W_mat)
+        assert W_returned is W_mat
+        expected_b0 = (Y - A.dot(C)).mean(axis=1).astype(np.float32)
+        np.testing.assert_allclose(b0_refit, expected_b0, atol=1e-4, rtol=1e-4)
+
     def test_subtract_background_reduces_variance(self):
         """Background subtraction should reduce variance in background-dominated pixels."""
         rng = np.random.default_rng(1)
@@ -274,3 +343,57 @@ class TestBackgroundSubtractor:
         bg = BackgroundSubtractor(Y, W_mat, b0)
         proj = bg.project_onto(sp.csc_matrix((Y.shape[0], 0), dtype=np.float32))
         assert proj.shape == (T, 0)
+
+    def test_slice_matches_numpy_on_zarr_backed_Y(self, tmp_path):
+        """BackgroundSubtractor must produce identical slices when ``Y_flat``
+        is a zarr-backed pixel-major store instead of a numpy array.
+
+        Phase F2 regression. The zarr branch in ``slice()`` pulls only the
+        ring-neighbour rows into RAM and remaps the sparse column indices,
+        avoiding a full Y_flat materialisation. Result must equal the
+        in-memory path bit-for-bit.
+        """
+        import zarr as _zarr
+
+        Y, W_mat, b0, dims = self._make_data(seed=17)
+        # Save Y as a pixel-major zarr; chunk small to force multi-chunk reads.
+        zarr_path = tmp_path / "Y_pixel_major.zarr"
+        z = _zarr.open_array(
+            str(zarr_path), mode="w",
+            shape=Y.shape, chunks=(32, 60), dtype="float32",
+        )
+        z[:] = Y
+
+        bg_np = BackgroundSubtractor(Y, W_mat, b0)
+        bg_zarr = BackgroundSubtractor(z, W_mat, b0)
+
+        for start, end in [(0, 16), (50, 100), (Y.shape[0] - 25, Y.shape[0])]:
+            np.testing.assert_allclose(
+                bg_zarr.slice(start, end),
+                bg_np.slice(start, end),
+                atol=1e-4, rtol=1e-4,
+            )
+
+    def test_project_onto_matches_dense_on_zarr_backed_Y(self, tmp_path):
+        import zarr as _zarr
+
+        rng = np.random.default_rng(31)
+        Y, W_mat, b0, dims = self._make_data(seed=5)
+        H, W, T = dims
+        zarr_path = tmp_path / "Y_pixel_major.zarr"
+        z = _zarr.open_array(
+            str(zarr_path), mode="w",
+            shape=Y.shape, chunks=(32, 60), dtype="float32",
+        )
+        z[:] = Y
+
+        K = 3
+        A_dense = np.zeros((H * W, K), dtype=np.float32)
+        for k in range(K):
+            for p in rng.choice(H * W, size=8, replace=False):
+                A_dense[p, k] = rng.uniform(0.1, 0.5)
+        A = sp.csc_matrix(A_dense)
+
+        np_proj = BackgroundSubtractor(Y, W_mat, b0).project_onto(A, batch_size=40)
+        z_proj = BackgroundSubtractor(z, W_mat, b0).project_onto(A, batch_size=40)
+        np.testing.assert_allclose(z_proj, np_proj, atol=1e-3, rtol=1e-3)
