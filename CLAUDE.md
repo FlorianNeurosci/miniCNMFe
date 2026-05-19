@@ -17,7 +17,7 @@ algorithmic reference only. All math is reimplemented from scratch with numpy/sc
 
 ## Current status
 
-**Complete and working.** All 78 tests pass:
+**Complete and working.** All 88 tests pass:
 
 ```bash
 pytest tests/ -v
@@ -62,6 +62,55 @@ are critical for producing the same shifts as CaImAn on real data — using
 `scipy.ndimage.convolve` or FFT-based shift application produces a ~4–5 px absolute
 offset compared to CaImAn even when correlation is high. Do not replace these with
 scipy equivalents.
+
+The function has **two execution paths**, chosen automatically:
+
+- **Streaming (zarr-backed)** — used when the input is a `zarr.Array` *or* an
+  `output_path` is given. Reads/writes batches of frames; peak RAM is
+  `(batch_size + template_max_frames) * H * W * 4` bytes, independent of T.
+  Template is built from a strided sample of up to `template_max_frames` frames.
+  For `niter_rig > 1` we ping-pong between two scratch zarrs
+  (`<name>.scratch_a.zarr`, `<name>.scratch_b.zarr`) and `shutil.move` the final
+  result to `output_path`. Zarr input **requires** `output_path` (we refuse to
+  silently load it into RAM).
+- **In-memory** — used when the input is a numpy array and no `output_path` is
+  given. Same algorithm, returns a numpy corrected movie. Kept for the small-movie
+  test path.
+
+Both paths parallelize per-frame work via joblib (`n_jobs`). The worker
+`_filter_estimate_apply` is module-level for `spawn`-based pickling on Windows.
+Within a batch, frames are independent given the fixed template, so they
+parallelize trivially.
+
+CNMFeParams MC fields:
+- `mc_batch_size: int = 200` — frames per streaming/parallel batch
+- `mc_template_max_frames: int = 2000` — cap on frames sampled for the template
+- `mc_output_chunk_t: int | None = None` — output zarr time chunk (None = match source)
+- `mc_output_dtype: str = "float32"` — output zarr dtype
+
+`fit_mc(movie, output_dir=...)` is the canonical entry for big movies: pass a
+`zarr.Array` + `output_dir`, the corrected movie is written to
+`<output_dir>/mc.zarr` without materializing T frames in RAM.
+
+**Extraction RAM after the streaming refactor (Items 1A–1D, May 2026).**
+The full corrected movie still has to fit in pixel-major RAM as `Y_flat`
+(time-major zarr can't be efficiently sliced pixel-wise without a disk
+transpose). Everything *on top of* `Y_flat` is now streamed:
+- `BackgroundSubtractor` (`background.py`) materialises pixel-row slices
+  of `(I - W) @ (Y - b0)` on demand. The full `Y_bg` is never built.
+- `compute_W` computes `b0` via streaming reductions
+  (`(Y_sum - A @ C_sum) / T`) and builds X_fit only at the subsampled time
+  resolution. After the first call it accepts `W_cached=W_mat` and only
+  refreshes `b0` — saving the per-pixel BTB solve on subsequent BCD
+  iterations.
+- Greedy init runs on a strided sample (`init_stride` field on `CNMFeParams`;
+  auto = `max(1, T // 5000)`); full-T temporal traces are recovered by
+  projecting `Y_flat` onto each footprint after init.
+
+On a 10k × 600 × 600 movie peak working RAM is ~14 GB (Y_flat) + small
+per-batch buffers. The 60k+ frame case still requires either subsampling
+or a future Phase that disk-transposes the corrected zarr to pixel-major
+chunks; see `todo/correctionplan.md`.
 
 Convenience wrappers added alongside `motion_correction_rigid`:
 - `apply_shift(img, shift)` — alias for `apply_shift_caiman`
@@ -259,7 +308,7 @@ pip install oasis-deconvolution          # faster deconvolution
 pip install cupy-cuda12x                 # GPU support (match your CUDA version)
 
 # Tests
-pytest tests/ -v                         # all 78 tests
+pytest tests/ -v                         # all 88 tests
 pytest tests/test_pipeline.py -v         # pipeline + temporal-correlation regression
 pytest tests/test_multiprocessing.py -v  # parallelism only
 

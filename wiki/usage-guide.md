@@ -72,6 +72,40 @@ model = CNMFe(params).fit(movie, output_dir="/tmp/cnmfe_out/")
 # Saves corrected movie to /tmp/cnmfe_out/mc.zarr
 ```
 
+### Run on a large zarr (RAM-bounded extraction)
+
+The extraction path is streaming-aware after the Phase 1 refactors (May 2026):
+
+- `fit()` accepts a `zarr.Array` directly. The corrected movie is held once
+  as a pixel-major `(H·W, T)` float32 array; downstream steps allocate
+  only small per-batch buffers.
+- `BackgroundSubtractor` (used internally by the BCD loop) materialises
+  pixel-row slices of `(I - W) @ (Y - b0)` on demand — `Y_bg` is never
+  built in full.
+- `compute_W` computes `b0` via streaming reductions and reuses the ring
+  weight matrix `W` across BCD iterations (`W_cached` arg).
+- Greedy init runs on a strided sample of the movie
+  (`CNMFeParams.init_stride`, auto = `max(1, T // 5000)`); full-T traces
+  are recovered by projection after init.
+
+```python
+from cnmfe.io import open_zarr
+from cnmfe import CNMFe, CNMFeParams
+
+z = open_zarr("session/mc.zarr")            # already motion-corrected
+params = CNMFeParams(
+    sigma=3.0, min_corr=0.8, min_pnr=10.0,
+    init_stride=None,                       # auto: max(1, T // 5000)
+    n_jobs=-1,
+)
+model = CNMFe(params).fit(z, do_motion_correction=False)
+```
+
+Peak working RAM is `~T·H·W·4` bytes (the movie itself) plus `~K·T·4` for
+traces. On a 10k × 600 × 600 movie that is ~14 GB; on 60k × 600 × 600
+it's ~86 GB and you'll want either subsampling or — when the disk-transpose
+preprocessing path lands — to read straight from a pixel-major chunked zarr.
+
 ### Use multiple CPU cores
 
 ```python
