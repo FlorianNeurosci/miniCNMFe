@@ -156,13 +156,15 @@ class TestComputeW:
         )
         assert W_returned is W_mat
 
-    def test_compute_W_streaming_matches_in_memory(self, tmp_path):
-        """compute_W on a zarr-backed Y_flat must match the in-memory path.
+    @pytest.mark.parametrize("n_jobs", [1, 2])
+    def test_compute_W_streaming_matches_in_memory(self, tmp_path, n_jobs):
+        """compute_W on a zarr-backed Y_flat must match the in-memory path,
+        on both the serial (n_jobs=1) and parallel (n_jobs=2) branches.
 
         Phase F3 regression. The streaming path constructs X-slabs per
         pixel batch instead of materialising the full ``(H*W, T_sub)``
-        residual. b0 and W weights must equal the in-memory computation
-        within float32 tolerance.
+        residual. Parallel branch was once a placeholder that ran serially
+        regardless of n_jobs — this guards against that resurfacing.
         """
         import zarr as _zarr
 
@@ -185,50 +187,12 @@ class TestComputeW:
         z[:] = Y
 
         W_np, b0_np = compute_W(Y, A, C, (H, W), radius=3, tsub=2)
-        W_zr, b0_zr = compute_W(z, A, C, (H, W), radius=3, tsub=2)
+        W_zr, b0_zr = compute_W(z, A, C, (H, W), radius=3, tsub=2, n_jobs=n_jobs)
 
         np.testing.assert_allclose(b0_zr, b0_np, atol=1e-4, rtol=1e-4)
         # Compare W as dense (small, K=3, n_pixels=288).
         np.testing.assert_allclose(
             W_zr.toarray(), W_np.toarray(), atol=1e-3, rtol=1e-3,
-        )
-
-    def test_compute_W_streaming_parallel_matches_serial(self, tmp_path):
-        """Streaming compute_W must produce the same W and b0 with n_jobs=2
-        as with n_jobs=1 — the parallel branch used to be a placeholder
-        that ran serially regardless of n_jobs.
-        """
-        import zarr as _zarr
-
-        rng = np.random.default_rng(101)
-        H, W, T = 20, 24, 260
-        Y = rng.standard_normal((H * W, T)).astype(np.float32) * 1.2
-        K = 4
-        A_dense = np.zeros((H * W, K), dtype=np.float32)
-        for k in range(K):
-            for p in rng.choice(H * W, size=18, replace=False):
-                A_dense[p, k] = rng.uniform(0.1, 0.5)
-        A = sp.csc_matrix(A_dense)
-        C = rng.standard_normal((K, T)).astype(np.float32) * 0.7
-
-        z_path = tmp_path / "Y_pixel.zarr"
-        z = _zarr.open_array(
-            str(z_path), mode="w",
-            shape=Y.shape, chunks=(60, 80), dtype="float32",
-        )
-        z[:] = Y
-
-        W_serial, b0_serial = compute_W(
-            z, A, C, (H, W), radius=3, tsub=2, n_jobs=1,
-        )
-        W_parallel, b0_parallel = compute_W(
-            z, A, C, (H, W), radius=3, tsub=2, n_jobs=2,
-        )
-
-        np.testing.assert_allclose(b0_parallel, b0_serial, atol=1e-4, rtol=1e-4)
-        np.testing.assert_allclose(
-            W_parallel.toarray(), W_serial.toarray(),
-            atol=1e-4, rtol=1e-4,
         )
 
     def test_compute_W_cached_streaming(self, tmp_path):

@@ -167,33 +167,33 @@ class TestParallelism:
         )
         assert shifts.shape == (12, 2)
 
-    def test_parallel_matches_serial_in_memory(self):
-        """n_jobs=2 in-memory path must produce the same shifts as n_jobs=1."""
+    @pytest.mark.parametrize("input_mode", ["numpy", "zarr"])
+    def test_parallel_matches_serial(self, tmp_path, input_mode):
+        """n_jobs=2 must produce the same shifts as n_jobs=1, on both the
+        in-memory (``numpy``) and streaming (``zarr``) input paths."""
         movie, _ = _make_movie(T=20, H=40, W=40, seed=8)
-        _, shifts_s = motion_correction_rigid(
-            movie, max_shift=(6, 6), gSig_filt=None,
-            upsample_factor=5, niter_rig=1, n_jobs=1, verbose=False,
-        )
-        _, shifts_p = motion_correction_rigid(
-            movie, max_shift=(6, 6), gSig_filt=None,
-            upsample_factor=5, niter_rig=1, n_jobs=2, verbose=False,
-        )
-        np.testing.assert_allclose(shifts_p, shifts_s, atol=1e-4)
 
-    def test_parallel_matches_serial_streaming(self, tmp_path):
-        """Same equivalence on the streaming path."""
-        movie, _ = _make_movie(T=20, H=40, W=40, seed=9)
-        src = _save_zarr(movie, tmp_path / "src.zarr", chunk_t=8)
-        _, shifts_s = motion_correction_rigid(
-            src, output_path=tmp_path / "mc_s.zarr",
-            max_shift=(6, 6), gSig_filt=None, upsample_factor=5,
-            niter_rig=1, n_jobs=1, batch_size=8, verbose=False,
-        )
-        _, shifts_p = motion_correction_rigid(
-            src, output_path=tmp_path / "mc_p.zarr",
-            max_shift=(6, 6), gSig_filt=None, upsample_factor=5,
-            niter_rig=1, n_jobs=2, batch_size=8, verbose=False,
-        )
+        if input_mode == "numpy":
+            _, shifts_s = motion_correction_rigid(
+                movie, max_shift=(6, 6), gSig_filt=None,
+                upsample_factor=5, niter_rig=1, n_jobs=1, verbose=False,
+            )
+            _, shifts_p = motion_correction_rigid(
+                movie, max_shift=(6, 6), gSig_filt=None,
+                upsample_factor=5, niter_rig=1, n_jobs=2, verbose=False,
+            )
+        else:
+            src = _save_zarr(movie, tmp_path / "src.zarr", chunk_t=8)
+            _, shifts_s = motion_correction_rigid(
+                src, output_path=tmp_path / "mc_s.zarr",
+                max_shift=(6, 6), gSig_filt=None, upsample_factor=5,
+                niter_rig=1, n_jobs=1, batch_size=8, verbose=False,
+            )
+            _, shifts_p = motion_correction_rigid(
+                src, output_path=tmp_path / "mc_p.zarr",
+                max_shift=(6, 6), gSig_filt=None, upsample_factor=5,
+                niter_rig=1, n_jobs=2, batch_size=8, verbose=False,
+            )
         np.testing.assert_allclose(shifts_p, shifts_s, atol=1e-4)
 
 

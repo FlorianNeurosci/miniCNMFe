@@ -103,12 +103,16 @@ class TestUpdateTemporal:
 
         C_new, _, _, _ = update_temporal(Y_flat, A, C_init, sn, ar_order=1, n_iter=2)
 
-        # At least one component should have r > 0.5
+        # Every component should track its ground-truth trace on a small,
+        # well-behaved synthetic — best-of-K hides per-neuron failures.
         correlations = [
-            np.corrcoef(C_new[k], d["C_true"][k])[0, 1]
+            float(np.corrcoef(C_new[k], d["C_true"][k])[0, 1])
             for k in range(C_new.shape[0])
         ]
-        assert max(correlations) > 0.5, f"Best correlation = {max(correlations):.3f}"
+        assert np.mean(correlations) > 0.7, (
+            f"Mean correlation = {np.mean(correlations):.3f}, per-neuron: "
+            f"{[round(r, 3) for r in correlations]}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -231,4 +235,37 @@ class TestDriftRobustness:
         assert hits_yes > hits_no, (
             f"Detrended deconv must do strictly better than no-detrend. "
             f"hits_yes={hits_yes}, hits_no={hits_no}"
+        )
+
+    def test_detrend_is_no_op_on_clean_trace(self):
+        """Symmetric guard: on a trace with NO slow drift, enabling the
+        polynomial detrend (order ≥ 1) must NOT change the AR estimate.
+
+        Pin against future loosenings of `_detrend_poly` or accidental
+        over-fitting: if a regression made the detrend bias `g` on clean
+        data, this test catches it. Companion to
+        `test_estimate_ar_invariant_to_linear_drift` (which checks the
+        invariant in the drifty direction).
+        """
+        # Clean AR(1) trace, no drift component.
+        data = make_ar1_trace(T=1500, g=0.9, sn=0.1, seed=7)
+        trace = data["trace"]
+
+        g0, sn0 = estimate_ar_params(trace, p=1, detrend_order=0)
+        g2, sn2 = estimate_ar_params(trace, p=1, detrend_order=2)
+        g0, g2 = float(g0[0]), float(g2[0])
+
+        # Mean-only and quadratic detrend on a clean trace should give
+        # essentially the same g. Empirically the difference is well under
+        # 0.005 on this fixture; assert at 0.01 for headroom.
+        assert abs(g2 - g0) < 0.01, (
+            f"Detrend should be a no-op on a clean trace: "
+            f"g(detrend=0)={g0:.4f}, g(detrend=2)={g2:.4f}"
+        )
+        # Noise estimate uses the high-frequency PSD only; it does not
+        # touch the detrend path, but pin it anyway so a refactor that
+        # accidentally couples them gets caught.
+        assert abs(sn2 - sn0) < 1e-6, (
+            f"sn estimate must not depend on detrend_order: "
+            f"sn(0)={sn0:.6f}, sn(2)={sn2:.6f}"
         )

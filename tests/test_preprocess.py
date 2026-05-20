@@ -75,7 +75,7 @@ class TestLocalCorrelationsFFT:
         cn = local_correlations_fft(movie)
         assert cn.shape == (16, 16)
         # All pixels share the signal → correlation near 1
-        assert cn.mean() > 0.5
+        assert cn.mean() > 0.85
 
     def test_independent_noise(self):
         """Independent pixel noise → correlation ≈ 0."""

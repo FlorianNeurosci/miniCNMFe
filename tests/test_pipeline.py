@@ -69,35 +69,6 @@ class TestCNMFePipeline:
         if model.S is not None and model.S.size > 0:
             assert (model.S >= -1e-5).all()
 
-    def test_finds_some_neurons(self, synth_small):
-        movie = synth_small["movie"]
-        params = CNMFeParams(
-            sigma=3.0,
-            min_corr=0.4,
-            min_pnr=2.0,
-            n_iter_main=1,
-        )
-        model = CNMFe(params).fit(movie, do_motion_correction=False)
-        assert model.A.shape[1] >= 1, "Should find at least one neuron"
-
-    def test_spatial_recovery(self, synth_small):
-        """At least one true neuron should be recovered with r > 0.5."""
-        movie = synth_small["movie"]
-        params = CNMFeParams(
-            sigma=3.0,
-            min_corr=0.4,
-            min_pnr=2.0,
-            n_iter_main=1,
-        )
-        model = CNMFe(params).fit(movie, do_motion_correction=False)
-
-        if model.A.shape[1] == 0:
-            pytest.skip("No neurons found — lower thresholds")
-
-        matches = match_components(model.A, synth_small["A_true"])
-        best_corr = max(m[2] for m in matches)
-        assert best_corr > 0.4, f"Best spatial correlation = {best_corr:.3f}"
-
     def test_default_params(self, synth_small):
         """Pipeline with default params should not crash."""
         movie = synth_small["movie"]
@@ -145,8 +116,8 @@ class TestCNMFePipeline:
         for k_true in range(K_true):
             _, _, r1 = matches_1[k_true]
             _, _, r3 = matches_3[k_true]
-            assert r1 > 0.7, f"stride=1 poor spatial match on neuron {k_true}: r={r1:.3f}"
-            assert r3 > 0.7, f"stride=3 poor spatial match on neuron {k_true}: r={r3:.3f}"
+            assert r1 > 0.85, f"stride=1 poor spatial match on neuron {k_true}: r={r1:.3f}"
+            assert r3 > 0.85, f"stride=3 poor spatial match on neuron {k_true}: r={r3:.3f}"
 
         # Full-T traces always; strided init recovers C at full T via the
         # post-init projection. Check shape.
@@ -158,7 +129,7 @@ class TestCNMFePipeline:
         The initial CORR/PNR sweep inside greedy init runs on a strided
         slice of the (already strided) init_movie. Spatial reductions
         survive moderate subsampling; we verify each ground-truth neuron
-        still matches an extracted footprint at r > 0.7.
+        still matches an extracted footprint at r > 0.85.
         """
         from tests.conftest import make_synthetic_movie
 
@@ -186,7 +157,7 @@ class TestCNMFePipeline:
         matches_3 = match_components(m3.A, synth["A_true"])
         for k_true in range(K_true):
             _, _, r3 = matches_3[k_true]
-            assert r3 > 0.7, (
+            assert r3 > 0.85, (
                 f"corrpnr_stride=3 poor spatial match on neuron {k_true}: r={r3:.3f}"
             )
 
@@ -512,18 +483,24 @@ class TestCNMFePipeline:
         assert model.shifts is not None
         assert model.shifts.shape == (movie.shape[0], 2)
 
-    def test_temporal_correlation_against_truth(self, synth):
+    @pytest.mark.parametrize("global_ar", [True, False])
+    def test_temporal_correlation_against_truth(self, synth, global_ar):
         """Recovered temporal traces should align with ground truth.
 
-        Regression test: per-component re-estimation of the AR coefficient g
-        across BCD iterations used to drift it toward 0 (fudge_factor=0.96
-        re-applied each call), distorting calcium decay shape and dropping
-        Pearson r vs ground truth to ~0.6-0.8. Pooling g across components
-        and caching it across iterations brings r back above 0.85.
+        Regression test (global_ar=True): per-component re-estimation of the
+        AR coefficient g across BCD iterations used to drift it toward 0
+        (fudge_factor=0.96 re-applied each call), distorting calcium decay
+        shape and dropping Pearson r vs ground truth to ~0.6-0.8. Pooling g
+        across components and caching it across iterations brings r back
+        above 0.85.
+
+        Per-neuron AR mode (global_ar=False) must recover traces at least
+        as well as the pooled-g mode — same r > 0.85 bar.
         """
         params = CNMFeParams(
             sigma=3.0, min_corr=0.7, min_pnr=3.0,
             n_iter_main=2, n_iter_temporal=2,
+            global_ar=global_ar,
         )
         model = CNMFe(params).fit(synth["movie"], do_motion_correction=False)
         matches = match_components(model.A, synth["A_true"])
@@ -537,12 +514,15 @@ class TestCNMFePipeline:
         valid = [(kt, ke) for kt, ke, sc in matches if sc > 0.5]
         assert len(valid) >= 5, f"Only {len(valid)}/6 truth neurons recovered"
 
-        rs_oasis = [pearson(model.C[ke], synth["C_true"][kt]) for kt, ke in valid]
         rs_proj = [pearson((model.C + model.YrA)[ke], synth["C_true"][kt]) for kt, ke in valid]
-
-        assert np.mean(rs_oasis) > 0.85, f"Mean r(C) = {np.mean(rs_oasis):.3f}"
         assert np.mean(rs_proj) > 0.85, f"Mean r(C+YrA) = {np.mean(rs_proj):.3f}"
-        assert min(rs_proj) > 0.70, f"Min r(C+YrA) = {min(rs_proj):.3f}"
+
+        if global_ar:
+            # global_ar=True is the canonical regression: also check the
+            # deconvolved trace C against truth and the min over neurons.
+            rs_oasis = [pearson(model.C[ke], synth["C_true"][kt]) for kt, ke in valid]
+            assert np.mean(rs_oasis) > 0.85, f"Mean r(C) = {np.mean(rs_oasis):.3f}"
+            assert min(rs_proj) > 0.80, f"Min r(C+YrA) = {min(rs_proj):.3f}"
 
     def test_auto_evaluation_rejects_ghosts(self, synth):
         """Auto-evaluation mask must flag ghost components.
@@ -594,28 +574,6 @@ class TestCNMFePipeline:
             f"spatial r > 0.7 among accepted components. Per-neuron r: "
             f"{[round(m[2], 3) for m in matches]}"
         )
-
-    def test_per_neuron_ar_temporal_correlation(self, synth):
-        """Per-neuron AR estimation (global_ar=False) should recover traces as well as global."""
-        params = CNMFeParams(
-            sigma=3.0, min_corr=0.7, min_pnr=3.0,
-            n_iter_main=2, n_iter_temporal=2,
-            global_ar=False,
-        )
-        model = CNMFe(params).fit(synth["movie"], do_motion_correction=False)
-        matches = match_components(model.A, synth["A_true"])
-
-        def pearson(a, b):
-            a = a - a.mean(); b = b - b.mean()
-            d = np.sqrt(np.sum(a ** 2) * np.sum(b ** 2))
-            return float(np.dot(a, b) / d) if d > 0 else 0.0
-
-        valid = [(kt, ke) for kt, ke, sc in matches if sc > 0.5]
-        assert len(valid) >= 5, f"Only {len(valid)}/6 truth neurons recovered"
-
-        rs_proj = [pearson((model.C + model.YrA)[ke], synth["C_true"][kt]) for kt, ke in valid]
-        assert np.mean(rs_proj) > 0.85, f"Mean r(C+YrA) per-neuron AR = {np.mean(rs_proj):.3f}"
-
 
 class TestGlobalBgRank1:
     """Rank-1 global background (NON-STANDARD, opt-in) on a movie with strong
@@ -706,3 +664,79 @@ class TestGlobalBgRank1:
         )
         model = CNMFe(params).fit(data["movie"], do_motion_correction=False)
         assert model.b_f is None and model.f is None
+
+    def test_save_load_roundtrip_preserves_bf_f(self, tmp_path):
+        """The rank-1 attrs must round-trip through save/load.
+
+        Pins the on-disk layout for ``b_f.npy`` / ``f.npy`` and the loader
+        path that restores them — downstream analysis code that consumes
+        ``model.b_f`` / ``model.f`` (e.g. plotting the bleach trajectory)
+        depends on this.
+        """
+        data = self._make_drifty_movie()
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.7, min_pnr=3.0,
+            n_iter_main=2, n_iter_temporal=2,
+            global_bg_rank=1,
+        )
+        model = CNMFe(params).fit(data["movie"], do_motion_correction=False)
+        assert model.b_f is not None and model.f is not None
+
+        save_dir = tmp_path / "model"
+        model.save(save_dir)
+        assert (save_dir / "b_f.npy").exists(), "b_f.npy missing from save dir"
+        assert (save_dir / "f.npy").exists(), "f.npy missing from save dir"
+
+        loaded = CNMFe.load(save_dir)
+        np.testing.assert_array_equal(loaded.b_f, model.b_f)
+        np.testing.assert_array_equal(loaded.f, model.f)
+
+    def test_global_bg_rank1_does_not_invent_drift_on_clean_movie(self):
+        """Negative control: when the input movie has no slow temporal
+        structure, ``f(t)`` must NOT look like a slow drift.
+
+        This requires a hand-built fixture — both ``make_miniscope_movie``
+        and ``make_synthetic_movie`` inject slow background by design
+        (the rank-1 model correctly tracks it, so it's not a "clean"
+        control). Here we generate neurons + iid noise only and assert
+        the spectral signature of ``f`` is broadband, not low-frequency
+        dominated.
+        """
+        import scipy.ndimage as ndi
+        rng = np.random.default_rng(0)
+        H, W, T, K = 40, 40, 400, 4
+        # Neurons: gaussian footprints, AR(1) traces.
+        yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+        A_true = np.zeros((H * W, K), dtype=np.float32)
+        for k in range(K):
+            r, c = 8 + 8 * k, 8 + 7 * k
+            blob = np.exp(-((yy - r) ** 2 + (xx - c) ** 2) / (2 * 3.0 ** 2))
+            A_true[:, k] = (blob / (blob.max() + 1e-10)).ravel()
+        S = (rng.random((K, T)) < 0.05).astype(np.float32); S[:, 0] = 0
+        C_true = np.zeros((K, T), dtype=np.float32)
+        for t in range(1, T):
+            C_true[:, t] = 0.9 * C_true[:, t - 1] + S[:, t]
+        # Flat baseline + iid noise. No slow background — anywhere.
+        Y_flat = A_true @ C_true + 1.0 + 0.3 * rng.standard_normal(
+            (H * W, T)).astype(np.float32)
+        movie = Y_flat.T.reshape(T, H, W)
+
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.7, min_pnr=3.0,
+            n_iter_main=2, n_iter_temporal=2,
+            global_bg_rank=1,
+        )
+        model = CNMFe(params).fit(movie, do_motion_correction=False)
+        assert model.b_f is not None and model.f is not None
+
+        # Spectral signature of f(t): power in the lowest 5% of rfft bins.
+        # On a bleach curve this is ≈1.0 (the positive test sits there);
+        # on a noise-driven trace it sits near 1/20 = 0.05.
+        f_centered = (model.f - model.f.mean()).astype(np.float64)
+        spec = np.abs(np.fft.rfft(f_centered)) ** 2
+        n_slow = max(1, len(spec) // 20)
+        slow_frac = float(spec[:n_slow].sum() / max(spec.sum(), 1e-12))
+        assert slow_frac < 0.5, (
+            f"With no slow input, f(t) must NOT be slow-frequency dominated; "
+            f"got slow_frac = {slow_frac:.3f} (positive test sits > 0.9)"
+        )
