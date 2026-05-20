@@ -18,22 +18,36 @@ independent noise — the standard CNMF assumption) and cheap.
 The items below were identified during the investigation but
 deferred to keep that fix tightly scoped.
 
-## 1. g estimation from the projected trace, not C_raw
+## 1. g estimation from the projected trace, not C_raw — TRIED, INSUFFICIENT
 
-**Why it matters.** Diagnostic showed `g` pinned at the 0.96
-fudge-factor ceiling for every component on the realistic miniscope
-fixture (true range 0.86–0.96). Smoothing in `C_raw` inflates the
-lag-1 autocorrelation, so Yule-Walker biases `g` upward, and the
-`fudge_factor=0.96` clamp then makes every neuron look like the
-slowest one. OASIS uses this for the AR(1) decay constraint.
+**Attempted.** Reordered `CNMFe.fit` so `compute_W` runs before AR
+estimation and ran Yule-Walker on the ring-subtracted projection
+`(A · Y_bg) / ‖a‖²`. Reverted: did not change `g` on the
+realistic-miniscope fixture.
 
-**What to change.** In `cnmfe/pipeline.py`, replace the
-`estimate_ar_params(C_raw[k], …)` call with one that runs on the
-*ring-subtracted projection* `(a · (Y - W·b0)) / ‖a‖²`. Requires
-the ring step (`compute_W`) to be moved before AR estimation (or
-estimate on the unsubtracted projection — the high-pass effect of
-the ring is what matters for the autocorrelation). Mirror the sn
-helper structure: a `_g_from_projection(a_k, Y, W, b0, …) → np.ndarray`.
+**Diagnostic.** Even the **IDEAL projection** `(a_true · Y) / ‖a_true‖²`
+gives `g ≈ 0.957` for every component (true range 0.90–0.93). Running
+Yule-Walker on `C_true` *directly* gives `g ≈ 0.87–0.91` — the
+correct band. So the input trace IS what biases the estimator; the
+ring just doesn't subtract enough.
+
+**Why.** The simulator's slow background is a random-walk smoothed
+with `bg_temporal_sigma=30` frames (5 components, summed) plus
+vignette·bleach modulation. The ring removes *local* slow modes
+inside a ~10-pixel radius; the simulator's slow modes span tens of
+pixels and survive the subtraction. Polynomial detrend
+(`ar_detrend_order=0..3`) doesn't catch them either — random walks
+aren't polynomial-shaped. Same with detrend on the projection trace.
+
+**What would actually work** (any one of):
+- **High-pass / rolling-window detrend** with window ≫ calcium tau
+  but ≪ drift correlation length (e.g. ~60 frames vs τ_cal ≈ 10).
+  Subtracts the large-scale slow drift while preserving transients.
+- **Decay-segment-only g estimator** — detect candidate transients,
+  fit g on inter-spike decay intervals (CaImAn's
+  `constrained_foopsi` path does this).
+- **Noise-constrained OASIS** (item #2 below) — sidesteps the issue:
+  with the correct sn budget, OASIS doesn't depend on a tight g.
 
 ## 2. CaImAn-style noise-constrained OASIS
 
