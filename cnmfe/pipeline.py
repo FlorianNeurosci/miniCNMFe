@@ -227,19 +227,21 @@ class CNMFeParams:
     # has lag-1 autocorrelation ≈ 1 and, when not detrended, pushes `g`
     # toward 1.0 — OASIS then explains the whole trace as one decaying tail
     # and the deconvolved C collapses to ~0 after the first transient.
-    # Default 2 absorbs linear and exponential-like drift (single
-    # photobleaching time constant) without eating the real AR(1) signal;
-    # order 3 starts to over-fit and bias g downward. Set 0 to recover
-    # standard CNMF-E (mean-only centring).
-    ar_detrend_order: int = 2
+    # Default 0 matches standard CNMF-E (mean-only centring). Set ≥1 when
+    # traces carry a slow bleach component (order 2 absorbs typical
+    # exponential photobleaching).
+    ar_detrend_order: int = 0
     # [NON-STANDARD] Polynomial order subtracted from each component's trace
     # `YrA[:,k]/nA[k] + C[k]` immediately before OASIS, inside the BCD loop.
     # Standard CNMF-E feeds OASIS the raw projection and lets OASIS fit a
     # single-scalar median baseline; that cannot track a long slow drift,
-    # so deconvolved spikes get suppressed. The drift naturally flows back
-    # into YrA so `C + YrA` still matches the projection. Default 2 (same
-    # rationale as `ar_detrend_order`); set 0 to recover standard CNMF-E.
-    temporal_detrend_order: int = 2
+    # so deconvolved spikes get suppressed. Set ≥1 to opt in. Default 0:
+    # on activity-rich recordings the least-squares polynomial gets pulled
+    # upward by the spike envelope, depressing the inter-spike baseline
+    # below truth so OASIS reconstructs inflated transients, and the BCD
+    # spatial update then propagates that distortion into A — visible as
+    # overshoot in `C + YrA` vs ground truth.
+    temporal_detrend_order: int = 0
 
     # --- Merging ---
     merge_thr_corr: float = 0.85

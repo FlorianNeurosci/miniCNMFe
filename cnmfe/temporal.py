@@ -46,14 +46,15 @@ def estimate_ar_params(
     noise_range: tuple[float, float] = (0.25, 0.5),
     fudge_factor: float = 0.96,
     lags: int = 5,
-    detrend_order: int = 2,
+    detrend_order: int = 0,
 ) -> tuple[np.ndarray, float]:
     """Estimate AR(p) decay constants and noise std from a fluorescence trace.
 
     Algorithm:
     1. Estimate noise via power in high-frequency bins (rfft).
-    2. Detrend the trace (polynomial of order ``detrend_order``) so a slow
-       bleach / scope-warmup trend does not inflate the autocorrelation.
+    2. Centre the trace (or detrend with a polynomial of order
+       ``detrend_order`` if a slow bleach / scope-warmup trend would
+       otherwise inflate the autocorrelation).
     3. Fit AR(p) by solving the Yule-Walker equations on the autocorrelation.
     4. Apply fudge_factor to prevent over-estimating the decay (slight bias).
 
@@ -64,12 +65,11 @@ def estimate_ar_params(
         fudge_factor: Shrinkage applied to g (< 1 avoids over-estimated decay).
         lags: Number of autocorrelation lags used.
         detrend_order: NON-STANDARD. Polynomial order subtracted from the trace
-            before Yule-Walker. ``0`` = mean only (standard CNMF-E). ``2``
-            (default) absorbs linear and exponential-like drift (typical
-            photobleaching) so the AR estimate reflects calcium dynamics and
-            not the bleach trajectory. Order 3+ starts to over-fit the AR(1)
-            envelope and biases g downward — empirically ``2`` is the sweet
-            spot on miniscope traces.
+            before Yule-Walker. ``0`` (default) = mean only (standard
+            CNMF-E). Set ``2`` to absorb linear and exponential-like drift
+            (typical photobleaching) so the AR estimate reflects calcium
+            dynamics and not the bleach trajectory. Order 3+ starts to
+            over-fit the AR(1) envelope and biases g downward.
 
     Returns:
         g: AR coefficients, shape (p,).

@@ -610,10 +610,14 @@ class TestGlobalBgRank1:
         from cnmfe.background import BackgroundSubtractor
 
         data = self._make_drifty_movie()
+        # Bleach scenario: opt in to the polynomial detrend so OASIS gets
+        # a clean baseline (the defaults are 0 because detrend overshoots
+        # on activity-rich data; bleach-heavy tests must enable it).
         params = CNMFeParams(
             sigma=3.0, min_corr=0.7, min_pnr=3.0,
             n_iter_main=2, n_iter_temporal=2,
             global_bg_rank=1,
+            ar_detrend_order=2, temporal_detrend_order=2,
         )
         model = CNMFe(params).fit(data["movie"], do_motion_correction=False)
 
