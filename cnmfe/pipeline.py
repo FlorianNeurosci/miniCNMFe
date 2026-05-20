@@ -774,7 +774,7 @@ class CNMFe:
         else:
             print("Running greedy CORR-PNR initialization...")
 
-        A, _, _, centers = greedy_corr_pnr(
+        A, C_init, C_raw_init, centers = greedy_corr_pnr(
             init_movie,
             sigma=p.sigma,
             min_corr=p.min_corr,
@@ -813,26 +813,40 @@ class CNMFe:
             Y_flat = make_2d(movie_arr)     # (H*W, T) view
         sn_flat = self.sn.ravel()           # (H*W,)
 
-        # Recover full-T temporal traces by projecting the full-resolution
-        # movie onto each footprint:
-        #     C[k, t] = (Y[:, t] @ A[:, k]) / ||A[:, k]||^2
-        # Greedy returned C at the strided resolution (stride > 1) or full T
-        # (stride == 1). Re-projecting at full T uniformly handles both.
+        # `C_init` / `C_raw_init` from greedy_corr_pnr are the per-pixel
+        # OLS-extracted traces at the seed pixels — narrow, mostly-clean
+        # traces (the seed pixel is, by construction, the local peak of
+        # CORR×PNR). They contain orders of magnitude less background
+        # contamination than the full-movie projection `(A.T @ Y) / ‖A‖²`,
+        # which polls every pixel in the footprint including the noisy
+        # halo. Phase D (commit 8a91b4e) replaced these with the projection
+        # to unify the strided init code path; on the realistic-miniscope
+        # fixture this dropped `r(C+YrA, truth)` from 0.87 to 0.18. Keep
+        # the strided projection ONLY when stride>1 (where greedy returned
+        # T_init traces, not full T); for stride==1 use greedy's traces
+        # directly.
         AA_init = (A.T @ A).toarray()
         nA_init = np.maximum(np.diag(AA_init), 1e-10).astype(np.float32)
-        if isinstance(Y_flat, np.ndarray):
-            YA_init = np.asarray(Y_flat.T @ A, dtype=np.float32)      # (T, K)
+        if init_stride > 1:
+            # Strided init returned T_init-length traces; we need full T,
+            # so re-project from the full-resolution movie.
+            if isinstance(Y_flat, np.ndarray):
+                YA_init = np.asarray(Y_flat.T @ A, dtype=np.float32)      # (T, K)
+            else:
+                # Streaming Y_flat.T @ A: sum pixel-batched contributions.
+                YA_init = np.zeros((T, A.shape[1]), dtype=np.float32)
+                A_csr = A.tocsr()
+                proj_batch = 4096
+                for s in range(0, H * W, proj_batch):
+                    e = min(s + proj_batch, H * W)
+                    Y_chunk = np.asarray(Y_flat[s:e], dtype=np.float32)
+                    YA_init += np.asarray(Y_chunk.T @ A_csr[s:e], dtype=np.float32)
+            C_raw = (YA_init / nA_init[None, :]).T.astype(np.float32)     # (K, T)
+            C = C_raw.copy()
         else:
-            # Streaming Y_flat.T @ A: sum pixel-batched contributions.
-            YA_init = np.zeros((T, A.shape[1]), dtype=np.float32)
-            A_csr = A.tocsr()
-            proj_batch = 4096
-            for s in range(0, H * W, proj_batch):
-                e = min(s + proj_batch, H * W)
-                Y_chunk = np.asarray(Y_flat[s:e], dtype=np.float32)
-                YA_init += np.asarray(Y_chunk.T @ A_csr[s:e], dtype=np.float32)
-        C_raw = (YA_init / nA_init[None, :]).T.astype(np.float32)     # (K, T)
-        C = C_raw.copy()
+            # stride==1: greedy already produced full-T per-pixel-OLS traces.
+            C_raw = C_raw_init.astype(np.float32)
+            C = C_init.astype(np.float32)
 
         # Estimate the AR coefficient `g` ONCE from the pooled raw traces.
         #

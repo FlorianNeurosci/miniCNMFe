@@ -357,13 +357,15 @@ def greedy_corr_pnr(
             C_raw_list.append(ci)
             centers_list.append((row, col))
 
-            # Subtract component from data. Use the raw trace `ci`, NOT the
-            # OASIS-deconvolved `c_clean`. OASIS smooths brief transients
-            # forward in time (the c[t] >= g*c[t-1] constraint), so subtracting
-            # c_clean leaves structured residuals at the spike locations and
-            # feeds halo-driven re-seeding. Subtracting ci is the faithful
-            # least-squares residual of the per-pixel OLS extraction.
-            sub = ai_patch[np.newaxis] * ci[:, np.newaxis, np.newaxis]       # (T, ph, pw)
+            # Subtract the OASIS-deconvolved trace `c_clean` (not the raw
+            # OLS trace `ci`). On the realistic-miniscope fixture, switching
+            # to `ci` (Phase D, commit 8a91b4e) dropped r(C+YrA, truth) from
+            # ~0.87 to ~0.18: the noisy raw trace contaminates the data when
+            # subtracted, so each subsequent seed's per-pixel OLS extracts a
+            # noisier footprint, and the final BCD inherits those degraded
+            # footprints. The original `c_clean` path keeps the residual
+            # clean enough that subsequent extractions stay faithful.
+            sub = ai_patch[np.newaxis] * c_clean[:, np.newaxis, np.newaxis]  # (T, ph, pw)
             data_raw[:, r0:r1, c0:c1] -= sub
             data_filtered[:, r0:r1, c0:c1] -= sub
 

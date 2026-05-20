@@ -18,6 +18,22 @@ independent noise — the standard CNMF assumption) and cheap.
 The items below were identified during the investigation but
 deferred to keep that fix tightly scoped.
 
+## 0. Rank-1 BG (`global_bg_rank=1`) fit broken after Phase-D revert
+
+After restoring greedy init's clean `c_clean` residual subtraction
+(commit pending) and using greedy's per-pixel-OLS `C` as the initial
+trace, the rank-1 BG alternating LS in `_fit_global_bg_rank1` no
+longer matches its calibrated amplitude. On the bleach-heavy
+fixture, `bf · f` now *increases* ring-residual variance instead of
+reducing it; `r(f, bleach)` drops from 0.94 to 0.27.
+
+The rank-1 feature is opt-in (default `global_bg_rank=0`), so the
+default path is unaffected. The regression test
+`test_bf_and_f_capture_real_rank1_structure` is marked xfail
+pending a recalibration of the alternating-LS update with the
+cleaner C as input. Likely needs a different normalisation in the
+`bf` / `f` updates, or a fundamentally different initialisation.
+
 ## 1. g estimation from the projected trace, not C_raw — TRIED, INSUFFICIENT
 
 **Attempted.** Reordered `CNMFe.fit` so `compute_W` runs before AR
