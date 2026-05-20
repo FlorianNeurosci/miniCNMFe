@@ -250,6 +250,17 @@ class CNMFeParams:
     ar_order: int = 1
     global_ar: bool = True  # True = one g estimated from pooled C_raw; False = per-neuron
     n_iter_temporal: int = 2
+    # [NON-STANDARD knob, standard *value*] Shrinkage on the Yule-Walker AR
+    # estimate. 0.96 is the historical CNMF-E default (Friedrich 2017) and
+    # avoids over-estimating the decay on clean traces. The downside: on
+    # data with slow-background contamination — *any* miniscope recording
+    # with photobleach or non-stationary neuropil — Yule-Walker over-shoots
+    # toward 1, and 0.96 clamps it there instead of correcting it. Drop to
+    # 0.90 for fast indicators (GCaMP6f, GCaMP8) on bleach-heavy recordings.
+    # Exposed per recording rather than tuned globally because the correct
+    # value depends on the indicator's true τ and the recording's drift
+    # characteristics, neither of which the algorithm can observe directly.
+    fudge_factor: float = 0.96
     # [NON-STANDARD] Polynomial order subtracted from each trace before the
     # Yule-Walker autocorrelation that estimates `g`. A slow bleach trend
     # has lag-1 autocorrelation ≈ 1 and, when not detrended, pushes `g`
@@ -846,6 +857,7 @@ class CNMFe:
                     C_raw.ravel().astype(np.float32),
                     p=p.ar_order,
                     detrend_order=p.ar_detrend_order,
+                    fudge_factor=p.fudge_factor,
                 )
             except Exception:
                 g_global = np.array([0.9 ** (1.0 / max(p.ar_order, 1))] * p.ar_order,
@@ -859,6 +871,7 @@ class CNMFe:
                     g_k, _ = estimate_ar_params(
                         C_raw[k], p=p.ar_order,
                         detrend_order=p.ar_detrend_order,
+                        fudge_factor=p.fudge_factor,
                     )
                 except Exception:
                     g_k = np.array([0.9 ** (1.0 / max(p.ar_order, 1))] * p.ar_order,
