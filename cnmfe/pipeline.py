@@ -43,6 +43,34 @@ def _zarr_store_path(arr) -> "str | None":
     return None
 
 
+def _sn_from_footprint(a_k, sn_flat: np.ndarray) -> float:
+    """Closed-form noise std of the projected trace ``(a · Y) / ‖a‖²``.
+
+    Assuming pixel noise is independent with per-pixel std ``sn_flat``
+    (the assumption already baked into ``compute_W`` and
+    ``update_spatial``), the projection is a fixed linear combination
+    of pixel traces, so its variance is
+
+        Var(proj) = (Σᵢ aᵢ² · sn_flat[i]²) / ‖a‖⁴
+        sn_k      = ‖a · sn_flat‖₂ / ‖a‖²
+
+    Used instead of ``estimate_ar_params(C_raw[k], ...)`` for the
+    per-component noise std at init — that path runs PSD on the
+    center-surround-filtered ``C_raw`` whose high-frequency content
+    has been smoothed out, returning a near-zero ``sn`` that drives
+    OASIS into collapse.
+    """
+    if sp.issparse(a_k):
+        a_k = a_k.toarray().ravel()
+    else:
+        a_k = np.asarray(a_k).ravel()
+    aa = float(a_k @ a_k)
+    if aa <= 0:
+        return 1.0
+    weighted = a_k.astype(np.float32) * sn_flat.astype(np.float32)
+    return float(np.sqrt(np.sum(weighted ** 2)) / aa)
+
+
 def _Y_times_vec(Y_flat, v, axis: int) -> np.ndarray:
     """Compute ``Y_flat @ v`` (axis=1, output shape (H*W,)) or ``Y_flat.T @ v``
     (axis=0, output shape (T,)) without materialising a zarr ``Y_flat`` in full.
@@ -824,27 +852,19 @@ class CNMFe:
                                     dtype=np.float32)
             for k in range(K_init):
                 g_per_k.append(g_global.copy())
-                try:
-                    _, sn_k = estimate_ar_params(
-                        C_raw[k], p=p.ar_order,
-                        detrend_order=p.ar_detrend_order,
-                    )
-                except Exception:
-                    sn_k = float(np.std(C_raw[k])) if np.std(C_raw[k]) > 0 else 1.0
-                sn_per_k[k] = sn_k
+                sn_per_k[k] = _sn_from_footprint(A[:, k], sn_flat)
         else:
             for k in range(K_init):
                 try:
-                    g_k, sn_k = estimate_ar_params(
+                    g_k, _ = estimate_ar_params(
                         C_raw[k], p=p.ar_order,
                         detrend_order=p.ar_detrend_order,
                     )
                 except Exception:
                     g_k = np.array([0.9 ** (1.0 / max(p.ar_order, 1))] * p.ar_order,
                                    dtype=np.float32)
-                    sn_k = float(np.std(C_raw[k])) if np.std(C_raw[k]) > 0 else 1.0
                 g_per_k.append(g_k)
-                sn_per_k[k] = sn_k
+                sn_per_k[k] = _sn_from_footprint(A[:, k], sn_flat)
 
         # --- Step 5: Initial ring background ---
         ring_radius = p.ring_size_factor * (2 * p.sigma + 1)

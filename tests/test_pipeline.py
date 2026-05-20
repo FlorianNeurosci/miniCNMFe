@@ -51,6 +51,50 @@ class TestCNMFePipeline:
         assert model.C is not None
         assert model.S is not None
 
+    def test_sn_per_k_uses_footprint_weighted_pixel_noise(self, synth_small):
+        """``model.sn_per_k`` must come from the closed-form footprint
+        weighting ``‖a · sn_flat‖ / ‖a‖²``, NOT from PSD of the smoothed
+        ``C_raw`` — the latter returns ~0 and collapses OASIS.
+
+        Regression for the sn-collapse bug surfaced on the realistic
+        miniscope fixture (see todo/temporal_followups.md).
+        """
+        movie = synth_small["movie"]
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.5, min_pnr=3.0,
+            n_iter_main=1, n_iter_temporal=1,
+        )
+        model = CNMFe(params).fit(movie, do_motion_correction=False)
+
+        if model.A.shape[1] == 0:
+            pytest.skip("No neurons found; thresholds too tight")
+
+        assert model.sn_per_k is not None
+        # All sn must be strictly positive — sn ≈ 0 is the collapse signature.
+        assert (model.sn_per_k > 1e-3).all(), (
+            f"sn_per_k has near-zero entries (OASIS-collapse risk): "
+            f"{model.sn_per_k}"
+        )
+        # Sanity check: stored sn should be in the same order of magnitude
+        # as the closed-form recomputation on the final A (footprints change
+        # between init — when sn was set — and end of fit, so exact equality
+        # is not expected; large discrepancies would indicate the formula
+        # was not used at all).
+        A_dense = np.asarray(model.A.todense()).astype(np.float32)
+        sn_flat = model.sn.ravel().astype(np.float32)
+        for k in range(A_dense.shape[1]):
+            a_k = A_dense[:, k]
+            aa = float(a_k @ a_k)
+            if aa <= 0:
+                continue
+            expected = float(np.sqrt(np.sum((a_k * sn_flat) ** 2)) / aa)
+            ratio = model.sn_per_k[k] / max(expected, 1e-12)
+            assert 0.25 < ratio < 4.0, (
+                f"sn_per_k[{k}]={model.sn_per_k[k]:.5f} vs footprint-formula "
+                f"{expected:.5f} (ratio={ratio:.2f}). Likely not using the "
+                f"footprint-weighted estimator at all."
+            )
+
     def test_output_shapes(self, synth_small):
         movie = synth_small["movie"]
         T, H, W = movie.shape
