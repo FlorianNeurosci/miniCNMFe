@@ -545,20 +545,20 @@ class TestCNMFePipeline:
         assert min(rs_proj) > 0.70, f"Min r(C+YrA) = {min(rs_proj):.3f}"
 
     def test_auto_evaluation_rejects_ghosts(self, synth):
-        """Loose init thresholds must not produce ghost components.
+        """Auto-evaluation mask must flag ghost components.
 
         Regression: with min_corr=0.7, min_pnr=3.0 on the 6-neuron synthetic
-        fixture the pipeline used to return ~26 components — 6 real neurons
+        fixture the pipeline produces ~26 raw components — 6 real neurons
         plus ~20 ghost components at scattered background-noise locations
-        7-26 px from any true neuron. Ghosts had tiny footprints (~11-29 px)
+        7-26 px from any true neuron. Ghosts have tiny footprints (~11-29 px)
         compared to real sigma=3 Gaussians (~130 px after threshold_footprint
-        at max_thr=0.1). The matching-based tests
-        (test_temporal_correlation_against_truth etc.) pair each *true*
-        neuron with its best estimate and so silently ignored the extras.
+        at max_thr=0.1).
 
-        Fix: the auto-evaluation step (cnmfe.evaluate.auto_evaluate_components,
-        called from CNMFe.fit after the BCD loop) drops components with fewer
-        than ceil(0.5*pi*sigma^2) pixels.
+        Auto-eval (cnmfe.evaluate.auto_evaluate_components, called from
+        CNMFe.fit after the BCD loop) flags such components on
+        ``model.accepted_mask`` so they can be filtered post-hoc. All
+        components remain on the model so the user can also inspect the
+        rejected ones.
         """
         params = CNMFeParams(
             sigma=3.0, min_corr=0.7, min_pnr=3.0,
@@ -567,20 +567,31 @@ class TestCNMFePipeline:
         model = CNMFe(params).fit(synth["movie"], do_motion_correction=False)
 
         K_true = synth["A_true"].shape[1]
-        K_recovered = model.A.shape[1]
 
-        # Pre-fix: K_recovered == 26 for K_true=6. Post-fix expectation: 6-7.
-        assert K_recovered <= K_true + 2, (
-            f"Over-detection: recovered {K_recovered} components for "
-            f"K_true={K_true} (pre-fix this was ~26 ghost-laden runs)."
+        assert model.accepted_mask is not None
+        assert model.accepted_mask.shape == (model.A.shape[1],)
+        assert model.accepted_mask.dtype == bool
+        assert model.eval_info is not None
+        for key in ("pixel_count", "snr_amp", "pixel_pass", "snr_pass"):
+            assert key in model.eval_info
+
+        n_accepted = int(model.accepted_mask.sum())
+        # Pre-mask: ~26 raw components for K_true=6. Mask should retain
+        # roughly the real neurons (6-7) and flag the rest as rejected.
+        assert n_accepted <= K_true + 2, (
+            f"Auto-eval mask did not catch ghosts: accepted {n_accepted} "
+            f"components for K_true={K_true} (raw K={model.A.shape[1]})."
         )
 
-        # Ghost rejection must not trade away real neurons.
-        matches = match_components(model.A, synth["A_true"])
+        # Ghost rejection must not trade away real neurons. Match against
+        # the accepted subset of A only — well-matched real neurons should
+        # all be among the accepted.
+        A_accepted = model.A[:, model.accepted_mask]
+        matches = match_components(A_accepted, synth["A_true"])
         well_matched = sum(1 for m in matches if m[2] > 0.7)
         assert well_matched == K_true, (
             f"Lost real neurons: only {well_matched}/{K_true} matched with "
-            f"spatial r > 0.7. Per-neuron r: "
+            f"spatial r > 0.7 among accepted components. Per-neuron r: "
             f"{[round(m[2], 3) for m in matches]}"
         )
 

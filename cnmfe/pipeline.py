@@ -144,12 +144,17 @@ class CNMFeParams:
     # slice. Standard CNMF-E uses tsub=1.
     bg_tsub: int = 5
 
-    # --- Auto evaluation (post-BCD quality filter) ---
+    # --- Auto evaluation (post-BCD quality tagging — non-destructive) ---
     # [NON-STANDARD] `min_pixel` above is reused as a hard floor on footprint extent.
     # `auto_eval_snr_amp_thr` is the threshold on the mean-amplitude SNR
     # mean(a^2) / mean(sn_pixel^2) — a scale-invariant check that catches
     # ghost components whose footprint sits at the pixel-noise floor.
-    # Set to 0 to disable. Standard CNMF-E has no comparable post-BCD quality filter.
+    # Components below this score (or below `min_pixel` non-zero pixels) are
+    # flagged in ``model.accepted_mask`` but are NOT removed from the model;
+    # filter post-hoc with ``model.A[:, model.accepted_mask]`` (and similarly
+    # for C, S, YrA, C_raw). Per-component stats live in ``model.eval_info``.
+    # Set to 0 to mark every component as accepted on the SNR check.
+    # Standard CNMF-E has no comparable post-BCD quality filter.
     auto_eval_snr_amp_thr: float = 3.0
 
     # --- Serialisation ---------------------------------------------------------
@@ -208,6 +213,8 @@ class CNMFe:
         self.g: list[np.ndarray] | None = None    # per-component AR coefs
         self.sn_per_k: np.ndarray | None = None   # per-component noise std
         self.mc_roi: "tuple[slice, slice] | None" = None  # ROI used for shift estimation
+        self.accepted_mask: np.ndarray | None = None    # (K,) bool — passed auto-eval
+        self.eval_info: dict | None = None              # full dict from auto_evaluate_components
 
     # ------------------------------------------------------------------
     # Convenience accessors
@@ -254,6 +261,8 @@ class CNMFe:
         - ``W.npz``        sparse CSR ring weights (when available)
         - ``g.npy``        ``(K, ar_order)`` stacked AR coefs (when available)
         - ``sn_per_k.npy`` ``(K,)`` per-component noise std (when available)
+        - ``accepted_mask.npy`` ``(K,)`` bool from auto-eval (when available)
+        - ``eval_info.npz`` per-component auto-eval stats (when available)
         - ``params.json``  the ``CNMFeParams`` dataclass
         - ``manifest.json`` non-parameter metadata: ``dims``, ``K``, ``T``.
 
@@ -284,6 +293,12 @@ class CNMFe:
             np.save(output_dir / "g.npy", np.stack(self.g))
         if self.sn_per_k is not None:
             np.save(output_dir / "sn_per_k.npy", self.sn_per_k)
+        if self.accepted_mask is not None:
+            np.save(output_dir / "accepted_mask.npy", self.accepted_mask)
+        if self.eval_info is not None:
+            # eval_info has arrays (pixel_count, snr_amp, pixel_pass, snr_pass)
+            # plus scalars (min_pixel, snr_amp_thr); npz stores both fine.
+            np.savez(output_dir / "eval_info.npz", **self.eval_info)
 
         self.params.to_json(output_dir / "params.json")
 
@@ -300,8 +315,9 @@ class CNMFe:
 
         All result attributes (``A``, ``C``, ``S``, ``YrA``, ``sn``, etc.)
         are restored. Optional files (``shifts``, ``b0``, ``W``, ``g``,
-        ``sn_per_k``, ``C_raw``) are loaded if present; otherwise the
-        corresponding attribute stays ``None``.
+        ``sn_per_k``, ``C_raw``, ``accepted_mask``, ``eval_info``) are
+        loaded if present; otherwise the corresponding attribute stays
+        ``None``.
         """
         output_dir = Path(output_dir)
         if not output_dir.is_dir():
@@ -334,6 +350,13 @@ class CNMFe:
             model.g = [g_arr[k] for k in range(g_arr.shape[0])]
         if (output_dir / "sn_per_k.npy").exists():
             model.sn_per_k = np.load(output_dir / "sn_per_k.npy")
+        if (output_dir / "accepted_mask.npy").exists():
+            model.accepted_mask = np.load(output_dir / "accepted_mask.npy")
+        if (output_dir / "eval_info.npz").exists():
+            with np.load(output_dir / "eval_info.npz") as f:
+                model.eval_info = {
+                    k: f[k].item() if f[k].ndim == 0 else f[k] for k in f.files
+                }
 
         return model
 
@@ -790,13 +813,18 @@ class CNMFe:
                 constrain_sum=p.ring_constrain_sum,
             )
 
-        # --- Step 7: Auto-evaluation ---
-        # Drop components failing per-component quality checks before the
-        # final deconvolution. Combines a hard pixel-count floor with a
-        # scale-invariant mean-amplitude SNR check (mean(a^2)/mean(sn^2));
-        # see cnmfe/evaluate.py for the rationale. Catches ghost components
-        # born from background-noise seeds under loose init thresholds —
-        # their footprints can be wide but are at the pixel-noise floor.
+        # --- Step 7: Auto-evaluation (informational, non-destructive) ---
+        # Tag components with per-component quality results, but do NOT drop
+        # them. Combines a pixel-count floor with a scale-invariant
+        # mean-amplitude SNR check (mean(a^2)/mean(sn^2)); see
+        # cnmfe/evaluate.py for the rationale. The mask catches ghost
+        # components born from background-noise seeds under loose init
+        # thresholds — their footprints can be wide but sit at the
+        # pixel-noise floor.
+        #
+        # All components are retained on the model. Callers can filter
+        # post-hoc via ``model.A[:, model.accepted_mask]`` (and likewise
+        # for C, S, YrA, C_raw, g, sn_per_k).
         if A.shape[1] > 0:
             keep, eval_info = auto_evaluate_components(
                 A,
@@ -804,28 +832,21 @@ class CNMFe:
                 min_pixel=p.min_pixel,
                 snr_amp_thr=p.auto_eval_snr_amp_thr,
             )
+            self.accepted_mask = keep
+            self.eval_info = eval_info
             n_drop = int((~keep).sum())
-            if n_drop:
-                K_before = A.shape[1]
-                keep_idx = np.where(keep)[0]
-                A = A[:, keep_idx]
-                C = C[keep_idx]
-                C_raw = C_raw[keep_idx]
-                g_per_k = [g_per_k[i] for i in keep_idx]
-                sn_per_k = sn_per_k[keep_idx]
-                n_px_fail = int((~eval_info["pixel_pass"]).sum())
-                n_snr_fail = int((~eval_info["snr_pass"]).sum())
-                print(
-                    f"Auto-evaluation: kept {A.shape[1]}/{K_before} "
-                    f"(rejected {n_drop}: {n_px_fail} fail pixel_count<{p.min_pixel}, "
-                    f"{n_snr_fail} fail snr_amp<{p.auto_eval_snr_amp_thr})."
-                )
-
-        if A.shape[1] == 0:
-            print("All components rejected by auto-evaluation.")
-            assert C_raw.shape[0] == A.shape[1], (
-                f"C_raw/A K mismatch: C_raw has {C_raw.shape[0]} rows, A has {A.shape[1]} cols"
+            n_px_fail = int((~eval_info["pixel_pass"]).sum())
+            n_snr_fail = int((~eval_info["snr_pass"]).sum())
+            print(
+                f"Auto-evaluation: {int(keep.sum())}/{A.shape[1]} accepted "
+                f"(flagged {n_drop}: {n_px_fail} fail pixel_count<{p.min_pixel}, "
+                f"{n_snr_fail} fail snr_amp<{p.auto_eval_snr_amp_thr}). "
+                f"All components retained; filter via model.accepted_mask."
             )
+        else:
+            # BCD ended with no surviving components — skip the final
+            # temporal pass + YrA recomputation, return empty arrays.
+            print("No components survived refinement.")
             self.A = A
             self.C = np.empty((0, T), dtype=np.float32)
             self.S = np.empty((0, T), dtype=np.float32)
