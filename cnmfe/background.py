@@ -607,6 +607,12 @@ class BackgroundSubtractor:
         Y_flat: (H*W, T) source movie. numpy array or zarr.Array.
         W: (H*W, H*W) sparse ring weight matrix.
         b0: (H*W,) per-pixel baseline.
+        bf, f: NON-STANDARD CNMF-E. Optional rank-1 temporal background
+            ``b_f · f(t)``: ``bf`` is ``(H*W,)`` and ``f`` is ``(T,)``. When
+            both are provided, ``slice`` and ``project_onto`` subtract
+            ``bf[:, None] · f[None, :]`` (in the appropriate projection) so
+            downstream consumers see the residual with this rank-1 background
+            also removed. Use with ``CNMFeParams.global_bg_rank=1``.
     """
 
     def __init__(
@@ -614,12 +620,18 @@ class BackgroundSubtractor:
         Y_flat: np.ndarray,
         W: sp.csr_matrix,
         b0: np.ndarray,
+        bf: "np.ndarray | None" = None,
+        f: "np.ndarray | None" = None,
     ) -> None:
         self.Y_flat = Y_flat
         self.W = W if sp.isspmatrix_csr(W) else W.tocsr()
         self.b0 = np.asarray(b0, dtype=np.float32)
         self.shape = (int(Y_flat.shape[0]), int(Y_flat.shape[1]))
         self.dtype = np.dtype(np.float32)
+        if (bf is None) != (f is None):
+            raise ValueError("BackgroundSubtractor: pass both `bf` and `f`, or neither")
+        self.bf = None if bf is None else np.asarray(bf, dtype=np.float32)
+        self.f = None if f is None else np.asarray(f, dtype=np.float32)
 
     def slice(self, start: int, end: int) -> np.ndarray:
         """Return ``Y_bg[start:end, :]`` as a fresh ``(end-start, T)`` array.
@@ -659,6 +671,9 @@ class BackgroundSubtractor:
         W_b0 = np.asarray(W_chunk @ self.b0, dtype=np.float32)
         out = Y_chunk - self.b0[start:end, None] - W_Y
         out += W_b0[:, None]
+        if self.bf is not None:
+            # Rank-1 temporal background: subtract bf[start:end, None] * f[None, :].
+            out -= self.bf[start:end, None] * self.f[None, :]
         return out
 
     def __getitem__(self, key) -> np.ndarray:
@@ -704,6 +719,11 @@ class BackgroundSubtractor:
             B = np.asarray((A_csr - WtA).toarray(), dtype=np.float32)  # (H*W, K)
             YA = np.asarray(self.Y_flat.T @ B, dtype=np.float32)        # (T, K)
             YA -= (self.b0 @ B).astype(np.float32)
+            if self.bf is not None:
+                # (bf · f).T @ A = f[:, None] · (bf @ A)[None, :]   — rank-1 in (T, K).
+                # Use A (not B) here: the rank-1 term sits *outside* (I − W).
+                bfA = np.asarray(self.bf @ A_csr, dtype=np.float32)     # (K,)
+                YA -= self.f[:, None] * bfA[None, :]
             return YA
 
         # Zarr / streaming path: per-pixel batches.

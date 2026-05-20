@@ -109,3 +109,126 @@ class TestUpdateTemporal:
             for k in range(C_new.shape[0])
         ]
         assert max(correlations) > 0.5, f"Best correlation = {max(correlations):.3f}"
+
+
+# ---------------------------------------------------------------------------
+# Drift-robustness (Fix 1 + Fix 2 from the plan)
+# ---------------------------------------------------------------------------
+
+class TestDriftRobustness:
+    """Slow drift inflates lag-1 autocorrelation; the detrend kwargs should
+    keep `g` close to truth (Fix 1) and let OASIS recover spike events
+    (Fix 2). These mirror the failure mode visible in tmp/deconv_real.png.
+    """
+
+    def test_estimate_ar_invariant_to_linear_drift(self):
+        """The cleanest invariant of the detrend fix: adding a linear drift
+        to a trace should NOT change the estimated `g` when detrending is on,
+        and SHOULD inflate `g` toward the fudge-factor ceiling (~0.96) when
+        detrending is off. This isolates the specific failure mode visible
+        in tmp/deconv_real.png (drift → over-estimated g → OASIS collapse).
+
+        Note: Yule-Walker on sparse-spike traces has its own intrinsic
+        downward bias; we therefore do NOT assert |g_est − g_true| < small
+        on the clean trace. The point of the test is the invariance under
+        an added drift, which is what the algorithm is designed to deliver.
+        """
+        T = 1500
+        g_true = 0.90
+        data = make_ar1_trace(T=T, g=g_true, sn=0.1, seed=3)
+        trace_clean = data["trace"]
+        trace_drifty = trace_clean + np.linspace(0.0, 30.0, T).astype(np.float32)
+
+        # Reference: g on the clean (no-drift) trace.
+        g_clean, _ = estimate_ar_params(trace_clean, p=1, detrend_order=0)
+        g_clean = float(g_clean[0])
+
+        # Without detrending: drift inflates g toward the fudge ceiling.
+        g_no, _ = estimate_ar_params(trace_drifty, p=1, detrend_order=0)
+        g_no = float(g_no[0])
+        assert g_no > 0.94, (
+            f"Drift should push g near the fudge ceiling (≈0.96) without "
+            f"detrending; got {g_no:.3f}"
+        )
+
+        # With detrending: g matches the clean-trace value within a tight
+        # band (linear ramp is exactly captured by a degree-≥1 polynomial,
+        # so the drifty estimate should be ≈ clean-trace estimate).
+        g_yes, _ = estimate_ar_params(trace_drifty, p=1, detrend_order=2)
+        g_yes = float(g_yes[0])
+        assert abs(g_yes - g_clean) < 0.01, (
+            f"Detrended g on drifty trace ({g_yes:.4f}) should match clean "
+            f"g ({g_clean:.4f}) within 0.01; got delta={g_yes - g_clean:+.4f}"
+        )
+        # And it must be much further from the no-detrend (inflated) value
+        # than from the clean reference.
+        assert abs(g_yes - g_clean) < 0.5 * abs(g_no - g_clean), (
+            f"Detrend should mostly cancel the drift inflation: "
+            f"g_no={g_no:.3f}, g_yes={g_yes:.3f}, g_clean={g_clean:.3f}"
+        )
+
+    def test_update_temporal_detrend_recovers_spikes(self):
+        """A trace = three sharp transients on top of an exponential bleach
+        should yield ~0 spikes when fed to OASIS raw (drift collapses the
+        deconvolution), and many spikes when fed via update_temporal's
+        detrend_order=3 path.
+
+        Setup: a 1-pixel "movie" with a single component whose footprint is a
+        single nonzero pixel; the projected trace is then exactly the data
+        for that pixel.
+        """
+        T = 800
+        rng = np.random.default_rng(11)
+        # Three sharp transients at known frames.
+        S_true = np.zeros(T, dtype=np.float32)
+        spike_frames = [200, 400, 600]
+        for t in spike_frames:
+            S_true[t] = 3.0
+        g = 0.92
+        C_clean = np.zeros(T, dtype=np.float32)
+        for t in range(1, T):
+            C_clean[t] = g * C_clean[t - 1] + S_true[t]
+        bleach = 8.0 * np.exp(-np.arange(T, dtype=np.float32) / 250.0)
+        noise = rng.standard_normal(T).astype(np.float32) * 0.2
+        trace = C_clean + bleach + noise
+
+        # 1-pixel × T "movie" with a single 1.0-weight footprint.
+        Y_flat = trace[None, :].astype(np.float32)               # (1, T)
+        A = sp.csc_matrix(np.ones((1, 1), dtype=np.float32))     # (1, 1)
+        C_init = np.zeros((1, T), dtype=np.float32)
+        sn = np.array([0.2], dtype=np.float32)
+        g_cached = [np.array([g], dtype=np.float32)]
+        sn_cached = np.array([0.2], dtype=np.float32)
+
+        # Without detrending.
+        _, S_no, _, _ = update_temporal(
+            Y_flat, A, C_init, sn,
+            ar_order=1, n_iter=2,
+            g_cached=g_cached, sn_cached=sn_cached,
+            detrend_order=0,
+        )
+        # With detrending.
+        _, S_yes, _, _ = update_temporal(
+            Y_flat, A, C_init.copy(), sn,
+            ar_order=1, n_iter=2,
+            g_cached=g_cached, sn_cached=sn_cached,
+            detrend_order=3,
+        )
+
+        # Count "real" spikes (S > 0.5) in a ±3-frame window around truth.
+        def hits(S):
+            return sum(
+                int(S[0, max(0, t - 3): t + 4].max() > 0.5)
+                for t in spike_frames
+            )
+
+        hits_no = hits(S_no)
+        hits_yes = hits(S_yes)
+        assert hits_yes >= 2, (
+            f"Expected ≥2 of 3 spikes recovered with detrend; got {hits_yes}. "
+            f"S_yes nonzero count: {int((S_yes > 0.5).sum())}"
+        )
+        assert hits_yes > hits_no, (
+            f"Detrended deconv must do strictly better than no-detrend. "
+            f"hits_yes={hits_yes}, hits_no={hits_no}"
+        )

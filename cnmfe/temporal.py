@@ -24,19 +24,38 @@ from cnmfe._utils import get_xp, to_numpy
 # AR parameter estimation
 # ---------------------------------------------------------------------------
 
+def _detrend_poly(x: np.ndarray, order: int) -> np.ndarray:
+    """Subtract a least-squares polynomial trend of given order from ``x``.
+
+    ``order == 0`` reduces to mean subtraction (degree-0 polynomial = constant).
+    Higher orders absorb linear, quadratic, etc. drift — useful before any
+    operation that interprets autocorrelation as calcium decay (a long slow
+    bleach trend has lag-1 autocorrelation near 1 and will dominate the
+    Yule-Walker solution if not removed).
+    """
+    if order <= 0:
+        return x - x.mean()
+    t = np.arange(len(x), dtype=np.float64)
+    coeffs = np.polyfit(t, x.astype(np.float64), int(order))
+    return (x.astype(np.float64) - np.polyval(coeffs, t)).astype(x.dtype, copy=False)
+
+
 def estimate_ar_params(
     trace: np.ndarray,
     p: int = 1,
     noise_range: tuple[float, float] = (0.25, 0.5),
     fudge_factor: float = 0.96,
     lags: int = 5,
+    detrend_order: int = 2,
 ) -> tuple[np.ndarray, float]:
     """Estimate AR(p) decay constants and noise std from a fluorescence trace.
 
     Algorithm:
     1. Estimate noise via power in high-frequency bins (rfft).
-    2. Fit AR(p) by solving the Yule-Walker equations on the autocorrelation.
-    3. Apply fudge_factor to prevent over-estimating the decay (slight bias).
+    2. Detrend the trace (polynomial of order ``detrend_order``) so a slow
+       bleach / scope-warmup trend does not inflate the autocorrelation.
+    3. Fit AR(p) by solving the Yule-Walker equations on the autocorrelation.
+    4. Apply fudge_factor to prevent over-estimating the decay (slight bias).
 
     Args:
         trace: (T,) fluorescence trace.
@@ -44,13 +63,21 @@ def estimate_ar_params(
         noise_range: Frequency band [f_low, f_high] * Nyquist for noise estimate.
         fudge_factor: Shrinkage applied to g (< 1 avoids over-estimated decay).
         lags: Number of autocorrelation lags used.
+        detrend_order: NON-STANDARD. Polynomial order subtracted from the trace
+            before Yule-Walker. ``0`` = mean only (standard CNMF-E). ``2``
+            (default) absorbs linear and exponential-like drift (typical
+            photobleaching) so the AR estimate reflects calcium dynamics and
+            not the bleach trajectory. Order 3+ starts to over-fit the AR(1)
+            envelope and biases g downward — empirically ``2`` is the sweet
+            spot on miniscope traces.
 
     Returns:
         g: AR coefficients, shape (p,).
         sn: Noise standard deviation.
     """
     T = len(trace)
-    # Noise via high-frequency PSD
+    # Noise via high-frequency PSD (operates on the raw trace — high-frequency
+    # bins are insensitive to slow drift, so no detrend is needed here).
     Xf = np.fft.rfft(trace)
     freqs = np.fft.rfftfreq(T)
     noise_mask = (freqs >= noise_range[0]) & (freqs <= noise_range[1])
@@ -59,8 +86,8 @@ def estimate_ar_params(
     psd = np.abs(Xf[noise_mask]) ** 2 / T * 2
     sn = float(np.sqrt(np.exp(np.log(psd + 1e-10).mean())))
 
-    # Yule-Walker: build autocorrelation matrix
-    trace_centered = trace - trace.mean()
+    # Yule-Walker on the *detrended* trace.
+    trace_centered = _detrend_poly(trace, detrend_order)
     ac = np.array([
         np.dot(trace_centered[: T - k], trace_centered[k:]) / (T - k)
         for k in range(lags + 1)
@@ -248,6 +275,7 @@ def update_temporal(
     g_cached: list[np.ndarray] | None = None,
     sn_cached: np.ndarray | None = None,
     deconvolve: bool = True,
+    detrend_order: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], np.ndarray]:
     """Refine temporal traces by block coordinate descent.
 
@@ -281,6 +309,13 @@ def update_temporal(
         device: 'cpu' or 'cuda'. GPU accelerates the (H*W × T) @ (H*W × K) projection.
         g_cached: Optional list of length K with pre-estimated AR coefs per component.
         sn_cached: Optional (K,) array of pre-estimated per-component noise std.
+        detrend_order: NON-STANDARD. Polynomial order subtracted from each
+            component's projected trace immediately before OASIS. ``0`` (default
+            here, but the pipeline passes ``CNMFeParams.temporal_detrend_order``)
+            disables the detrend and matches standard CNMF-E. Positive orders
+            strip slow drift so OASIS sees the calcium transients on a flat
+            baseline; the drift naturally flows into the residual YrA so the
+            noisy projection ``C + YrA`` is unchanged.
 
     Returns:
         C_new: (K, T) updated calcium traces.
@@ -337,7 +372,11 @@ def update_temporal(
             for k in range(K):
                 trace_k = (YrA[:, k] / nA[k] + C[k]).astype(np.float32)
                 if deconvolve:
-                    c_k, s_k = _deconvolve_with(trace_k, g_per_k[k], float(sn_per_k[k]))
+                    trace_for_oasis = (
+                        _detrend_poly(trace_k, detrend_order)
+                        if detrend_order > 0 else trace_k
+                    )
+                    c_k, s_k = _deconvolve_with(trace_for_oasis, g_per_k[k], float(sn_per_k[k]))
                 else:
                     c_k = np.maximum(trace_k, 0.0)
                     s_k = np.zeros_like(c_k)
@@ -360,9 +399,13 @@ def update_temporal(
                 # way -- the threads path doesn't make that worse.
                 # threadpool_limits caps inner BLAS to 1 so n_jobs worker
                 # threads x n_cores BLAS threads doesn't oversubscribe.
+                if detrend_order > 0:
+                    traces_for_oasis = [_detrend_poly(t, detrend_order) for t in traces]
+                else:
+                    traces_for_oasis = traces
                 with threadpool_limits(limits=1, user_api="blas"):
                     results = Parallel(n_jobs=n_jobs, prefer="threads")(
-                        delayed(_deconvolve_with)(traces[k], g_per_k[k], float(sn_per_k[k]))
+                        delayed(_deconvolve_with)(traces_for_oasis[k], g_per_k[k], float(sn_per_k[k]))
                         for k in range(K)
                     )
             else:

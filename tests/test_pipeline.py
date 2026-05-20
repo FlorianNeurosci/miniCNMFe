@@ -615,3 +615,94 @@ class TestCNMFePipeline:
 
         rs_proj = [pearson((model.C + model.YrA)[ke], synth["C_true"][kt]) for kt, ke in valid]
         assert np.mean(rs_proj) > 0.85, f"Mean r(C+YrA) per-neuron AR = {np.mean(rs_proj):.3f}"
+
+
+class TestGlobalBgRank1:
+    """Rank-1 global background (NON-STANDARD, opt-in) on a movie with strong
+    vignette × bleach. The simulator multiplies each pixel by vignette[i] *
+    bleach[t], so the residual after b0 subtraction has dominant rank-1
+    structure ``vignette[i] * baseline[i] * (bleach[t] - mean(bleach))``.
+    """
+
+    def _make_drifty_movie(self):
+        # Import inside the method so test collection doesn't fail if cv2 is
+        # missing on a future CI image.
+        from tests.miniscope_simulator import make_miniscope_movie
+        return make_miniscope_movie(
+            n_neurons=4, dims=(40, 40), T=400,
+            vignette_strength=0.6,           # strong vignette
+            photobleach_tau_factor=0.5,      # tau = 0.5 * T → ~2x intensity drop
+            seed=0,
+        )
+
+    def test_bf_and_f_capture_real_rank1_structure(self):
+        """After fit with global_bg_rank=1:
+        - shapes are correct,
+        - the temporal mode f(t) tracks the injected bleach trajectory,
+        - the rank-1 term explains a substantial fraction of the
+          ring-residual variance that the ring itself could not.
+
+        The variance check is the load-bearing one: it verifies the rank-1
+        model actually captures something the ring missed (rather than just
+        fitting noise). The bf-vs-vignette spatial correlation is NOT
+        asserted directly — after the ring subtracts local spatial structure,
+        what's left is the *deviation* of vignette·baseline from a
+        ring-smoothed version, which need not look like vignette pointwise.
+        """
+        from cnmfe.background import BackgroundSubtractor
+
+        data = self._make_drifty_movie()
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.7, min_pnr=3.0,
+            n_iter_main=2, n_iter_temporal=2,
+            global_bg_rank=1,
+        )
+        model = CNMFe(params).fit(data["movie"], do_motion_correction=False)
+
+        assert model.b_f is not None and model.f is not None, (
+            "global_bg_rank=1 must populate model.b_f and model.f"
+        )
+        H, W = data["dims"]
+        T = data["movie"].shape[0]
+        assert model.b_f.shape == (H * W,)
+        assert model.f.shape == (T,)
+
+        # f(t) should track the bleach trajectory (sign is arbitrary).
+        bleach_centered = data["bleach"] - data["bleach"].mean()
+        r_f = abs(np.corrcoef(model.f, bleach_centered)[0, 1])
+        assert r_f > 0.9, (
+            f"f(t) should track the bleach trajectory; got |r|={r_f:.3f}"
+        )
+
+        # Variance check: build Y_bg WITHOUT the rank-1 term and with it,
+        # then compare ring-residual variance. Use the model's own W/b0 so
+        # the comparison isolates the contribution of bf*f.
+        Y_flat = data["movie"].reshape(T, H * W).T.astype(np.float32)
+        bg_no_rank1 = BackgroundSubtractor(Y_flat, model.W, model.b0)
+        bg_rank1 = BackgroundSubtractor(
+            Y_flat, model.W, model.b0, bf=model.b_f, f=model.f,
+        )
+        # Sample a batch of pixels (full materialisation is unneeded for a
+        # variance comparison).
+        sl_no = bg_no_rank1[0:H * W]
+        sl_yes = bg_rank1[0:H * W]
+        var_no = float(sl_no.var())
+        var_yes = float(sl_yes.var())
+        assert var_yes < 0.7 * var_no, (
+            f"Rank-1 background should explain >30% of the ring-residual "
+            f"variance on a movie with strong bleach+vignette. "
+            f"var(ring only)={var_no:.4f}, var(ring+rank1)={var_yes:.4f}, "
+            f"ratio={var_yes / var_no:.3f}"
+        )
+
+    def test_global_bg_rank0_leaves_attrs_none(self):
+        """At the default flag value, b_f / f stay None and behaviour is
+        the same as before the feature existed."""
+        data = self._make_drifty_movie()
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.7, min_pnr=3.0,
+            n_iter_main=1, n_iter_temporal=1,
+            global_bg_rank=0,
+        )
+        model = CNMFe(params).fit(data["movie"], do_motion_correction=False)
+        assert model.b_f is None and model.f is None

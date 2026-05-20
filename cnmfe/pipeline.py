@@ -42,6 +42,107 @@ def _zarr_store_path(arr) -> "str | None":
             return str(val)
     return None
 
+
+def _Y_times_vec(Y_flat, v, axis: int) -> np.ndarray:
+    """Compute ``Y_flat @ v`` (axis=1, output shape (H*W,)) or ``Y_flat.T @ v``
+    (axis=0, output shape (T,)) without materialising a zarr ``Y_flat`` in full.
+    """
+    if isinstance(Y_flat, np.ndarray):
+        return (Y_flat @ v if axis == 1 else Y_flat.T @ v).astype(np.float32)
+    n_pix = int(Y_flat.shape[0])
+    T = int(Y_flat.shape[1])
+    batch = 4096
+    if axis == 1:
+        out = np.zeros(n_pix, dtype=np.float32)
+        for s in range(0, n_pix, batch):
+            e = min(s + batch, n_pix)
+            out[s:e] = np.asarray(Y_flat[s:e], dtype=np.float32) @ v
+        return out
+    out = np.zeros(T, dtype=np.float32)
+    for s in range(0, n_pix, batch):
+        e = min(s + batch, n_pix)
+        out += np.asarray(Y_flat[s:e], dtype=np.float32).T @ v[s:e]
+    return out
+
+
+def _fit_global_bg_rank1(
+    Y_flat,
+    A: "sp.csc_matrix",
+    C: np.ndarray,
+    W_mat: "sp.csr_matrix",
+    b0: np.ndarray,
+    bf: "np.ndarray | None",
+    f: "np.ndarray | None",
+    n_iter: int = 2,
+) -> "tuple[np.ndarray, np.ndarray]":
+    """Alternating LS for the rank-1 temporal background ``b_f · f(t)``.
+
+    Fits ``R ≈ b_f · f(t)`` where
+        R = (I − W)(Y − b0) − A C
+    is the ring-subtracted, neural-signal-subtracted residual. ``bf`` and ``f``
+    are unconstrained (drift can have either sign per pixel relative to b0);
+    standard CNMF non-negativity would force a monotonic-only background and
+    is not appropriate when modelling a *deviation* from b0.
+
+    On first call pass ``bf=None, f=None`` for init via the per-frame mean of
+    ``Y_bg``; subsequent calls warm-start from the previous values.
+
+    Algebra (avoids materialising R):
+
+        u  = (I − W^T) bf
+        f  = (Y^T u  −  u·b0  −  (bf·A) C) / (bf·bf)
+
+        v  = Y f − b0·(f.sum())
+        bf = ((I − W) v  −  A (C f)) / (f·f)
+
+    All terms use sparse matvec + dense matvec; cost per iteration is
+    O(H·W·T) (the ``Y @ f`` and ``Y.T @ u`` calls) plus O(H·W·K + K·T) for
+    the A/C terms. Streams cleanly on zarr Y_flat via ``_Y_times_vec``.
+    """
+    n_pix = int(Y_flat.shape[0])
+    T = int(Y_flat.shape[1])
+    A_csr = A.tocsr() if sp.issparse(A) else sp.csr_matrix(A)
+
+    if bf is None or f is None:
+        # Init: f_0 = per-frame mean of Y_bg (drift signal).
+        # mean_p (I-W)(Y-b0) = (1/HW) · (1 − W^T 1)^T · (Y − b0)
+        ones = np.ones(n_pix, dtype=np.float32) / float(n_pix)
+        u0 = ones - (W_mat.T @ ones)
+        f = _Y_times_vec(Y_flat, u0, axis=0) - float(u0 @ b0)
+        f = (f - f.mean()).astype(np.float32)
+        if not np.any(f):
+            return (np.zeros(n_pix, dtype=np.float32),
+                    np.zeros(T, dtype=np.float32))
+        # bf_0: LS projection of Y_bg onto f.
+        # bf = ((I-W)(Y - b0) f) / (f·f) — neural term skipped on init.
+        v = _Y_times_vec(Y_flat, f, axis=1) - b0 * float(f.sum())
+        bf = (v - (W_mat @ v)).astype(np.float32) / max(float(f @ f), 1e-10)
+
+    for _ in range(n_iter):
+        # Update f given bf
+        u = (bf - (W_mat.T @ bf)).astype(np.float32)
+        yTu = _Y_times_vec(Y_flat, u, axis=0)
+        ub0 = float(u @ b0)
+        if A_csr.shape[1] > 0:
+            bfA = np.asarray(bf @ A_csr, dtype=np.float32)
+            bfA_C = bfA @ C
+        else:
+            bfA_C = np.zeros(T, dtype=np.float32)
+        denom_f = max(float(bf @ bf), 1e-10)
+        f = ((yTu - ub0 - bfA_C) / denom_f).astype(np.float32)
+
+        # Update bf given f
+        v = _Y_times_vec(Y_flat, f, axis=1) - b0 * float(f.sum())
+        Iv_minus_Wv = v - (W_mat @ v)
+        if A_csr.shape[1] > 0:
+            ACf = np.asarray(A_csr @ (C @ f), dtype=np.float32)
+        else:
+            ACf = np.zeros(n_pix, dtype=np.float32)
+        denom_b = max(float(f @ f), 1e-10)
+        bf = ((Iv_minus_Wv - ACf) / denom_b).astype(np.float32)
+
+    return bf, f
+
 if TYPE_CHECKING:
     import zarr
 
@@ -104,6 +205,14 @@ class CNMFeParams:
     # unconstrained ridge LS (i.e. False). Negligible cost (one extra RHS in
     # the same per-pixel solve).
     ring_constrain_sum: bool = False
+    # [NON-STANDARD] Add a rank-1 temporal background ``b_f · f(t)`` on top of
+    # the ring (CNMF-style ``nb=1``). Captures *spatially-non-uniform* slow
+    # drift (vignetting-coupled photobleaching, scope warmup) that the ring
+    # cannot — the constrained ring only cancels spatially-uniform modes.
+    # ``0`` = standard CNMF-E (ring only). ``1`` = one rank-1 term, fit via
+    # alternating non-negative LS in each BCD iteration. Higher ranks are
+    # deferred — ``1`` covers the typical bleach pattern.
+    global_bg_rank: int = 0
 
     # --- Spatial update ---
     dilation_radius: int = 3
@@ -113,6 +222,24 @@ class CNMFeParams:
     ar_order: int = 1
     global_ar: bool = True  # True = one g estimated from pooled C_raw; False = per-neuron
     n_iter_temporal: int = 2
+    # [NON-STANDARD] Polynomial order subtracted from each trace before the
+    # Yule-Walker autocorrelation that estimates `g`. A slow bleach trend
+    # has lag-1 autocorrelation ≈ 1 and, when not detrended, pushes `g`
+    # toward 1.0 — OASIS then explains the whole trace as one decaying tail
+    # and the deconvolved C collapses to ~0 after the first transient.
+    # Default 2 absorbs linear and exponential-like drift (single
+    # photobleaching time constant) without eating the real AR(1) signal;
+    # order 3 starts to over-fit and bias g downward. Set 0 to recover
+    # standard CNMF-E (mean-only centring).
+    ar_detrend_order: int = 2
+    # [NON-STANDARD] Polynomial order subtracted from each component's trace
+    # `YrA[:,k]/nA[k] + C[k]` immediately before OASIS, inside the BCD loop.
+    # Standard CNMF-E feeds OASIS the raw projection and lets OASIS fit a
+    # single-scalar median baseline; that cannot track a long slow drift,
+    # so deconvolved spikes get suppressed. The drift naturally flows back
+    # into YrA so `C + YrA` still matches the projection. Default 2 (same
+    # rationale as `ar_detrend_order`); set 0 to recover standard CNMF-E.
+    temporal_detrend_order: int = 2
 
     # --- Merging ---
     merge_thr_corr: float = 0.85
@@ -207,6 +334,8 @@ class CNMFe:
         self.YrA: np.ndarray | None = None    # residual at each footprint; C + YrA = noisy projection
         self.W: sp.csr_matrix | None = None
         self.b0: np.ndarray | None = None
+        self.b_f: np.ndarray | None = None     # (H*W,) — rank-1 spatial bg
+        self.f: np.ndarray | None = None       # (T,)   — rank-1 temporal bg
         self.sn: np.ndarray | None = None
         self.shifts: np.ndarray | None = None
         self.dims: tuple[int, int] | None = None
@@ -287,6 +416,10 @@ class CNMFe:
             np.save(output_dir / "shifts.npy", self.shifts)
         if self.b0 is not None:
             np.save(output_dir / "b0.npy", self.b0)
+        if self.b_f is not None:
+            np.save(output_dir / "b_f.npy", self.b_f)
+        if self.f is not None:
+            np.save(output_dir / "f.npy", self.f)
         if self.W is not None:
             sp.save_npz(output_dir / "W.npz", self.W.tocsr())
         if self.g is not None and len(self.g) > 0:
@@ -343,6 +476,10 @@ class CNMFe:
             model.shifts = np.load(output_dir / "shifts.npy")
         if (output_dir / "b0.npy").exists():
             model.b0 = np.load(output_dir / "b0.npy")
+        if (output_dir / "b_f.npy").exists():
+            model.b_f = np.load(output_dir / "b_f.npy")
+        if (output_dir / "f.npy").exists():
+            model.f = np.load(output_dir / "f.npy")
         if (output_dir / "W.npz").exists():
             model.W = sp.load_npz(output_dir / "W.npz").tocsr()
         if (output_dir / "g.npy").exists():
@@ -675,21 +812,31 @@ class CNMFe:
 
         if p.global_ar:
             try:
-                g_global, _ = estimate_ar_params(C_raw.ravel().astype(np.float32), p=p.ar_order)
+                g_global, _ = estimate_ar_params(
+                    C_raw.ravel().astype(np.float32),
+                    p=p.ar_order,
+                    detrend_order=p.ar_detrend_order,
+                )
             except Exception:
                 g_global = np.array([0.9 ** (1.0 / max(p.ar_order, 1))] * p.ar_order,
                                     dtype=np.float32)
             for k in range(K_init):
                 g_per_k.append(g_global.copy())
                 try:
-                    _, sn_k = estimate_ar_params(C_raw[k], p=p.ar_order)
+                    _, sn_k = estimate_ar_params(
+                        C_raw[k], p=p.ar_order,
+                        detrend_order=p.ar_detrend_order,
+                    )
                 except Exception:
                     sn_k = float(np.std(C_raw[k])) if np.std(C_raw[k]) > 0 else 1.0
                 sn_per_k[k] = sn_k
         else:
             for k in range(K_init):
                 try:
-                    g_k, sn_k = estimate_ar_params(C_raw[k], p=p.ar_order)
+                    g_k, sn_k = estimate_ar_params(
+                        C_raw[k], p=p.ar_order,
+                        detrend_order=p.ar_detrend_order,
+                    )
                 except Exception:
                     g_k = np.array([0.9 ** (1.0 / max(p.ar_order, 1))] * p.ar_order,
                                    dtype=np.float32)
@@ -706,6 +853,15 @@ class CNMFe:
             tsub=p.bg_tsub,
             constrain_sum=p.ring_constrain_sum,
         )
+
+        # --- Step 5b: Rank-1 global background bf · f(t) (opt-in, NON-STANDARD) ---
+        bf: np.ndarray | None = None
+        f_bg: np.ndarray | None = None
+        if p.global_bg_rank == 1:
+            print("Fitting rank-1 global background b_f · f(t) (initial)...")
+            bf, f_bg = _fit_global_bg_rank1(
+                Y_flat, A, C, W_mat, b0, bf=None, f=None, n_iter=2,
+            )
 
         def _cache_after_merge(members_per_group: list[np.ndarray]) -> None:
             """Update g_per_k / sn_per_k after merge_components reorders K."""
@@ -748,7 +904,7 @@ class CNMFe:
                 if n_pre_merged:
                     print(f"  {A.shape[1]} components ({n_pre_merged} pre-merged).")
 
-            Y_bg = BackgroundSubtractor(Y_flat, W_mat, b0)  # lazy (H*W, T)
+            Y_bg = BackgroundSubtractor(Y_flat, W_mat, b0, bf=bf, f=f_bg)  # lazy (H*W, T)
 
             print("  Updating spatial footprints...")
             A = update_spatial(Y_bg, C, A, sn_flat, dims, p.dilation_radius, p.n_jobs, p.spatial_max_thr)
@@ -775,6 +931,7 @@ class CNMFe:
                 n_jobs=p.n_jobs, device=p.device,
                 g_cached=g_per_k, sn_cached=sn_per_k,
                 deconvolve=_deconvolve,
+                detrend_order=p.temporal_detrend_order,
             )
 
             print("  Merging correlated components...")
@@ -797,6 +954,7 @@ class CNMFe:
                     n_jobs=p.n_jobs, device=p.device,
                     g_cached=g_per_k, sn_cached=sn_per_k,
                     deconvolve=True,
+                    detrend_order=p.temporal_detrend_order,
                 )
             print(f"  {A.shape[1]} components ({n_merged} merged).")
 
@@ -812,6 +970,14 @@ class CNMFe:
                 W_cached=W_mat,
                 constrain_sum=p.ring_constrain_sum,
             )
+
+            # Refresh the rank-1 global background warm-started from the
+            # previous iteration's (bf, f). Two alternating-LS sweeps converge
+            # fast since A, C are nearly converged here.
+            if p.global_bg_rank == 1:
+                bf, f_bg = _fit_global_bg_rank1(
+                    Y_flat, A, C, W_mat, b0, bf=bf, f=f_bg, n_iter=2,
+                )
 
         # --- Step 7: Auto-evaluation (informational, non-destructive) ---
         # Tag components with per-component quality results, but do NOT drop
@@ -854,17 +1020,20 @@ class CNMFe:
             self.YrA = np.empty((0, T), dtype=np.float32)
             self.W = W_mat
             self.b0 = b0
+            self.b_f = bf
+            self.f = f_bg
             self.g = g_per_k
             self.sn_per_k = sn_per_k
             return self
 
         # Final deconvolution pass to get spike trains
         print("Final temporal update...")
-        Y_bg = BackgroundSubtractor(Y_flat, W_mat, b0)
+        Y_bg = BackgroundSubtractor(Y_flat, W_mat, b0, bf=bf, f=f_bg)
         C, S, g_per_k, sn_per_k = update_temporal(
             Y_bg, A, C, sn_flat, p.ar_order, p.n_iter_temporal,
             n_jobs=p.n_jobs, device=p.device,
             g_cached=g_per_k, sn_cached=sn_per_k,
+            detrend_order=p.temporal_detrend_order,
         )
 
         # Compute the residual projected onto each footprint:
@@ -890,6 +1059,8 @@ class CNMFe:
         self.YrA = YrA
         self.W = W_mat
         self.b0 = b0
+        self.b_f = bf
+        self.f = f_bg
         self.g = g_per_k
         self.sn_per_k = sn_per_k
         print(f"Done. Extracted {A.shape[1]} neurons.")
