@@ -110,68 +110,110 @@ def estimate_ar_params(
 # Deconvolution (OASIS with pure-Python AR1 fallback)
 # ---------------------------------------------------------------------------
 
-def _oasis_ar1_pava(y: np.ndarray, g: float, sn: float) -> tuple[np.ndarray, np.ndarray, float]:
-    """Pure-Python OASIS AR(1) deconvolution using the pool-adjacent violators algorithm.
+def _oasis_pava_run(y_bl: np.ndarray, g: float, lam: float) -> np.ndarray:
+    """One PAVA sweep with L1 penalty ``lam`` on the spike train.
 
-    Solves:  min_c  ||y - c||^2   s.t.  c[t] >= g * c[t-1],  c[t] >= 0
-    which is equivalent to constrained AR(1) deconvolution.
+    Minimises ``||y - c||² + lam · Σ s[t]`` subject to
+    ``c[t] >= g·c[t-1] >= 0`` (with ``s[t] = c[t] − g·c[t-1]``).
 
-    This is the PAVA (pool-adjacent-violators) implementation for the
-    non-negative constrained LS problem.
-
-    Returns:
-        c: Denoised calcium trace.
-        s: Spike train (s[t] = c[t] - g * c[t-1]).
-        bl: Estimated baseline.
+    Inside a pool the AR shape gives one spike at the start of value ``v``
+    (and zero spikes during the decay), so the per-pool LS objective is
+    minimised at ``v = max(0, (num − lam/2) / den)`` — the only change from
+    plain PAVA is the ``lam/2`` shrinkage.
     """
-    T = len(y)
-    # Estimate and subtract baseline
-    bl = float(np.median(y))
-    y_bl = (y - bl).astype(np.float64)
-
-    # PAVA pools
-    # Each pool i represents a segment [start_i, start_i + length_i)
-    # where the constrained optimal value is pool_val[i] = max(0, w[i] / v[i])
+    T = len(y_bl)
     pool_start = list(range(T))
     pool_length = [1] * T
-    pool_num = [y_bl[t] for t in range(T)]   # numerator  = sum of weighted y
-    pool_den = [1.0] * T                      # denominator = sum of weights
-    pool_val = [max(0.0, y_bl[t]) for t in range(T)]
+    pool_num = [float(y_bl[t]) for t in range(T)]
+    pool_den = [1.0] * T
+    pool_val = [max(0.0, float(y_bl[t]) - lam / 2) for t in range(T)]
 
-    def merge(i: int, j: int) -> None:
-        """Merge pool j into pool i."""
+    def merge(i: int) -> None:
         g_pow = g ** pool_length[i]
-        pool_num[i] += g_pow * pool_num[j]
-        pool_den[i] += (g_pow ** 2) * pool_den[j]
-        pool_length[i] += pool_length[j]
-        pool_val[i] = max(0.0, pool_num[i] / pool_den[i])
+        pool_num[i] += g_pow * pool_num[i + 1]
+        pool_den[i] += (g_pow ** 2) * pool_den[i + 1]
+        pool_length[i] += pool_length[i + 1]
+        pool_val[i] = max(0.0, (pool_num[i] - lam / 2) / pool_den[i])
 
     i = 0
     while i < len(pool_start) - 1:
-        # Check if constraint c[t] >= g * c[t-1] is violated between pools i and i+1
         if pool_val[i] * g > pool_val[i + 1]:
-            merge(i, i + 1)
+            merge(i)
             pool_start.pop(i + 1)
             pool_length.pop(i + 1)
             pool_num.pop(i + 1)
             pool_den.pop(i + 1)
             pool_val.pop(i + 1)
-            # Re-check previous merge
             if i > 0:
                 i -= 1
         else:
             i += 1
 
-    # Reconstruct c
     c = np.zeros(T, dtype=np.float64)
     for k in range(len(pool_start)):
-        start = pool_start[k]
-        length = pool_length[k]
-        val = pool_val[k]
-        for t in range(length):
-            c[start + t] = val * (g ** t)
+        start, length, val = pool_start[k], pool_length[k], pool_val[k]
+        c[start:start + length] = val * (g ** np.arange(length))
+    return c
 
-    # Spike train
+
+def _oasis_ar1_pava(y: np.ndarray, g: float, sn: float) -> tuple[np.ndarray, np.ndarray, float]:
+    """L1-penalised noise-constrained OASIS AR(1) deconvolution.
+
+    Solves
+        min_c  ‖y − c‖² + lam · Σ s[t]
+        s.t.   c[t] >= g·c[t-1],  c[t] >= 0,  s[t] = c[t] − g·c[t-1]
+
+    where ``lam`` is chosen by bisection to satisfy the noise constraint
+    ``‖y − c‖² ≈ T·sn²``. This is the constrained-foopsi form from
+    Friedrich et al. 2017 §2.1, implemented in pure Python so the
+    fallback doesn't silently degrade when the Cython `oasis-deconvolution`
+    package isn't installed.
+
+    Args:
+        y:  (T,) raw trace.
+        g:  AR(1) decay coefficient.
+        sn: per-component noise std (from the footprint-weighted formula
+            in ``pipeline._sn_from_footprint``). Setting ``sn <= 0`` runs
+            the unconstrained PAVA (legacy behaviour).
+
+    Returns:
+        c:  denoised calcium trace.
+        s:  spike train ``s[t] = c[t] − g·c[t-1]``.
+        bl: scalar baseline (median of y).
+    """
+    T = len(y)
+    bl = float(np.median(y))
+    y_bl = (y - bl).astype(np.float64)
+
+    if sn <= 0 or T < 2:
+        c = _oasis_pava_run(y_bl, g, 0.0)
+    else:
+        target = float(sn) ** 2 * T
+        # lam = 0: smallest residual (overfit). If it's already at/above
+        # the noise budget, no shrinkage needed.
+        c = _oasis_pava_run(y_bl, g, 0.0)
+        resid0 = float(np.sum((y_bl - c) ** 2))
+        if resid0 < target:
+            # Expand lam_hi until residual exceeds target, then bisect.
+            lam_hi = max(2.0 * float(sn), 1e-3)
+            for _ in range(20):
+                c_hi = _oasis_pava_run(y_bl, g, lam_hi)
+                if float(np.sum((y_bl - c_hi) ** 2)) >= target:
+                    break
+                lam_hi *= 2.0
+            lam_lo = 0.0
+            # 10 bisection iterations get ~3 decimal places of lam, plenty
+            # for the noise-budget match. Cost ≈ 10 PAVA sweeps per neuron.
+            for _ in range(10):
+                lam_mid = 0.5 * (lam_lo + lam_hi)
+                c_mid = _oasis_pava_run(y_bl, g, lam_mid)
+                if float(np.sum((y_bl - c_mid) ** 2)) < target:
+                    lam_lo = lam_mid
+                else:
+                    lam_hi = lam_mid
+            # Use lam_hi (residual >= target ⇒ within budget).
+            c = _oasis_pava_run(y_bl, g, lam_hi)
+
     s = np.zeros(T, dtype=np.float64)
     s[0] = c[0]
     s[1:] = np.maximum(c[1:] - g * c[:-1], 0)

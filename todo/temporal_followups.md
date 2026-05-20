@@ -49,19 +49,30 @@ aren't polynomial-shaped. Same with detrend on the projection trace.
 - **Noise-constrained OASIS** (item #2 below) — sidesteps the issue:
   with the correct sn budget, OASIS doesn't depend on a tight g.
 
-## 2. CaImAn-style noise-constrained OASIS
+## 2. ~~CaImAn-style noise-constrained OASIS~~ — DONE (in the fallback)
 
-**Why it matters.** Our current OASIS (in `cnmfe/temporal.py`) uses a
-ridge-style shrinkage penalty. CaImAn uses
-`constrained_foopsi`/`oasisAR1` with an explicit per-component noise
-*budget* (the residual variance must equal `sn²`). The constrained
-form is provably consistent and avoids both collapse and overfit
-without param tuning. Likely the cleanest long-term fix.
+**What was wrong.** The pure-Python `_oasis_ar1_pava` fallback accepted
+`sn` in its signature but never referenced it — it was plain isotonic
+LS under the AR constraint, no noise budget, no L1 penalty. With
+`oasis-deconvolution` not installed in `claude_cnmfe` (the PyPI name
+doesn't resolve, and the GitHub install is blocked by the auto-mode
+classifier), every deconv call had silently been falling back to that
+unconstrained PAVA — which is why the sn fix from commit `4831330`
+had no visible effect on `model.C`.
 
-**What to change.** Replace `_deconvolve_with` in `cnmfe/temporal.py`
-with the noise-constrained OASIS solver from `oasis-deconvolution`'s
-`foopsi` family. Keep the same return signature `(c, s)` so
-`update_temporal` is untouched.
+**Fix.** Rewrote `_oasis_ar1_pava` as constrained foopsi (Friedrich
+2017 §2.1): minimise `‖y − c‖² + lam·Σ s[t]` subject to the AR
+constraint, with `lam` chosen by bisection so the residual variance
+matches `T · sn²`. Pure Python, no new deps. The pool-value update
+is `max(0, (num − lam/2) / den)` — only change from plain PAVA is the
+`lam/2` shrinkage. Bisection runs ~10 PAVA sweeps per neuron.
+
+**End-to-end effect (realistic miniscope fixture).** With the L1 fix
+plus correct `sn` (commit 4831330), `r(C, truth)` rises from 0.02 to
+0.08 with the wrong g, and to ~0.15 if `fudge_factor` is also lowered
+(item #1). The realistic fixture's ideal-projection ceiling is
+`r ≈ 0.20` (item #4) — most of the remaining gap is data-quality, not
+algorithmic.
 
 ## 3. Robust (spike-aware) detrend → raise the detrend defaults
 
