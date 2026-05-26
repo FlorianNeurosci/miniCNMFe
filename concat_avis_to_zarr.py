@@ -16,10 +16,21 @@ with lossless blosc lz4+bitshuffle compression. Use --dtype float32 for
 float-valued intermediates.
 It can be opened lazily with  cnmfe.io.open_zarr(output_path).
 
+Optional inline downsampling (``--ssub`` / ``--tsub``) bins the frames as they
+are decoded, so the *only* zarr written is the (downsampled) output — no
+intermediate full-resolution store. Spatial binning is a block-mean over
+``ssub×ssub`` pixel blocks; temporal binning averages ``tsub`` consecutive
+frames. Temporal grouping is **per file** (a bin never spans two AVIs; the
+trailing ``< tsub`` frames of each file are dropped). Binned means are
+fractional — pass ``--dtype float32`` to keep that precision (uint8 would
+round each averaged pixel).
+
 Programmatic use:
     from concat_avis_to_zarr import concat_avis_to_zarr
     z = concat_avis_to_zarr(folder, output_path="session.zarr",
                             pattern="*.avi", skip_if_exists=True)
+    # Single-pass downsample-on-write (e.g. 2x spatial, 2x temporal):
+    z = concat_avis_to_zarr(folder, "ds.zarr", ssub=2, tsub=2, dtype="float32")
 """
 
 from __future__ import annotations
@@ -76,6 +87,45 @@ def _numeric_key(path: Path) -> int:
     return int(m.group()) if m else -1
 
 
+def _spatial_bin(frame: np.ndarray, ssub: int) -> np.ndarray:
+    """Block-mean a single (H, W) frame by ``ssub`` -> (H//ssub, W//ssub) float32.
+
+    Trailing rows/cols that don't fill a full ``ssub×ssub`` block are dropped.
+    Grayscale (2-D) only — inline downsampling requires ``grayscale=True``.
+    """
+    H, W = frame.shape[0], frame.shape[1]
+    Hu, Wu = (H // ssub) * ssub, (W // ssub) * ssub
+    f = frame[:Hu, :Wu].astype(np.float32)
+    return f.reshape(Hu // ssub, ssub, Wu // ssub, ssub).mean(axis=(1, 3))
+
+
+def _binned_file_frames(raw_iter, ssub: int, tsub: int):
+    """Yield (spatially + temporally) binned output frames for ONE file.
+
+    Temporal grouping is per call (per file): ``tsub`` consecutive frames are
+    averaged into one output frame, and the trailing ``< tsub`` frames are
+    dropped. With ``ssub == tsub == 1`` this is a passthrough.
+    """
+    tacc = None
+    tfill = 0
+    for fr in raw_iter:
+        if ssub > 1:
+            fr = _spatial_bin(fr, ssub)
+        if tsub > 1:
+            if tacc is None:
+                tacc = np.zeros(fr.shape, dtype=np.float32)
+                tfill = 0
+            tacc += fr
+            tfill += 1
+            if tfill < tsub:
+                continue
+            yield tacc / tsub
+            tacc = None
+            tfill = 0
+        else:
+            yield fr
+
+
 # ---------------------------------------------------------------------------
 # Parallel decode pipeline (n_jobs >= 2)
 # ---------------------------------------------------------------------------
@@ -88,6 +138,8 @@ def _decode_avi_worker(
     grayscale: bool,
     grayscale_method: str,
     dtype: str,
+    ssub: int,
+    tsub: int,
     out_q: "queue.Queue",
     errors: list,
     stop_event: threading.Event,
@@ -99,8 +151,13 @@ def _decode_avi_worker(
     the absolute `start` index carried by each batch lets the writer place
     them correctly when batches from different files arrive interleaved.
 
+    When ``ssub`` / ``tsub`` > 1 frames are binned inline (block-mean) before
+    buffering, so ``start_offset`` and every emitted index are in OUTPUT
+    (downsampled) frame coordinates. Temporal grouping is per file — the
+    trailing ``< tsub`` frames are dropped.
+
     ``start_offset`` is the file's exact absolute position in the output
-    zarr, computed by the caller from the pre-scan frame counts.
+    zarr, computed by the caller from the (downsampled) pre-scan frame counts.
 
     On any exception, the exception is appended to `errors`, `stop_event`
     is set, and a `_DECODER_DONE` sentinel is sent so the writer can
@@ -116,9 +173,12 @@ def _decode_avi_worker(
         import av  # pyav
 
         # batch buffer + how many frames have been written into it
-        buf = None       # lazy-allocated once we know H, W
+        buf = None       # lazy-allocated once we know the (binned) frame shape
         fill = 0
         cur_start = start_offset
+        # Temporal-bin accumulator (per file): sum of the current group.
+        tacc = None
+        tfill = 0
 
         container = av.open(str(path))
         try:
@@ -139,9 +199,27 @@ def _decode_avi_worker(
                 else:
                     arr = frame.to_ndarray(format="rgb24")   # keep RGB
 
+                # Inline downsample (block-mean). `out_arr` is the frame to
+                # buffer, or we `continue` while a temporal group still fills.
+                if ssub > 1:
+                    arr = _spatial_bin(arr, ssub)
+                if tsub > 1:
+                    if tacc is None:
+                        tacc = np.zeros(arr.shape, dtype=np.float32)
+                        tfill = 0
+                    tacc += arr
+                    tfill += 1
+                    if tfill < tsub:
+                        continue
+                    out_arr = tacc / tsub
+                    tacc = None
+                    tfill = 0
+                else:
+                    out_arr = arr
+
                 if buf is None:
-                    buf = np.empty((chunk_t,) + arr.shape, dtype=dtype)
-                buf[fill] = arr
+                    buf = np.empty((chunk_t,) + out_arr.shape, dtype=dtype)
+                buf[fill] = out_arr
                 fill += 1
 
                 if fill == chunk_t:
@@ -206,6 +284,8 @@ def concat_avis_to_zarr(
     verbose: bool = True,
     clevel: int = 3,
     shuffle: str = "shuffle",
+    ssub: int = 1,
+    tsub: int = 1,
 ):
     """Concatenate numbered AVIs in `folder` into a single time-chunked zarr.
 
@@ -263,9 +343,18 @@ def concat_avis_to_zarr(
         shuffle: blosc shuffle filter — ``"shuffle"`` (byte, default;
             fast), ``"bitshuffle"`` (slower, ~10 % smaller), or
             ``"noshuffle"``.
+        ssub: Spatial bin factor (block-mean over ``ssub×ssub`` pixels).
+            ``1`` (default) = no spatial downsampling. Requires ``grayscale``.
+        tsub: Temporal bin factor (mean of ``tsub`` consecutive frames).
+            ``1`` (default) = no temporal downsampling. Binning is **per file**
+            — a group never spans two AVIs, and each file's trailing
+            ``< tsub`` frames are dropped, so the output frame count is
+            ``sum(n_i // tsub)``. Pass ``dtype="float32"`` to keep the
+            fractional precision of the binned means.
 
     Returns:
-        Open zarr.Array with shape (T_total, H, W).
+        Open zarr.Array with shape (T_out, H//ssub, W//ssub), where
+        ``T_out == sum(n_i // tsub)`` (``== T_total`` when ``tsub == 1``).
 
     Raises:
         FileNotFoundError: `folder` is not a directory.
@@ -280,6 +369,10 @@ def concat_avis_to_zarr(
         raise ValueError(
             f"grayscale_method must be 'luma' or 'mean', got {grayscale_method!r}"
         )
+    if ssub < 1 or tsub < 1:
+        raise ValueError(f"ssub and tsub must be >= 1 (got {ssub}, {tsub})")
+    if (ssub > 1 or tsub > 1) and not grayscale:
+        raise ValueError("inline downsampling (ssub/tsub > 1) requires grayscale=True")
     folder = Path(folder).resolve()
     if not folder.is_dir():
         raise FileNotFoundError(f"Not a directory: {folder}")
@@ -335,16 +428,26 @@ def concat_avis_to_zarr(
         if verbose:
             print(f"  {avi.name}: {n} frames  ({H}x{W})", flush=True)
     T_total = sum(counts)
+    # Per-file OUTPUT counts after (optional) temporal binning, and the
+    # downsampled spatial dims. Binning is per file, so the output frame
+    # count is sum(n_i // tsub) — the trailing < tsub frames of each file
+    # are dropped.
+    out_counts = [c // tsub for c in counts] if tsub > 1 else list(counts)
+    T_out = int(sum(out_counts))
+    out_H, out_W = ref_H // ssub, ref_W // ssub
     if verbose:
         print(f"\nTotal: {T_total} frames  x  {ref_H}x{ref_W} px")
+        if ssub > 1 or tsub > 1:
+            print(f"Downsample ssub={ssub} tsub={tsub} -> "
+                  f"{T_out} frames  x  {out_H}x{out_W} px")
     _probe_secs = _time.time() - _t0_probe
 
     # --- Create zarr --------------------------------------------------------
     _t0_create = _time.time()
     from cnmfe.io import _open_array
     store = _open_array(out_path, "w",
-                        shape=(T_total, ref_H, ref_W),
-                        chunks=(chunk_t, ref_H, ref_W),
+                        shape=(T_out, out_H, out_W),
+                        chunks=(min(chunk_t, T_out), out_H, out_W),
                         dtype=dtype,
                         compression=True,
                         clevel=clevel,
@@ -367,20 +470,20 @@ def concat_avis_to_zarr(
     if n_jobs == 1:
         write_start = _run_serial(
             avis, counts, store, chunk_t, dtype, grayscale, grayscale_method,
-            verbose,
+            ssub, tsub, verbose,
         )
     else:
         if queue_maxsize is None:
             queue_maxsize = 2 * n_jobs
         write_start = _run_parallel(
-            avis, counts, store, chunk_t, dtype, grayscale, grayscale_method,
-            n_jobs, queue_maxsize, verbose,
+            avis, out_counts, store, chunk_t, dtype, grayscale, grayscale_method,
+            ssub, tsub, n_jobs, queue_maxsize, verbose,
         )
     _decode_secs = _time.time() - _t0_decode
 
     if verbose:
         total_secs = _time.time() - _t0_total
-        bytes_total = T_total * ref_H * ref_W * np.dtype(dtype).itemsize
+        bytes_total = T_out * out_H * out_W * np.dtype(dtype).itemsize
         gbps = bytes_total / max(total_secs, 1e-3) / 1e9
         print(f"\nDone. Zarr written to: {out_path}")
         print(f"  Total frames written: {write_start}")
@@ -398,11 +501,14 @@ def concat_avis_to_zarr(
 # ---------------------------------------------------------------------------
 
 def _run_serial(avis, counts, store, chunk_t, dtype, grayscale,
-                grayscale_method, verbose) -> int:
+                grayscale_method, ssub, tsub, verbose) -> int:
     """Single-threaded path: same loop as before, plus the luma fast-path.
 
     Kept as a verbatim alternative to the parallel pipeline for debugging
-    and test reproducibility.
+    and test reproducibility. Inline downsampling (``ssub`` / ``tsub``) is
+    applied per file via ``_binned_file_frames``; the chunk buffer may still
+    span file boundaries (write granularity only), but temporal groups never
+    do. ``counts`` are raw per-file frame counts, used only for the log line.
     """
     write_start = 0
     buf: list[np.ndarray] = []
@@ -418,56 +524,61 @@ def _run_serial(avis, counts, store, chunk_t, dtype, grayscale,
     # Luma fast-path: use the same direct-to-gray8 decoder as the parallel
     # path so serial output is byte-equal to parallel output. "mean" falls
     # back to the imageio iterator (historical behaviour).
-    if grayscale and grayscale_method == "luma":
+    use_luma = grayscale and grayscale_method == "luma"
+    if use_luma:
         import av
-        for avi_idx, avi in enumerate(avis):
-            if verbose:
-                print(f"  [{avi_idx + 1}/{len(avis)}] {avi.name} ...",
-                      end=" ", flush=True)
+
+    for avi_idx, avi in enumerate(avis):
+        if verbose:
+            print(f"  [{avi_idx + 1}/{len(avis)}] {avi.name} ...",
+                  end=" ", flush=True)
+        if use_luma:
             container = av.open(str(avi))
             try:
                 stream = container.streams.video[0]
                 stream.thread_type = "FRAME"
-                for frame in container.decode(stream):
-                    buf.append(frame.to_ndarray(format="gray8"))
+                raw_iter = (frame.to_ndarray(format="gray8")
+                            for frame in container.decode(stream))
+                for out_fr in _binned_file_frames(raw_iter, ssub, tsub):
+                    buf.append(out_fr)
                     if len(buf) == chunk_t:
                         write_start = _flush(buf, write_start)
                         buf = []
             finally:
                 container.close()
-            if verbose:
-                print(f"{counts[avi_idx]} frames", flush=True)
-    else:
-        for avi_idx, avi in enumerate(avis):
-            if verbose:
-                print(f"  [{avi_idx + 1}/{len(avis)}] {avi.name} ...",
-                      end=" ", flush=True)
-            for frame in _iter_frames(avi, grayscale=grayscale):
-                buf.append(frame)
+        else:
+            raw_iter = _iter_frames(avi, grayscale=grayscale)
+            for out_fr in _binned_file_frames(raw_iter, ssub, tsub):
+                buf.append(out_fr)
                 if len(buf) == chunk_t:
                     write_start = _flush(buf, write_start)
                     buf = []
-            if verbose:
-                print(f"{counts[avi_idx]} frames", flush=True)
+        if verbose:
+            print(f"{counts[avi_idx]} frames", flush=True)
 
     write_start = _flush(buf, write_start)
     return write_start
 
 
-def _run_parallel(avis, counts, store, chunk_t, dtype, grayscale,
-                  grayscale_method, n_jobs, queue_maxsize, verbose) -> int:
+def _run_parallel(avis, out_counts, store, chunk_t, dtype, grayscale,
+                  grayscale_method, ssub, tsub, n_jobs, queue_maxsize,
+                  verbose) -> int:
     """Producer-consumer parallel pipeline.
 
     Spawns up to `n_jobs` decoder threads (one per AVI, capped at `n_jobs`
     in flight) and one writer thread. Frame batches travel through a
     bounded `queue.Queue` so RAM is `O(queue_maxsize * chunk_t * H * W)`.
+
+    ``out_counts`` are the per-file OUTPUT frame counts (``count // tsub``
+    when temporal binning, else raw counts); offsets and the progress total
+    are derived from them so writes land at the right downsampled positions.
     """
     out_q: "queue.Queue" = queue.Queue(maxsize=queue_maxsize)
     errors: list = []
     stop_event = threading.Event()
 
-    # Compute each AVI's absolute frame offset from the pre-scan counts.
-    offsets = np.concatenate([[0], np.cumsum(counts[:-1])]).tolist()
+    # Each AVI's absolute OUTPUT-frame offset from the (downsampled) counts.
+    offsets = np.concatenate([[0], np.cumsum(out_counts[:-1])]).astype(int).tolist()
 
     # Spawn decoders. We cap concurrent threads at n_jobs by spawning in
     # batches; a simple Semaphore controls admission. For typical sessions
@@ -479,11 +590,11 @@ def _run_parallel(avis, counts, store, chunk_t, dtype, grayscale,
             _decode_avi_worker(*args)
 
     decoder_threads: list[threading.Thread] = []
-    for i, (path, count, offset) in enumerate(zip(avis, counts, offsets)):
+    for i, (path, offset) in enumerate(zip(avis, offsets)):
         t = threading.Thread(
             target=_decode_with_admission,
             args=(path, i, offset, chunk_t, grayscale, grayscale_method,
-                  dtype, out_q, errors, stop_event),
+                  dtype, ssub, tsub, out_q, errors, stop_event),
             name=f"decoder-{i}-{path.name}",
             daemon=True,
         )
@@ -492,7 +603,7 @@ def _run_parallel(avis, counts, store, chunk_t, dtype, grayscale,
 
     # Run the writer on the main thread (no extra thread needed; cleaner
     # exception propagation). Use tqdm for a frames-written progress bar.
-    T_total = int(sum(counts))
+    T_total = int(sum(out_counts))
     if verbose:
         try:
             from tqdm import tqdm
@@ -550,6 +661,10 @@ def main() -> None:
                         default="shuffle",
                         help="blosc shuffle filter (default: 'shuffle' = byte "
                              "shuffle, fast)")
+    parser.add_argument("--ssub", type=int, default=1,
+                        help="Spatial bin factor, block-mean (default: 1 = none)")
+    parser.add_argument("--tsub", type=int, default=1,
+                        help="Temporal bin factor, per-file mean (default: 1 = none)")
     args = parser.parse_args()
 
     try:
@@ -566,6 +681,8 @@ def main() -> None:
             queue_maxsize=args.queue_maxsize,
             clevel=args.clevel,
             shuffle=args.shuffle,
+            ssub=args.ssub,
+            tsub=args.tsub,
             verbose=True,
         )
     except (FileNotFoundError, ValueError, FileExistsError) as exc:

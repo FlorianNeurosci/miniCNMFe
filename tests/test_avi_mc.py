@@ -284,3 +284,49 @@ class TestFitMcFromAvisWrapper:
         assert np.array_equal(model.shifts, shifts)
         assert model.dims == (24, 24)
         assert mc_zarr.shape == (30, 24, 24)
+
+
+class TestFusedDownsampling:
+    """The fused path bins frames inline (before MC), so a downsampled run is
+    still a single write — only the downsampled mc.zarr is produced."""
+
+    def test_downsampled_shape_dtype_and_shifts(self, tmp_path):
+        src = tmp_path / "session"
+        _make_session(src, n_files=3, T=15, H=32, W=32)
+        # Downscaled params: max_shift (4,4) -> (2,2), gSig_filt 2 -> 1.
+        params = _params(H=32).downscaled(ssub=2, tsub=3)
+        mc_zarr, shifts = concat_avis_to_mc_zarr(
+            src, tmp_path / "mc.zarr", params,
+            ssub=2, tsub=3, n_jobs=2, n_template_avis=3, verbose=False,
+        )
+        # per file 15 // 3 = 5 output frames; 3 files -> 15; 32 // 2 = 16.
+        assert mc_zarr.shape == (15, 16, 16)
+        assert mc_zarr.dtype == np.dtype("float32")
+        assert shifts.shape == (15, 2)
+        arr = np.asarray(mc_zarr[:])
+        assert np.isfinite(arr).all()
+        # Shifts stay near the (downscaled) max_shift bound (subpixel
+        # refinement can nudge slightly past the integer search limit).
+        assert np.abs(shifts).max() <= params.max_shift[0] + 1
+
+    def test_spatial_only_keeps_frame_count(self, tmp_path):
+        src = tmp_path / "session"
+        _make_session(src, n_files=2, T=20, H=32, W=48)
+        params = _params(H=32).downscaled(ssub=2, tsub=1)
+        mc_zarr, shifts = concat_avis_to_mc_zarr(
+            src, tmp_path / "mc.zarr", params,
+            ssub=2, tsub=1, n_jobs=2, n_template_avis=2, verbose=False,
+        )
+        assert mc_zarr.shape == (40, 16, 24)   # T unchanged, H/W halved
+        assert shifts.shape == (40, 2)
+
+    def test_wrapper_downsamples(self, tmp_path):
+        src = tmp_path / "session"
+        _make_session(src, n_files=2, T=12, H=24, W=24)
+        out_dir = tmp_path / "out"
+        model = CNMFe(_params(H=24).downscaled(2, 2))
+        mc_zarr = model.fit_mc_from_avis(src, out_dir, ssub=2, tsub=2)
+        # per file 12 // 2 = 6 -> 12; 24 // 2 = 12.
+        assert mc_zarr.shape == (12, 12, 12)
+        assert model.dims == (12, 12)
+        assert np.load(out_dir / "shifts.npy").shape == (12, 2)

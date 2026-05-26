@@ -57,6 +57,8 @@ def concat_avis_to_mc_zarr(
     n_jobs: "int | None" = None,
     skip_if_exists: bool = False,
     n_template_avis: int = 10,
+    ssub: int = 1,
+    tsub: int = 1,
     verbose: bool = True,
 ) -> "tuple[zarr.Array, np.ndarray]":
     """Decode an AVI folder and apply motion correction in one pass.
@@ -88,11 +90,23 @@ def concat_avis_to_mc_zarr(
         n_template_avis: Number of strided AVIs to decode into RAM for
             template building. The template is then strided down to
             ``params.mc_template_max_frames`` frames.
+        ssub: Spatial bin factor (block-mean over ``ssub×ssub`` pixels),
+            applied to the raw AVI frames *before* MC. ``1`` = none.
+        tsub: Temporal bin factor (mean of ``tsub`` consecutive frames),
+            per file, applied before MC. ``1`` = none. Output frame count
+            is ``sum(n_i // tsub)``; the trailing ``< tsub`` frames of each
+            file are dropped.
+            **When downsampling, pass MC params in downsampled units** —
+            i.e. ``params = native_params.downscaled(ssub, tsub)`` so
+            ``max_shift`` / ``mc_gSig_filt`` match the binned frames. The
+            fused output ``mc.zarr`` is the *only* zarr written (no
+            intermediate full-resolution store).
         verbose: Print progress + per-phase timing lines.
 
     Returns:
-        (mc_zarr, shifts) — ``zarr.Array`` shape ``(T, H, W)`` float32
-        + ``np.ndarray`` ``(T, 2)`` float32.
+        (mc_zarr, shifts) — ``zarr.Array`` shape ``(T_out, H//ssub, W//ssub)``
+        float32 + ``np.ndarray`` ``(T_out, 2)`` float32, where
+        ``T_out == sum(n_i // tsub)``.
 
     Raises:
         ValueError: bad input, or ``params.mc_n_iter > 1``.
@@ -104,6 +118,8 @@ def concat_avis_to_mc_zarr(
         raise ValueError(
             f"mc_n_iter must be >= 1, got {params.mc_n_iter}"
         )
+    if ssub < 1 or tsub < 1:
+        raise ValueError(f"ssub and tsub must be >= 1 (got {ssub}, {tsub})")
 
     t0_total = time.time()
 
@@ -158,23 +174,36 @@ def concat_avis_to_mc_zarr(
         if verbose:
             print(f"  {avi.name}: {n} frames  ({H}x{W})", flush=True)
     T_total = sum(counts)
+    # Output (post-bin) dims + per-file output counts. Temporal binning is
+    # per file, so T_out = sum(n_i // tsub); the trailing < tsub frames of
+    # each file are dropped.
+    downsampling = (ssub > 1 or tsub > 1)
+    out_H, out_W = ref_H // ssub, ref_W // ssub
+    out_counts = [c // tsub for c in counts] if tsub > 1 else list(counts)
+    T_out = int(sum(out_counts))
     if verbose:
         print(f"\nTotal: {T_total} frames  x  {ref_H}x{ref_W} px")
+        if downsampling:
+            print(f"Downsample ssub={ssub} tsub={tsub} -> "
+                  f"{T_out} frames  x  {out_H}x{out_W} px (binned before MC)")
     probe_secs = time.time() - t0_probe
 
     n_jobs_eff = _resolve_n_jobs(n_jobs, params, len(avis))
 
     # --- Phase 1: build template from a strided AVI subset ------------------
+    # Built from binned frames so it matches the (downsampled) data MC sees.
     t0_template = time.time()
     template = _build_template_from_strided_avis(
         avis,
         counts,
-        ref_H,
-        ref_W,
+        out_H,
+        out_W,
         n_template_avis=n_template_avis,
         template_max_frames=params.mc_template_max_frames,
         gSig_filt=params.mc_gSig_filt,
         bin_window=10,
+        ssub=ssub,
+        tsub=tsub,
         n_jobs=n_jobs_eff,
         verbose=verbose,
     )
@@ -196,11 +225,11 @@ def concat_avis_to_mc_zarr(
         if pass1_path.exists():
             shutil.rmtree(pass1_path)
 
-    chunk_t = params.mc_output_chunk_t or min(params.mc_batch_size, T_total)
+    chunk_t = params.mc_output_chunk_t or min(params.mc_batch_size, T_out)
     mc_zarr = _open_array(
         pass1_path, "w",
-        shape=(T_total, ref_H, ref_W),
-        chunks=(chunk_t, ref_H, ref_W),
+        shape=(T_out, out_H, out_W),
+        chunks=(chunk_t, out_H, out_W),
         dtype=params.mc_output_dtype,
         compression=True,
         # Heavy compression: the mc.zarr is read many times during
@@ -208,7 +237,7 @@ def concat_avis_to_mc_zarr(
         clevel=5,
         shuffle="bitshuffle",
     )
-    shifts = np.zeros((T_total, 2), dtype=np.float32)
+    shifts = np.zeros((T_out, 2), dtype=np.float32)
     if verbose:
         print(f"\nWriting -> {pass1_path}")
         print(f"  shape={mc_zarr.shape}  chunks={mc_zarr.chunks}  "
@@ -218,7 +247,7 @@ def concat_avis_to_mc_zarr(
     t0_mc = time.time()
     _run_avi_mc_parallel(
         avis,
-        counts,
+        out_counts,
         mc_zarr,
         shifts,
         filtered_template=filtered_template,
@@ -226,6 +255,8 @@ def concat_avis_to_mc_zarr(
         upsample_factor=params.upsample_factor,
         max_shift=params.max_shift,
         chunk_t=params.mc_batch_size,
+        ssub=ssub,
+        tsub=tsub,
         n_jobs=n_jobs_eff,
         n_jobs_inner=n_jobs_eff,
         queue_maxsize=2 * n_jobs_eff,
@@ -323,6 +354,8 @@ def _build_template_from_strided_avis(
     template_max_frames: int,
     gSig_filt,
     bin_window: int,
+    ssub: int,
+    tsub: int,
     n_jobs: int,
     verbose: bool,
 ) -> np.ndarray:
@@ -331,7 +364,9 @@ def _build_template_from_strided_avis(
 
     Picks ``n_template_avis`` evenly-spaced AVIs across the file list.
     Frame counts come from the caller's pre-scan so no extra pyav opens
-    happen here.
+    happen here. ``H`` / ``W`` are the OUTPUT (post-bin) dims; the sample
+    frames are binned by ``ssub`` / ``tsub`` so the template matches the
+    downsampled data MC operates on.
     """
     if not avis:
         raise ValueError("no AVIs provided to template builder")
@@ -351,8 +386,9 @@ def _build_template_from_strided_avis(
 
     pool = _decode_avis_to_buffer(
         chosen_avis, chosen_counts, H, W,
+        ssub=ssub, tsub=tsub,
         n_jobs=min(n_jobs, k), verbose=verbose,
-    )  # (T_subset, H, W) uint8
+    )  # (T_subset_out, H, W) — H, W already post-bin
 
     # Stride-sample the pool down to template_max_frames, high-pass filter,
     # and median-bin to get the template.
@@ -372,18 +408,25 @@ def _decode_avis_to_buffer(
     H: int,
     W: int,
     *,
+    ssub: int = 1,
+    tsub: int = 1,
     n_jobs: int,
     verbose: bool,
 ) -> np.ndarray:
     """Decode the given AVIs (with known per-file frame counts) into a single
-    contiguous ``(sum(counts), H, W) uint8`` RAM buffer.
+    contiguous RAM buffer.
 
-    Uses the same parallel decoder threads as the main MC pass, but drains
-    them into RAM instead of a zarr.
+    ``H`` / ``W`` are the OUTPUT (post-bin) dims; frames are binned by
+    ``ssub`` / ``tsub`` inline. The buffer is ``(sum(n_i // tsub), H, W)``,
+    float32 when binning (to keep the fractional means) else uint8. Uses the
+    same parallel decoder threads as the main MC pass, draining into RAM.
     """
-    T = sum(counts)
-    offsets = np.concatenate([[0], np.cumsum(counts[:-1])]).tolist()
-    buf = np.empty((T, H, W), dtype=np.uint8)
+    downsampling = (ssub > 1 or tsub > 1)
+    out_counts = [c // tsub for c in counts] if tsub > 1 else list(counts)
+    T = int(sum(out_counts))
+    offsets = np.concatenate([[0], np.cumsum(out_counts[:-1])]).astype(int).tolist()
+    dec_dtype = "float32" if downsampling else "uint8"
+    buf = np.empty((T, H, W), dtype=np.float32 if downsampling else np.uint8)
 
     out_q: "queue.Queue" = queue.Queue(maxsize=2 * max(1, n_jobs))
     errors: list = []
@@ -399,7 +442,8 @@ def _decode_avis_to_buffer(
         t = threading.Thread(
             target=_decode_with_admission,
             args=(path, i, offset, 200,    # chunk_t in template phase
-                  True, "luma", "uint8",
+                  True, "luma", dec_dtype,
+                  ssub, tsub,
                   out_q, errors, stop_event),
             name=f"tmpl-decoder-{i}-{path.name}",
             daemon=True,
@@ -440,7 +484,7 @@ def _decode_avis_to_buffer(
 
 def _run_avi_mc_parallel(
     avis,
-    counts,
+    out_counts,
     mc_zarr,
     shifts_buf,
     *,
@@ -449,25 +493,33 @@ def _run_avi_mc_parallel(
     upsample_factor,
     max_shift,
     chunk_t: int,
+    ssub: int,
+    tsub: int,
     n_jobs: int,
     n_jobs_inner: int,
     queue_maxsize: int,
     verbose: bool,
 ) -> None:
-    """The fused decode+MC+write loop.
+    """The fused decode+(bin)+MC+write loop.
 
     Mirrors ``concat_avis_to_zarr._run_parallel`` but swaps the
     "write batch to zarr" writer for a "MC the batch, write the corrected
-    output + shifts" writer. Decoders push raw uint8 batches; the writer
-    runs ``_process_batch`` (per-frame MC, parallelised across the batch via
-    ``n_jobs_inner``) and writes the float32 result.
+    output + shifts" writer. Decoders push batches (binned to the output
+    resolution when ``ssub`` / ``tsub`` > 1); the writer runs
+    ``_process_batch`` (per-frame MC, parallelised across the batch via
+    ``n_jobs_inner``) against the (binned) template and writes the float32
+    result. ``out_counts`` are per-file OUTPUT frame counts, so batch
+    ``start`` indices land at the right downsampled positions.
     """
     out_q: "queue.Queue" = queue.Queue(maxsize=queue_maxsize)
     errors: list = []
     stop_event = threading.Event()
 
-    offsets = np.concatenate([[0], np.cumsum(counts[:-1])]).tolist()
+    offsets = np.concatenate([[0], np.cumsum(out_counts[:-1])]).astype(int).tolist()
     sem = threading.Semaphore(max(1, n_jobs))
+    # Keep the fractional binned means: decode straight to float32 when
+    # downsampling (uint8 would round each averaged pixel before MC).
+    dec_dtype = "float32" if (ssub > 1 or tsub > 1) else "uint8"
 
     def _decode_with_admission(*args):
         with sem:
@@ -478,7 +530,8 @@ def _run_avi_mc_parallel(
         t = threading.Thread(
             target=_decode_with_admission,
             args=(path, i, offset, chunk_t,
-                  True, "luma", "uint8",
+                  True, "luma", dec_dtype,
+                  ssub, tsub,
                   out_q, errors, stop_event),
             name=f"mc-decoder-{i}-{path.name}",
             daemon=True,
@@ -486,7 +539,7 @@ def _run_avi_mc_parallel(
         decoders.append(t)
         t.start()
 
-    T_total = int(sum(counts))
+    T_total = int(sum(out_counts))
     if verbose:
         try:
             from tqdm import tqdm

@@ -7,7 +7,7 @@ ring background → iterative spatial/temporal refinement.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -405,6 +405,34 @@ class CNMFeParams:
             data["max_shift"] = tuple(data["max_shift"])
         return cls(**data)
 
+    def downscaled(self, ssub: int, tsub: int) -> "CNMFeParams":
+        """Return a copy with spatial/temporal params rescaled for a movie
+        downsampled by ``ssub`` (space) and ``tsub`` (time).
+
+        Lets a user express parameters in NATIVE (full-resolution) units once
+        and run the whole pipeline on a movie produced by
+        ``cnmfe.downsample.downsample_movie``. Pixel-valued fields shrink with
+        ``ssub`` (areas with ``ssub²``); the frame rate that feeds the AR-``g``
+        prior shrinks with ``tsub``. Fields derived from these (e.g. the ring
+        radius = ``ring_size_factor·(2·sigma+1)``) follow automatically.
+
+        ``decay_time_ms`` is a physical time and is left unchanged — only
+        ``frame_rate_hz`` changes, which correctly raises the per-frame decay.
+        """
+        if ssub < 1 or tsub < 1:
+            raise ValueError(f"ssub and tsub must be >= 1 (got {ssub}, {tsub})")
+        return replace(
+            self,
+            sigma=self.sigma / ssub,
+            min_pixel=max(1, self.min_pixel // (ssub * ssub)),
+            border_px=self.border_px // ssub,
+            max_shift=(self.max_shift[0] // ssub, self.max_shift[1] // ssub),
+            mc_gSig_filt=(None if self.mc_gSig_filt is None
+                          else self.mc_gSig_filt / ssub),
+            frame_rate_hz=(None if self.frame_rate_hz is None
+                           else self.frame_rate_hz / tsub),
+        )
+
 
 class CNMFe:
     """Clean CNMFe for 1-photon calcium imaging.
@@ -663,6 +691,8 @@ class CNMFe:
         *,
         pattern: str = "*.avi",
         skip_if_exists: bool = False,
+        ssub: int = 1,
+        tsub: int = 1,
     ) -> "zarr.Array":
         """Fused AVI -> motion-corrected zarr in one pass.
 
@@ -690,9 +720,16 @@ class CNMFe:
             pattern: Glob pattern for AVI selection.
             skip_if_exists: If ``mc.zarr`` is already in ``output_dir``,
                 reuse it (and ``shifts.npy`` if present).
+            ssub: Spatial bin factor applied to the raw AVI frames before MC
+                (``1`` = none). The fused ``mc.zarr`` is the only zarr written.
+            tsub: Temporal bin factor (per file) applied before MC (``1`` = none).
+                **When downsampling, construct this model with downscaled
+                params**, e.g. ``CNMFe(params.downscaled(ssub, tsub))``, so
+                ``max_shift`` / ``mc_gSig_filt`` match the binned frames.
 
         Returns:
-            Open zarr.Array of the corrected movie, shape (T, H, W) float32.
+            Open zarr.Array of the corrected movie, shape
+            ``(T_out, H//ssub, W//ssub)`` float32.
         """
         # Local import: avi_mc depends on the top-level concat_avis_to_zarr
         # script, which we don't want as a hard dep of `pipeline`.
@@ -708,6 +745,8 @@ class CNMFe:
             self.params,
             pattern=pattern,
             skip_if_exists=skip_if_exists,
+            ssub=ssub,
+            tsub=tsub,
             verbose=True,
         )
 
@@ -725,17 +764,225 @@ class CNMFe:
         do_motion_correction: bool = True,
         output_dir: str | Path | None = None,
         Y_flat_zarr: "zarr.Array | None" = None,
+        evaluate: bool = True,
     ) -> "CNMFe":
         """Run the full CNMFe pipeline on a (T, H, W) movie.
 
+        Thin wrapper that composes the standalone stages:
+        ``fit_mc`` (optional, in-memory) -> ``fit_extract`` -> ``evaluate``.
+        Behaviour is unchanged from the historical monolithic ``fit``; the
+        stages are also callable individually for a disk-handoff workflow.
+
         Args:
             movie: Input movie. zarr.Array or numpy array, shape (T, H, W).
-                Always required — used for motion correction (if enabled),
-                noise estimation, and greedy init (the latter on a strided
-                sample so the 3D movie need not fully materialise).
             do_motion_correction: Run rigid motion correction before extraction.
-            output_dir: If given, save motion-corrected movie and intermediate
-                results here as zarr stores.
+            output_dir: If given, derive the pixel-major ``Y_flat`` store here
+                (streaming path).
+            Y_flat_zarr: Optional pixel-major ``(H*W, T)`` zarr (see
+                ``fit_extract``). Incompatible with ``do_motion_correction``.
+            evaluate: Run the non-destructive auto-evaluation pass at the end
+                (sets ``accepted_mask`` / ``eval_info``).
+
+        Returns:
+            self (for chaining).
+        """
+        p = self.params
+
+        if do_motion_correction:
+            if Y_flat_zarr is not None:
+                raise ValueError(
+                    "Y_flat_zarr is the already-corrected movie; pass "
+                    "do_motion_correction=False (and run fit_mc separately if needed)."
+                )
+            # In-memory MC: extraction below needs the full movie in RAM
+            # anyway, so streaming-to-zarr would only add disk IO. Use
+            # fit_mc(zarr, output_dir=...) directly when the input is too big.
+            movie_arr = np.asarray(movie, dtype=np.float32)
+            movie_arr, self.shifts = motion_correction_rigid(
+                movie_arr,
+                max_shift=p.max_shift,
+                gSig_filt=p.mc_gSig_filt,
+                upsample_factor=p.upsample_factor,
+                niter_rig=p.mc_n_iter,
+                batch_size=p.mc_batch_size,
+                n_jobs=p.n_jobs,
+                template_max_frames=p.mc_template_max_frames,
+            )
+            return self.fit_extract(
+                movie_arr, output_dir=output_dir, evaluate=evaluate,
+            )
+
+        return self.fit_extract(
+            movie, Y_flat_zarr=Y_flat_zarr, output_dir=output_dir,
+            evaluate=evaluate,
+        )
+
+    def evaluate(self) -> "CNMFe":
+        """Tag components with per-component quality results (non-destructive).
+
+        Combines a pixel-count floor with a scale-invariant mean-amplitude SNR
+        check (mean(a^2)/mean(sn^2)); see ``cnmfe/evaluate.py``. The mask
+        catches ghost components born from background-noise seeds under loose
+        init thresholds — their footprints can be wide but sit at the
+        pixel-noise floor.
+
+        Reads only ``self.A`` and ``self.sn``, so it can be called on a freshly
+        ``load()``-ed model to retune thresholds without re-extracting. **No
+        components are dropped**; filter post-hoc via ``model.accepted_mask``.
+
+        Sets ``self.accepted_mask`` and ``self.eval_info``. Returns self.
+        """
+        if self.A is None:
+            raise RuntimeError("Cannot evaluate before extraction (self.A is None).")
+        if self.sn is None:
+            raise RuntimeError(
+                "evaluate() needs the per-pixel noise map self.sn; run "
+                "fit_extract first or load() a directory that contains sn.npy."
+            )
+        p = self.params
+        if self.A.shape[1] == 0:
+            self.accepted_mask = np.zeros(0, dtype=bool)
+            self.eval_info = None
+            return self
+
+        keep, eval_info = auto_evaluate_components(
+            self.A,
+            sn_flat=self.sn.ravel(),
+            min_pixel=p.min_pixel,
+            snr_amp_thr=p.auto_eval_snr_amp_thr,
+        )
+        self.accepted_mask = keep
+        self.eval_info = eval_info
+        n_drop = int((~keep).sum())
+        n_px_fail = int((~eval_info["pixel_pass"]).sum())
+        n_snr_fail = int((~eval_info["snr_pass"]).sum())
+        print(
+            f"Auto-evaluation: {int(keep.sum())}/{self.A.shape[1]} accepted "
+            f"(flagged {n_drop}: {n_px_fail} fail pixel_count<{p.min_pixel}, "
+            f"{n_snr_fail} fail snr_amp<{p.auto_eval_snr_amp_thr}). "
+            f"All components retained; filter via model.accepted_mask."
+        )
+        return self
+
+    def upsample_to_native(
+        self,
+        *,
+        orig_dims: "tuple[int, int] | None" = None,
+        orig_T: "int | None" = None,
+        ssub: "int | None" = None,
+        tsub: "int | None" = None,
+        ds_meta: "dict | str | Path | None" = None,
+        spatial_order: int = 1,
+    ) -> "CNMFe":
+        """Return a NEW model with footprints/traces interpolated to native res.
+
+        Re-expresses a downsampled extraction on the native pixel grid and frame
+        rate — for overlaying footprints on a native-resolution reference image
+        and plotting traces against native-rate signals.
+
+        **This is interpolation, not recovery.** The downsample-once workflow
+        keeps only the downsampled movie, so this upsamples the *already-extracted*
+        downsampled results; it does NOT recover detail the binning discarded.
+        Footprints become smooth (bilinear) blobs and traces are linearly
+        interpolated.
+
+        Non-destructive — ``self`` is left unchanged. The returned model is for
+        **inspection / overlay / native-rate plotting**, NOT for re-running the
+        BCD: the ring/background model (``W``, ``b0``, ``b_f``, ``f``) and
+        ``shifts`` are dropped, and the deconvolved spike train ``S`` is left at
+        the **downsampled** rate (upsampling a spike train is ambiguous), so
+        ``S.shape[1]`` will not match the upsampled ``C``.
+
+        Args:
+            orig_dims: Native ``(H, W)``. Required (or supplied via ``ds_meta``).
+            orig_T: Native frame count. Required (or via ``ds_meta``). Must be
+                ``>=`` the downsampled ``T``.
+            ssub, tsub: Recorded for reference only; the interpolation derives
+                everything from ``self.dims``/``orig_dims`` and ``T``/``orig_T``.
+            ds_meta: Optional ``ds_meta.json`` dict or path written by
+                ``downsample_movie``; if given, ``orig_dims``/``orig_T`` are read
+                from it.
+            spatial_order: 1 = bilinear (default), 0 = nearest (block-exact).
+
+        Returns:
+            A new ``CNMFe`` with ``A``/``C``/``YrA``/``C_raw`` at native
+            resolution, ``dims = orig_dims``.
+        """
+        from cnmfe.downsample import upsample_footprints, upsample_traces
+
+        if self.A is None or self.C is None:
+            raise RuntimeError("upsample_to_native requires a fitted model.")
+        if self.dims is None:
+            raise RuntimeError("self.dims is None; cannot upsample.")
+
+        if ds_meta is not None:
+            if isinstance(ds_meta, (str, Path)):
+                ds_meta = json.loads(Path(ds_meta).read_text())
+            orig_dims = tuple(ds_meta["orig_dims"]) if orig_dims is None else orig_dims
+            orig_T = int(ds_meta["orig_T"]) if orig_T is None else orig_T
+            ssub = ds_meta.get("ssub", ssub)
+            tsub = ds_meta.get("tsub", tsub)
+        if orig_dims is None or orig_T is None:
+            raise ValueError(
+                "provide orig_dims and orig_T (or a ds_meta with those keys)."
+            )
+        orig_dims = (int(orig_dims[0]), int(orig_dims[1]))
+        orig_T = int(orig_T)
+        T_ds = int(self.C.shape[1])
+        if orig_T < T_ds:
+            raise ValueError(
+                f"orig_T ({orig_T}) < downsampled T ({T_ds}); is it really native?"
+            )
+
+        new = CNMFe(self.params)
+        new.dims = orig_dims
+        new.A = upsample_footprints(self.A, self.dims, orig_dims, order=spatial_order)
+        new.C = upsample_traces(self.C, orig_T)
+        new.YrA = upsample_traces(self.YrA, orig_T) if self.YrA is not None else None
+        new.C_raw = upsample_traces(self.C_raw, orig_T) if self.C_raw is not None else None
+        # S stays at the downsampled rate (documented).
+        new.S = None if self.S is None else self.S.copy()
+        # Per-component metadata is resolution-independent.
+        new.g = self.g
+        new.sn_per_k = self.sn_per_k
+        new.accepted_mask = self.accepted_mask
+        new.eval_info = self.eval_info
+        if self.sn is not None:
+            import cv2
+            new.sn = cv2.resize(
+                np.asarray(self.sn, dtype=np.float32),
+                (orig_dims[1], orig_dims[0]),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        # Extraction internals / ds-rate quantities aren't meaningful at the
+        # native grid; the upsampled model is for inspection, not re-fitting.
+        new.W = None
+        new.b0 = None
+        new.b_f = None
+        new.f = None
+        new.shifts = None
+        return new
+
+    def fit_extract(
+        self,
+        movie: "zarr.Array | np.ndarray",
+        *,
+        Y_flat_zarr: "zarr.Array | None" = None,
+        output_dir: str | Path | None = None,
+        evaluate: bool = True,
+    ) -> "CNMFe":
+        """Run extraction on an ALREADY motion-corrected (T, H, W) movie.
+
+        This is the historical ``fit`` body minus motion correction: noise
+        estimation, greedy init, ring background, the spatial/temporal/merge
+        BCD loop, the final temporal pass, and YrA. Optionally finishes with
+        the non-destructive auto-evaluation (``evaluate=True``).
+
+        Args:
+            movie: Already-corrected movie. zarr.Array or numpy array, shape
+                (T, H, W). Used for noise estimation and greedy init (the
+                latter on a strided sample so the 3D movie need not fully
+                materialise).
             Y_flat_zarr: Optional pixel-major ``(H*W, T)`` zarr produced by
                 ``transpose_zarr_to_pixel_major``. When provided, extraction
                 (compute_W, BackgroundSubtractor, update_spatial,
@@ -744,6 +991,9 @@ class CNMFe:
                 ``movie`` must be a zarr.Array in this mode (we need
                 strided 3D access for init); it is **not** materialised.
                 Shape must match the spatial dims of ``movie``.
+            output_dir: If given (with a zarr ``movie`` and no Y_flat_zarr),
+                the pixel-major ``Y_flat`` store is derived here.
+            evaluate: Run the non-destructive auto-evaluation pass at the end.
 
         Returns:
             self (for chaining).
@@ -757,7 +1007,7 @@ class CNMFe:
         # pixel-major store: transpose once (idempotent — skip_if_exists),
         # then route through the existing streaming branch below.
         auto_derived_y_flat = False
-        if Y_flat_zarr is None and not do_motion_correction:
+        if Y_flat_zarr is None:
             try:
                 import zarr as _zarr_pkg
                 is_zarr_movie = isinstance(movie, _zarr_pkg.Array)
@@ -790,11 +1040,6 @@ class CNMFe:
                     )
             except ImportError as exc:
                 raise RuntimeError("zarr is required for Y_flat_zarr") from exc
-            if do_motion_correction:
-                raise ValueError(
-                    "Y_flat_zarr is the already-corrected movie; pass "
-                    "do_motion_correction=False (and run fit_mc separately if needed)."
-                )
             T, H, W = int(movie.shape[0]), int(movie.shape[1]), int(movie.shape[2])
             if Y_flat_zarr.shape != (H * W, T):
                 raise ValueError(
@@ -822,23 +1067,6 @@ class CNMFe:
             print(
                 "  Note: n_jobs=1 (serial). "
                 "Set CNMFeParams(n_jobs=-1) to use all CPU cores."
-            )
-
-        # --- Step 1: Motion correction ---
-        if do_motion_correction:
-            # In-memory path here: extraction steps below need the full movie
-            # in RAM anyway, so streaming-to-zarr would only add disk IO.
-            # Use fit_mc(zarr, output_dir=...) directly when the input is too
-            # big to materialize.
-            movie_arr, self.shifts = motion_correction_rigid(
-                movie_arr,
-                max_shift=p.max_shift,
-                gSig_filt=p.mc_gSig_filt,
-                upsample_factor=p.upsample_factor,
-                niter_rig=p.mc_n_iter,
-                batch_size=p.mc_batch_size,
-                n_jobs=p.n_jobs,
-                template_max_frames=p.mc_template_max_frames,
             )
 
         # --- Steps 2-3: sample frames for statistics if T > sample_frames ---
@@ -1186,39 +1414,9 @@ class CNMFe:
                     Y_flat, A, C, W_mat, b0, bf=bf, f=f_bg, n_iter=2,
                 )
 
-        # --- Step 7: Auto-evaluation (informational, non-destructive) ---
-        # Tag components with per-component quality results, but do NOT drop
-        # them. Combines a pixel-count floor with a scale-invariant
-        # mean-amplitude SNR check (mean(a^2)/mean(sn^2)); see
-        # cnmfe/evaluate.py for the rationale. The mask catches ghost
-        # components born from background-noise seeds under loose init
-        # thresholds — their footprints can be wide but sit at the
-        # pixel-noise floor.
-        #
-        # All components are retained on the model. Callers can filter
-        # post-hoc via ``model.A[:, model.accepted_mask]`` (and likewise
-        # for C, S, YrA, C_raw, g, sn_per_k).
-        if A.shape[1] > 0:
-            keep, eval_info = auto_evaluate_components(
-                A,
-                sn_flat=sn_flat,
-                min_pixel=p.min_pixel,
-                snr_amp_thr=p.auto_eval_snr_amp_thr,
-            )
-            self.accepted_mask = keep
-            self.eval_info = eval_info
-            n_drop = int((~keep).sum())
-            n_px_fail = int((~eval_info["pixel_pass"]).sum())
-            n_snr_fail = int((~eval_info["snr_pass"]).sum())
-            print(
-                f"Auto-evaluation: {int(keep.sum())}/{A.shape[1]} accepted "
-                f"(flagged {n_drop}: {n_px_fail} fail pixel_count<{p.min_pixel}, "
-                f"{n_snr_fail} fail snr_amp<{p.auto_eval_snr_amp_thr}). "
-                f"All components retained; filter via model.accepted_mask."
-            )
-        else:
-            # BCD ended with no surviving components — skip the final
-            # temporal pass + YrA recomputation, return empty arrays.
+        # BCD ended with no surviving components — skip the final temporal
+        # pass + YrA recomputation, return empty arrays.
+        if A.shape[1] == 0:
             print("No components survived refinement.")
             self.A = A
             self.C = np.empty((0, T), dtype=np.float32)
@@ -1271,5 +1469,12 @@ class CNMFe:
         self.f = f_bg
         self.g = g_per_k
         self.sn_per_k = sn_per_k
+
+        # --- Step 7: Auto-evaluation (informational, non-destructive) ---
+        # Reads only self.A + self.sn, so order relative to the final temporal
+        # pass is irrelevant; runs here so a standalone fit_extract is complete.
+        if evaluate:
+            self.evaluate()
+
         print(f"Done. Extracted {A.shape[1]} neurons.")
         return self

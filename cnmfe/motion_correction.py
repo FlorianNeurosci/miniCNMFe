@@ -30,7 +30,10 @@ def high_pass_filter_space(img_orig, gSig_filt):
     if np.isscalar(gSig_filt):
         gSig_filt = [gSig_filt, gSig_filt]
 
-    ksize = tuple([(3 * i) // 2 * 2 + 1 for i in gSig_filt])
+    # ksize must be an int for cv2 (gSig_filt may be a float, e.g. after
+    # CNMFeParams.downscaled scales it by ssub). For integer gSig_filt this
+    # is identical to the historical expression.
+    ksize = tuple([int((3 * i) // 2 * 2 + 1) for i in gSig_filt])
 
     ker = cv2.getGaussianKernel(ksize[0], gSig_filt[0])
     ker2D = ker.dot(ker.T)

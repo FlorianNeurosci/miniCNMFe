@@ -255,6 +255,78 @@ The regression test is `tests/test_pipeline.py::test_auto_evaluation_rejects_gho
 The project uses zarr v3 (`zarr >= 3.0`). The v3 API differs from v2 in chunk
 specification and store opening. Do not regress to v2 patterns.
 
+### Staged pipeline: `fit_extract` / `evaluate` + `fit` wrapper
+`CNMFe.fit()` is now a **thin wrapper** that composes the standalone stages
+`fit_mc` (optional, in-memory) → `fit_extract` → `evaluate`. Behaviour is
+unchanged from the old monolith (regression: `tests/test_stage_split.py` asserts
+`fit()` == the staged composition, bit-for-bit at `n_jobs=1`).
+
+- `fit_extract(movie, *, Y_flat_zarr=None, output_dir=None, evaluate=True)` —
+  everything from noise estimation through the BCD loop, final temporal pass,
+  and YrA. **Resolution-agnostic**: runs on whatever movie it is handed (full
+  or downsampled). Contains the streaming `Y_flat_zarr` auto-derive logic;
+  motion correction is *not* part of it.
+- `evaluate()` — the non-destructive auto-eval (moved out of the BCD body). Reads
+  **only `self.A` + `self.sn`**, so it can be re-run on a freshly `load()`-ed
+  model to retune `min_pixel` / `auto_eval_snr_amp_thr` without re-extracting.
+  It is now invoked *after* the final temporal pass; order is irrelevant since
+  it depends on neither `C` nor `S`. Pass `evaluate=False` to skip it.
+
+Four root CLIs give each stage a disk handoff (mirror `full_pipeline.py`
+conventions; `--params p.json` carries a `CNMFeParams` between stages):
+`run_preprocess.py` → `run_mc.py` → `run_extract.py` → `run_evaluate.py`.
+
+### Downsample-once front end
+The design is **downsample once, then run MC + extraction + evaluation entirely
+on the smaller movie** — outputs stay at downsampled resolution (no footprint
+upsampling, no full-res finalization). There are **three ways to produce the
+downsampled movie**, in increasing preference for the AVI workflow:
+
+1. `cnmfe/downsample.py::downsample_movie(src, dest, *, ssub, tsub, ...)` —
+   streaming block-mean of an **existing `(T,H,W)` zarr** (template:
+   `io.transpose_zarr_to_pixel_major`); writes a `ds_meta.json` sidecar. Use
+   when you already have a raw zarr. `run_preprocess.py` wraps it.
+2. `concat_avis_to_zarr(..., ssub=, tsub=)` — bins **inline while decoding the
+   AVIs**, so only the downsampled zarr is written (no full-res intermediate).
+3. **Fused (preferred for live sessions):** `concat_avis_to_mc_zarr` /
+   `CNMFe.fit_mc_from_avis(..., ssub=, tsub=)` decode + bin + motion-correct in
+   one pass, writing **only `mc.zarr`** — no `session.zarr`, no `ds.zarr`.
+
+Binning is **per file** in the AVI paths (2, 3): a temporal group never spans
+two AVIs, the trailing `< tsub` frames of each file are dropped, so the output
+frame count is `sum(n_i // tsub)`. Binned frames are decoded straight to
+**float32** (uint8 would round the means). For (2)/(3) pass MC params already in
+downsampled units (`params.downscaled(ssub, tsub)`); `ssub`/`tsub` only describe
+how the raw AVI frames are binned. Non-divisible dims are trimmed to a multiple
+of the factor before binning.
+
+`CNMFeParams.downscaled(ssub, tsub)` rescales the unit-bearing fields so params
+can be expressed once in **native** units: `sigma /= ssub`, `min_pixel //= ssub²`,
+`border_px //= ssub`, `max_shift //= ssub`, `mc_gSig_filt /= ssub`,
+`frame_rate_hz /= tsub`. `decay_time_ms` is a physical time and is **unchanged**
+(only the frame rate moves, which correctly raises the per-frame decay; the AR
+`g` is then estimated on the binned traces, self-consistently). The ring radius
+follows `sigma` automatically. `run_extract.py --ds-meta ds_meta.json` applies
+this rescale automatically.
+
+**Caveat (deliberate):** temporal binning happens *before* MC, so frames within
+a `tsub` group are averaged prior to registration. Fine for slow drift / small
+`tsub`; blurs neurons under large intra-bin motion.
+
+**Opt-in re-upsampling to native res.** `CNMFe.upsample_to_native(*, orig_dims,
+orig_T, ...)` returns a **new, non-destructive** model with `A` (bilinear) and
+`C`/`YrA`/`C_raw` (linear) interpolated to the native grid/rate — for overlaying
+footprints on a native reference image and plotting against native-rate signals.
+Helpers `upsample_footprints` / `upsample_traces` live in `cnmfe/downsample.py`
+(per-column `cv2.resize` to the exact native `(H,W)`; per-row `np.interp` to the
+exact native `T`, so trimming is handled). It is **interpolation, not recovery**
+— the native movie is gone in downsample-once, so no discarded detail is
+recovered. The returned model is for **inspection/overlay only**: `S` stays at
+the downsampled rate, and `W`/`b0`/`b_f`/`f`/`shifts` are dropped (don't re-run
+the BCD on it). Native `(H,W)`/`T` must be supplied (only `downsample_movie`
+writes a `ds_meta.json`; the fused/concat paths don't), or passed via
+`ds_meta=`.
+
 ### Fused AVI → MC (`cnmfe/avi_mc.py`)
 `concat_avis_to_mc_zarr` (and the convenience wrapper
 `CNMFe.fit_mc_from_avis`) decode an AVI folder and apply rigid motion
@@ -271,11 +343,20 @@ Pipeline shape:
    `params.mc_template_max_frames`, high-pass filter the samples and
    bin-median them.
 3. **Fused MC phase**: re-decode every AVI in parallel via
-   `_decode_avi_worker` (reused verbatim from `concat_avis_to_zarr`). A
-   queue-consuming writer pulls `(start, batch_uint8)` tuples, runs
+   `_decode_avi_worker` (reused from `concat_avis_to_zarr`). A
+   queue-consuming writer pulls `(start, batch)` tuples, runs
    `_process_batch` (parallelised per-frame MC from
    `cnmfe/motion_correction.py`), and writes the float32 corrected
    batch + shifts into `mc.zarr` / a `(T, 2)` shifts buffer.
+
+**Inline downsampling** (`ssub` / `tsub` on `concat_avis_to_mc_zarr` /
+`fit_mc_from_avis`): the decoders bin frames (block-mean) **before** MC, the
+template is built from the binned frames, and offsets/output shape come from the
+per-file binned counts (`sum(n_i // tsub)`, `H//ssub`, `W//ssub`). Decoders emit
+float32 when binning. Pass `params.downscaled(ssub, tsub)` so `max_shift` /
+`mc_gSig_filt` match the binned grid; `ssub`/`tsub` only drive the raw-frame
+binning. This is the **single-write** downsampled path — only `mc.zarr` is
+produced (`live_runs/run_session.ipynb` uses it).
 
 **`mc_n_iter > 1`** is supported: the fused first pass writes a scratch
 zarr at `<output_path>.parent / (".<output_path.name>.fused.zarr")`,
@@ -332,6 +413,16 @@ Defaults bumped:
 ---
 
 ## Non-obvious bugs that were already fixed — do not re-introduce
+
+### `high_pass_filter_space` float `gSig_filt` → cv2 ksize TypeError
+`ksize` for `cv2.getGaussianKernel` must be an int. The historical expression
+`(3*i)//2*2+1` stays a float when `gSig_filt` is a float — which happens as soon
+as `CNMFeParams.downscaled(ssub, tsub)` scales `mc_gSig_filt` by `ssub`
+(e.g. `7/2 = 3.5`). cv2 then raises `TypeError: Argument 'ksize' is required to
+be an integer`. **Fix** (`motion_correction.py:high_pass_filter_space`): wrap the
+ksize expression in `int(...)`. Identical for integer `gSig_filt`; only enables
+the float (downsampled) case. Affects every MC path (`fit_mc`,
+`motion_correction_rigid`, fused `avi_mc`).
 
 ### Floor division for odd image dimensions
 `np.arange(-H // 2, ...)` is wrong for odd H because Python floors toward −∞
@@ -393,18 +484,25 @@ cnmfe/                         Main package
   temporal.py                  estimate_ar_params, deconvolve, update_temporal, _deconvolve_with
   merging.py                   merge_components  (4-tuple return)
   avi_mc.py                    Fused AVI -> mc.zarr in one pass (skips session.zarr)
-  pipeline.py                  CNMFeParams (dataclass), CNMFe.fit(), CNMFe.fit_mc_from_avis()
+  downsample.py                downsample_movie() — streaming spatial+temporal block-mean (+ ds_meta.json)
+  pipeline.py                  CNMFeParams (+ .downscaled()), CNMFe.fit()/fit_mc/fit_extract/evaluate
 tests/
   conftest.py                  make_synthetic_movie() — clean fixture; supports motion_max_shift
   miniscope_simulator.py       make_miniscope_movie() — realistic 1p movie with bg/ghosts/vasc/bleach/shot noise/8-bit/motion
   test_multiprocessing.py      n_jobs correctness tests
   test_pipeline.py             includes test_temporal_correlation_against_truth (regression for the AR drift fix)
+  test_stage_split.py          fit() == fit_mc -> fit_extract -> evaluate (staged decomposition)
+  test_downsample.py           downsample_movie / downscaled / end-to-end downsampled recovery
 wiki/                          Obsidian docs (math, eli5, architecture, api-reference, usage-guide)
 demo_movies/                   Generated AVI files + _meta.npz sidecars + .zarr stores (created by scripts below)
 generate_demo_movies.py        Generate demo_movies/*.avi with ground-truth NPZ sidecars (idempotent)
 convert_to_zarr.py             Batch-convert demo_movies/*.avi -> *.zarr (idempotent)
 concat_avis_to_zarr.py         Concatenate a folder of 0.avi ... N.avi into one zarr store (CLI)
 full_pipeline.py               CLI: load any zarr lazily, run full CNMFe pipeline, save A/C/S/YrA/shifts/sn/params to disk
+run_preprocess.py              Staged CLI 1/4: downsample a zarr (ssub/tsub) -> ds.zarr + ds_meta.json
+run_mc.py                      Staged CLI 2/4: motion-correct a zarr -> mc.zarr + shifts.npy + params.json
+run_extract.py                 Staged CLI 3/4: extract on mc.zarr -> results/ (--ds-meta auto-rescales params)
+run_evaluate.py                Staged CLI 4/4: re-run auto-eval on a results dir (retune thresholds, no re-extract)
 tutorial.ipynb                 Original walkthrough (preserved)
 tutorial2.ipynb                Clean rewrite of the original tutorial
 tutorial_realistic.ipynb       Tutorial on the realistic simulator + mp4 export of the simulated movie

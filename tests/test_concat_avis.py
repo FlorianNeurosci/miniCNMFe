@@ -182,3 +182,69 @@ class TestNonUniformLengths:
             chunk_t=10, n_jobs=2, verbose=False,
         )
         assert z.shape == (45, 24, 24), z.shape
+
+
+def _ref_block_mean(movie: np.ndarray, ssub: int, tsub: int) -> np.ndarray:
+    """Global block-mean reference (matches per-file binning only when each
+    file's frame count is divisible by tsub)."""
+    T, H, W = movie.shape
+    Tu, Hu, Wu = (T // tsub) * tsub, (H // ssub) * ssub, (W // ssub) * ssub
+    m = movie[:Tu, :Hu, :Wu].astype(np.float32)
+    m = m.reshape(Tu // tsub, tsub, Hu, Wu).mean(axis=1)
+    return m.reshape(Tu // tsub, Hu // ssub, ssub, Wu // ssub, ssub).mean(axis=(2, 4))
+
+
+class TestInlineDownsampling:
+    """ssub/tsub bin frames as they are decoded — only the downsampled zarr
+    is written (no intermediate full-res store)."""
+
+    def test_downsampled_shape(self, tmp_path):
+        src = tmp_path / "session"
+        _make_session(src, n_files=3, T=30, H=48, W=48)
+        z = concat_avis_to_zarr(
+            src, output_path=tmp_path / "ds.zarr",
+            ssub=2, tsub=3, dtype="float32", n_jobs=2, verbose=False,
+        )
+        # per file 30 // 3 = 10 output frames; 3 files -> 30; 48 // 2 = 24.
+        assert z.shape == (30, 24, 24), z.shape
+        assert np.dtype(z.dtype) == np.dtype("float32")
+
+    def test_serial_parallel_byte_equal_downsampled(self, tmp_path):
+        src = tmp_path / "session"
+        _make_session(src, n_files=3, T=30, H=48, W=48)
+        zs = concat_avis_to_zarr(src, output_path=tmp_path / "s.zarr",
+                                 ssub=2, tsub=3, dtype="float32",
+                                 chunk_t=7, n_jobs=1, verbose=False)
+        zp = concat_avis_to_zarr(src, output_path=tmp_path / "p.zarr",
+                                 ssub=2, tsub=3, dtype="float32",
+                                 chunk_t=7, n_jobs=4, verbose=False)
+        np.testing.assert_array_equal(np.asarray(zs[:]), np.asarray(zp[:]))
+
+    def test_matches_block_mean_of_full_res(self, tmp_path):
+        # T per file (30) divisible by tsub (3) => per-file binning aligns
+        # with a global block-mean, so the inline result must match the
+        # block-mean of the full-resolution decode.
+        src = tmp_path / "session"
+        _make_session(src, n_files=3, T=30, H=48, W=48)
+        full = concat_avis_to_zarr(src, output_path=tmp_path / "full.zarr",
+                                   dtype="float32", n_jobs=2, verbose=False)
+        ds = concat_avis_to_zarr(src, output_path=tmp_path / "ds.zarr",
+                                 ssub=2, tsub=3, dtype="float32",
+                                 n_jobs=2, verbose=False)
+        ref = _ref_block_mean(np.asarray(full[:]), ssub=2, tsub=3)
+        np.testing.assert_allclose(np.asarray(ds[:]), ref, rtol=1e-4, atol=1e-2)
+
+    def test_spatial_only_keeps_frame_count(self, tmp_path):
+        src = tmp_path / "session"
+        _make_session(src, n_files=2, T=20, H=32, W=48)
+        z = concat_avis_to_zarr(src, output_path=tmp_path / "ds.zarr",
+                                ssub=2, tsub=1, dtype="float32",
+                                n_jobs=2, verbose=False)
+        assert z.shape == (40, 16, 24), z.shape  # T unchanged, H/W halved
+
+    def test_rejects_downsampling_in_color(self, tmp_path):
+        src = tmp_path / "session"
+        _make_session(src, n_files=1, T=10)
+        with pytest.raises(ValueError, match="requires grayscale"):
+            concat_avis_to_zarr(src, output_path=tmp_path / "ds.zarr",
+                                ssub=2, grayscale=False, verbose=False)
