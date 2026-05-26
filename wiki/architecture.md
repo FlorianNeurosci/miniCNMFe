@@ -112,11 +112,24 @@ movie_arr (T, H, W)  +  shifts (T, 2)
     │
     ├──► correlation_pnr() ─────────────────► cn (H, W), pnr (H, W)
     │
-    ├──► greedy_corr_pnr() ─────────────────► A (H·W, K), C (K, T), C_raw
+    ├──► [if decay_time_ms + frame_rate_hz set]
+    │     g_target = exp(-1 / (fps · τ_ms / 1000))
+    │     (Bayesian prior threaded into every estimate_ar_params call below)
+    │
+    ├──► greedy_corr_pnr(g_prior=g_target) ─► A (H·W, K), C (K, T), C_raw
+    │     (per-component estimate_ar_params inside greedy init also
+    │      receives the prior; OASIS deconvolution at each seed runs
+    │      against the prior-shrunk g)
     │
     ├──► make_2d() ─────────────────────────► Y_flat (H·W, T)
     │
-    ├──► estimate_ar_params(C_raw.ravel()) ─► g_per_k (cached), sn_per_k
+    ├──► estimate_ar_params(                 ► g_per_k (cached), sn_per_k
+    │         C_raw.ravel(),
+    │         g_prior=g_target,
+    │         g_prior_weight=p.g_prior_weight,
+    │     )
+    │     g_post = (1 - w) · g_yw + w · g_target  (fudge_factor bypassed
+    │     on prior path; legacy multiplicative shrinkage when prior is None)
     │
     ├──► compute_W() ───────────────────────► W_mat (H·W, H·W), b0 (H·W)
     │
@@ -180,3 +193,8 @@ All math is reimplemented from scratch using numpy/scipy/skimage/sklearn. CaImAn
 
 ### Module-level worker functions
 Functions dispatched by `joblib.Parallel` (e.g. `_shift_and_correct_frame`, `_deconvolve_with`) are always defined at the **top level** of their module, not as lambdas or nested functions. This is required for pickling on Windows (`spawn` process start method). `_deconvolve_with` replaced the older `_deconvolve_one` and takes pre-computed `g`/`sn` so it does not re-estimate AR params per call.
+
+### Bayesian-prior path for AR coefficient `g`
+`estimate_ar_params` has two shrinkage paths. The legacy path multiplies the Yule-Walker estimate by `fudge_factor` (default `0.96`) — a unitless prior toward zero. The prior path takes `g_prior = exp(-1 / (fps · τ_ms / 1000))` derived from `CNMFeParams.decay_time_ms` + `frame_rate_hz` and shrinks toward it: `g = (1 - g_prior_weight) · g_yw + g_prior_weight · g_prior`. `fudge_factor` is bypassed on the prior path.
+
+`g_target` is computed once in `CNMFe.fit` and threaded into every estimator: pipeline-init pooled estimate, per-component init estimate (greedy `extract_spatial_temporal`), and the `update_temporal` fallback when the cache is empty. With this, the same shrinkage target governs the AR coefficient end-to-end across init → BCD → final pass. See [todo/oasis_oversmoothing.md](../todo/oasis_oversmoothing.md) for the diagnostic that motivated the path.

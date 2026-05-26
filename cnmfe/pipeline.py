@@ -243,8 +243,46 @@ class CNMFeParams:
     global_bg_rank: int = 0
 
     # --- Spatial update ---
-    dilation_radius: int = 3
+    # Neighbourhood (in pixels) around each component's current binary
+    # footprint that's eligible to enter the per-pixel LASSO active set.
+    # Was 3 historically; reduced to 2 to suppress crosstalk between
+    # adjacent neurons (which otherwise produced thin "tendril" connections
+    # in the extracted footprints — see tmp/output_simple_movie_vs_caiman.png).
+    # Smaller = less crosstalk, slower footprint growth across BCD iterations.
+    # Larger = faster correction of under-shot init footprints, more crosstalk.
+    dilation_radius: int = 2
     spatial_max_thr: float = 0.1    # Zero footprint pixels below this fraction of the peak
+    # [NON-STANDARD; matches CaImAn] Radius (in pixels) of the morphological
+    # binary closing applied inside `threshold_footprint`, between the
+    # max-threshold and the largest-connected-component extraction. Fills
+    # 1-pixel gaps so a jagged LASSO support survives as one rounded blob
+    # instead of being split into multiple disconnected pieces (only the
+    # largest of which would be kept) — the cause of small fragmented
+    # footprints when this step is skipped. ``0`` disables (recovers the
+    # exact prior behaviour); ``1`` (default, 3×3 SE) is what CaImAn uses.
+    spatial_close_radius: int = 1
+    # Per-pixel LASSO coordinate-descent budget (sklearn's
+    # `enet_coordinate_descent_gram`). Defaults match the long-standing
+    # hardcoded values. Increase `spatial_max_iter` if the pipeline logs
+    # "N pixels hit max_iter ..." at the end of update_spatial;
+    # alternatively loosen `spatial_tol` (less strict convergence, faster).
+    # Both knobs trade compute for tightness of the LASSO solution.
+    spatial_max_iter: int = 1000
+    spatial_tol: float = 1e-4
+    # [NON-STANDARD; bandaid for LASSO spread] Apply `circular_constraint`
+    # (initialization.py:33-53) as the final step of `threshold_footprint`.
+    # Clips pixels further than `factor * sqrt(area/pi)` from the footprint
+    # centroid, suppressing thin tendril-shaped extensions toward
+    # neighbouring neurons (visible in tmp/after_tendril_correction.png on
+    # the 10-neuron simulator). The same prior is already used at greedy
+    # init (`circular_max_dist_factor`, default 2.5), but **post-BCD-
+    # refinement we know the footprint shape much better, so we use a
+    # tighter default here** (1.5 ≈ 50% above the area-derived natural
+    # radius). At factor=2.5 the cutoff is too generous to clip the short
+    # residual tendrils that appear with `dilation_radius=2`.
+    # Set ``0.0`` to disable (recovers pre-change behaviour, e.g. for
+    # dendritic imaging where non-circular footprints are expected).
+    spatial_circular_max_dist_factor: float = 1.5
 
     # --- Temporal update / deconvolution ---
     ar_order: int = 1
@@ -261,6 +299,27 @@ class CNMFeParams:
     # value depends on the indicator's true τ and the recording's drift
     # characteristics, neither of which the algorithm can observe directly.
     fudge_factor: float = 0.96
+    # Bayesian-prior path for `g`: when both `decay_time_ms` and
+    # `frame_rate_hz` are set, derive
+    #     g_target = exp(-1 / (frame_rate_hz * decay_time_ms / 1000))
+    # and shrink the Yule-Walker estimate toward it:
+    #     g = (1 - g_prior_weight) * g_yw + g_prior_weight * g_target
+    # `fudge_factor` is skipped on the prior path (the prior already
+    # encodes the physical bound). When either field is `None`, fall back
+    # to the legacy `fudge_factor` shrinkage.
+    #
+    # Suggested decay_time_ms (single-AP τ, somatic):
+    #   GCaMP6f ~140   jGCaMP7f ~160
+    #   jGCaMP8f ~70   jGCaMP8m ~180   jGCaMP8s ~350
+    #   GCaMP6s/7s ~1000
+    # Values vary 1.5–2× with cell type, AP count, expression level.
+    decay_time_ms: float | None = None
+    frame_rate_hz: float | None = None
+    # Shrinkage weight on the prior: 0 = pure Yule-Walker (legacy),
+    # 1 = pin at g_target. Default 0.5 balances data fit against the
+    # physical prior. Bump toward 1 when the recording has heavy slow
+    # drift (Yule-Walker is upward-biased); leave at 0.5 otherwise.
+    g_prior_weight: float = 0.5
     # [NON-STANDARD] Polynomial order subtracted from each trace before the
     # Yule-Walker autocorrelation that estimates `g`. A slow bleach trend
     # has lag-1 autocorrelation ≈ 1 and, when not detrended, pushes `g`
@@ -774,6 +833,21 @@ class CNMFe:
         else:
             print("Running greedy CORR-PNR initialization...")
 
+        # Bayesian-prior target for g, derived from indicator τ + frame rate.
+        # Threaded into every estimate_ar_params call (greedy init,
+        # pipeline init, update_temporal fallback) so g doesn't pin at the
+        # fudge_factor ceiling on data with un-subtracted slow background.
+        g_target: float | None = None
+        if p.decay_time_ms is not None and p.frame_rate_hz is not None:
+            g_target = float(np.exp(
+                -1.0 / (p.frame_rate_hz * p.decay_time_ms / 1000.0)
+            ))
+            print(
+                f"Using Bayesian g prior: decay_time_ms={p.decay_time_ms} "
+                f"frame_rate_hz={p.frame_rate_hz} -> g_target={g_target:.4f} "
+                f"(weight={p.g_prior_weight})"
+            )
+
         A, C_init, C_raw_init, centers = greedy_corr_pnr(
             init_movie,
             sigma=p.sigma,
@@ -790,6 +864,8 @@ class CNMFe:
             seed_suppress_factor=p.seed_suppress_factor,
             circular_max_dist_factor=p.circular_max_dist_factor,
             corrpnr_stride=corrpnr_stride,
+            g_prior=g_target,
+            g_prior_weight=p.g_prior_weight,
         )
         # Free the strided init movie before allocating C_raw at full T.
         if init_stride > 1:
@@ -872,10 +948,15 @@ class CNMFe:
                     p=p.ar_order,
                     detrend_order=p.ar_detrend_order,
                     fudge_factor=p.fudge_factor,
+                    g_prior=g_target,
+                    g_prior_weight=p.g_prior_weight,
                 )
             except Exception:
-                g_global = np.array([0.9 ** (1.0 / max(p.ar_order, 1))] * p.ar_order,
-                                    dtype=np.float32)
+                fallback_g = (
+                    float(g_target) if g_target is not None
+                    else 0.9 ** (1.0 / max(p.ar_order, 1))
+                )
+                g_global = np.array([fallback_g] * p.ar_order, dtype=np.float32)
             for k in range(K_init):
                 g_per_k.append(g_global.copy())
                 sn_per_k[k] = _sn_from_footprint(A[:, k], sn_flat)
@@ -886,10 +967,15 @@ class CNMFe:
                         C_raw[k], p=p.ar_order,
                         detrend_order=p.ar_detrend_order,
                         fudge_factor=p.fudge_factor,
+                        g_prior=g_target,
+                        g_prior_weight=p.g_prior_weight,
                     )
                 except Exception:
-                    g_k = np.array([0.9 ** (1.0 / max(p.ar_order, 1))] * p.ar_order,
-                                   dtype=np.float32)
+                    fallback_g = (
+                        float(g_target) if g_target is not None
+                        else 0.9 ** (1.0 / max(p.ar_order, 1))
+                    )
+                    g_k = np.array([fallback_g] * p.ar_order, dtype=np.float32)
                 g_per_k.append(g_k)
                 sn_per_k[k] = _sn_from_footprint(A[:, k], sn_flat)
 
@@ -956,7 +1042,14 @@ class CNMFe:
             Y_bg = BackgroundSubtractor(Y_flat, W_mat, b0, bf=bf, f=f_bg)  # lazy (H*W, T)
 
             print("  Updating spatial footprints...")
-            A = update_spatial(Y_bg, C, A, sn_flat, dims, p.dilation_radius, p.n_jobs, p.spatial_max_thr)
+            A = update_spatial(
+                Y_bg, C, A, sn_flat, dims,
+                p.dilation_radius, p.n_jobs, p.spatial_max_thr,
+                closing_radius=p.spatial_close_radius,
+                max_iter=p.spatial_max_iter,
+                tol=p.spatial_tol,
+                circular_max_dist_factor=p.spatial_circular_max_dist_factor,
+            )
 
             # Remove dead components (all-zero footprints)
             nA = np.asarray(A.power(2).sum(axis=0)).ravel()
@@ -981,6 +1074,7 @@ class CNMFe:
                 g_cached=g_per_k, sn_cached=sn_per_k,
                 deconvolve=_deconvolve,
                 detrend_order=p.temporal_detrend_order,
+                g_prior=g_target, g_prior_weight=p.g_prior_weight,
             )
 
             print("  Merging correlated components...")
@@ -1004,6 +1098,7 @@ class CNMFe:
                     g_cached=g_per_k, sn_cached=sn_per_k,
                     deconvolve=True,
                     detrend_order=p.temporal_detrend_order,
+                    g_prior=g_target, g_prior_weight=p.g_prior_weight,
                 )
             print(f"  {A.shape[1]} components ({n_merged} merged).")
 
@@ -1083,6 +1178,7 @@ class CNMFe:
             n_jobs=p.n_jobs, device=p.device,
             g_cached=g_per_k, sn_cached=sn_per_k,
             detrend_order=p.temporal_detrend_order,
+            g_prior=g_target, g_prior_weight=p.g_prior_weight,
         )
 
         # Compute the residual projected onto each footprint:

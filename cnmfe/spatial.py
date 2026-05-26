@@ -12,9 +12,12 @@ Reference (algorithmic only): CaImAn spatial.py:update_spatial_components (line 
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import scipy.ndimage as ndi
 import scipy.sparse as sp
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model._cd_fast import enet_coordinate_descent_gram
 
 # Cyclic CD doesn't need randomness, but the Cython entry point still wants
@@ -34,7 +37,9 @@ def _spatial_pixel_batch(
     support_batch: list,
     sn_batch: np.ndarray,
     T: int,
-) -> list[tuple[int, int, float]]:
+    max_iter: int = 1000,
+    tol: float = 1e-4,
+) -> tuple[list[tuple[int, int, float]], int]:
     """Process one contiguous batch of pixels.
 
     Args:
@@ -45,10 +50,18 @@ def _spatial_pixel_batch(
                        for global pixel pixel_start + i.
         sn_batch: (batch_size,) noise std for this batch.
         T: Number of time points.
+        max_iter: Per-pixel CD iteration cap (passed straight through to
+            ``enet_coordinate_descent_gram``).
+        tol: Per-pixel CD convergence tolerance (passed straight through).
 
     Returns:
-        List of (global_pixel_idx, component_idx, coefficient_value) tuples
-        with coefficient_value > 0.
+        Tuple of (results, n_unconverged):
+          - results: list of (global_pixel_idx, component_idx, coef) for
+            coefficients > 0.
+          - n_unconverged: number of pixels in this batch where the CD
+            solver hit ``max_iter`` without converging. Aggregated by
+            ``update_spatial`` into a single summary line instead of
+            sklearn's default per-pixel ConvergenceWarning.
     """
     # Call the underlying Cython CD solver directly instead of going
     # through sklearn's Lasso estimator. The estimator's .fit() path
@@ -65,6 +78,7 @@ def _spatial_pixel_batch(
     #   The Cython entry takes the un-normalised L1 penalty as its first
     #   arg, so we pass `lam * T` to match `Lasso(alpha=lam)`.
     results: list[tuple[int, int, float]] = []
+    n_unconverged = 0
     for i, active in enumerate(support_batch):
         if len(active) == 0:
             continue
@@ -86,19 +100,25 @@ def _spatial_pixel_batch(
         w = np.zeros(len(active), dtype=np.float64)
 
         try:
-            w, _, _, _ = enet_coordinate_descent_gram(
-                w,                       # initial coef, mutated in place
-                float(lam) * T,          # alpha * n_samples
-                0.0,                     # beta (no L2 / no Elastic-Net)
-                gram,                    # Q = X.T @ X
-                Xy,                      # q = X.T @ y
-                y_p_64,                  # y (for dual-gap check)
-                1000,                    # max_iter
-                1e-4,                    # tol
-                _CD_RNG,                 # rng (unused with cyclic CD)
-                0,                       # random=0 -> cyclic, deterministic
-                1,                       # positive
-            )
+            # Suppress sklearn's per-pixel ConvergenceWarning here; we report
+            # the aggregate count once at the end of update_spatial instead.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ConvergenceWarning)
+                w, _, _, n_iter = enet_coordinate_descent_gram(
+                    w,                       # initial coef, mutated in place
+                    float(lam) * T,          # alpha * n_samples
+                    0.0,                     # beta (no L2 / no Elastic-Net)
+                    gram,                    # Q = X.T @ X
+                    Xy,                      # q = X.T @ y
+                    y_p_64,                  # y (for dual-gap check)
+                    int(max_iter),
+                    float(tol),
+                    _CD_RNG,                 # rng (unused with cyclic CD)
+                    0,                       # random=0 -> cyclic, deterministic
+                    1,                       # positive
+                )
+            if int(n_iter) >= int(max_iter):
+                n_unconverged += 1
             coef = w
         except Exception:
             coef = np.zeros(len(active), dtype=np.float64)
@@ -108,7 +128,7 @@ def _spatial_pixel_batch(
             val = float(coef[idx])
             if val > 0:
                 results.append((p_global, int(k), val))
-    return results
+    return results, n_unconverged
 
 
 # ---------------------------------------------------------------------------
@@ -155,18 +175,38 @@ def threshold_footprint(
     ai: np.ndarray,
     dims: tuple[int, int],
     max_thr: float = 0.1,
+    closing_radius: int = 1,
+    circular_max_dist_factor: float = 1.5,
 ) -> np.ndarray:
     """Post-process a single spatial footprint to enforce compactness.
 
     Steps:
     1. Reshape to 2D and apply a 3×3 median filter (removes isolated pixels).
     2. Zero pixels below max_thr * max(ai).
-    3. Keep only the largest connected component.
+    3. Binary-close the support (fills 1-pixel gaps / hollow interiors so the
+       LASSO's jagged ring-with-holes survives as a single connected blob
+       instead of being split). Skipped when ``closing_radius == 0``.
+    4. Keep only the largest connected component.
+    5. NON-STANDARD bandaid: clip pixels further than
+       ``circular_max_dist_factor * sqrt(area/pi)`` from the footprint
+       centroid (``circular_constraint`` from initialization.py). Targets
+       thin "tendril" extensions toward neighbouring components that the
+       LASSO can produce. Same shape prior already applied at greedy init.
+       Skipped when ``circular_max_dist_factor <= 0``.
 
     Args:
         ai: (H*W,) flat footprint.
         dims: (H, W) spatial dimensions.
         max_thr: Fraction of maximum value below which pixels are zeroed.
+        closing_radius: Radius (in pixels) of the morphological binary closing
+            applied between thresholding and largest-CC extraction. ``0``
+            disables (legacy behaviour); ``1`` (default, 3×3 SE) matches
+            CaImAn.
+        circular_max_dist_factor: NON-STANDARD. Radius factor for the
+            post-update circular constraint (step 5). ``0`` disables;
+            ``1.5`` (default) is tighter than the greedy-init factor
+            because post-BCD-refinement the footprint shape is known
+            better — a generous factor lets thin tendrils survive.
 
     Returns:
         Cleaned footprint, same shape as ai.
@@ -182,11 +222,37 @@ def threshold_footprint(
 
     ai2d[ai2d < max_thr * ai2d.max()] = 0.0
 
-    labeled, n = ndi.label(ai2d > 0)
-    if n > 1:
-        sizes = ndi.sum(ai2d > 0, labeled, range(1, n + 1))
-        largest = int(np.argmax(sizes)) + 1
-        ai2d[labeled != largest] = 0.0
+    if closing_radius > 0:
+        # Run the largest-CC selection against the *closed* binary mask, so
+        # bridge pixels filled by the closing unify components for the CC
+        # step. The grayscale ai2d is then masked by the chosen CC — the
+        # bridge pixels remain 0 in the output (they don't get fake
+        # intensity), but both real clusters survive together.
+        se = ndi.generate_binary_structure(2, 2)   # 3×3 (8-connectivity)
+        if closing_radius > 1:
+            se = ndi.iterate_structure(se, closing_radius)
+        closed = ndi.binary_closing(ai2d > 0, structure=se)
+        labeled, n = ndi.label(closed)
+        if n > 1:
+            sizes = ndi.sum(closed, labeled, range(1, n + 1))
+            largest = int(np.argmax(sizes)) + 1
+            keep = labeled == largest
+        else:
+            keep = closed
+        ai2d = ai2d * keep.astype(ai2d.dtype)
+    else:
+        labeled, n = ndi.label(ai2d > 0)
+        if n > 1:
+            sizes = ndi.sum(ai2d > 0, labeled, range(1, n + 1))
+            largest = int(np.argmax(sizes)) + 1
+            ai2d[labeled != largest] = 0.0
+
+    if circular_max_dist_factor > 0 and (ai2d > 0).any():
+        # Imported locally to avoid an import cycle with `initialization`.
+        from cnmfe.initialization import circular_constraint
+        ai2d = circular_constraint(
+            ai2d, max_dist_factor=float(circular_max_dist_factor),
+        )
 
     return ai2d.ravel().astype(np.float32)
 
@@ -204,6 +270,10 @@ def update_spatial(
     dilation_radius: int = 3,
     n_jobs: int = 1,
     max_thr: float = 0.1,
+    closing_radius: int = 1,
+    max_iter: int = 1000,
+    tol: float = 1e-4,
+    circular_max_dist_factor: float = 1.5,
 ) -> sp.csc_matrix:
     """Refine spatial footprints by per-pixel non-negative LASSO regression.
 
@@ -227,6 +297,17 @@ def update_spatial(
         dilation_radius: Footprint dilation for support computation.
         n_jobs: Number of parallel workers (-1 = all CPUs, 1 = serial).
         max_thr: Pixels below max_thr * max(ai) are zeroed after LASSO.
+        closing_radius: Radius of the binary closing inside
+            ``threshold_footprint`` (0 = legacy / no closing; 1 = CaImAn 3×3 SE).
+        max_iter: Per-pixel coordinate-descent iteration cap.
+        tol: Per-pixel CD convergence tolerance. If any pixels hit
+            ``max_iter`` without converging, a single summary line is
+            printed (the per-pixel sklearn ConvergenceWarning is suppressed).
+        circular_max_dist_factor: Forwarded to ``threshold_footprint``;
+            radius factor for the post-update circular constraint.
+            ``0`` disables; ``1.5`` (default) is tighter than the
+            init-time factor because BCD-refined footprints are known
+            better and a generous factor lets thin tendrils survive.
 
     Returns:
         A_new: Updated sparse (H*W, K) footprints.
@@ -247,17 +328,20 @@ def update_spatial(
     if n_jobs == 1:
         # Serial path — avoids joblib import overhead
         all_results: list[tuple[int, int, float]] = []
+        total_unconverged = 0
         for start, end in batches:
-            all_results.extend(
-                _spatial_pixel_batch(
-                    start,
-                    Y_flat[start:end],
-                    C,
-                    support[start:end],
-                    sn[start:end],
-                    T,
-                )
+            batch_results, batch_unconv = _spatial_pixel_batch(
+                start,
+                Y_flat[start:end],
+                C,
+                support[start:end],
+                sn[start:end],
+                T,
+                max_iter,
+                tol,
             )
+            all_results.extend(batch_results)
+            total_unconverged += batch_unconv
     else:
         from joblib import Parallel, delayed
         from threadpoolctl import threadpool_limits
@@ -275,7 +359,7 @@ def update_spatial(
         # n_jobs * n_cores OS threads competing for n_cores. Observed:
         # 20+ min update_spatial on 16-core Ubuntu vs minutes when capped.
         with threadpool_limits(limits=1, user_api="blas"):
-            batch_lists = Parallel(n_jobs=n_jobs, prefer="threads")(
+            per_batch = Parallel(n_jobs=n_jobs, prefer="threads")(
                 delayed(_spatial_pixel_batch)(
                     start,
                     Y_flat[start:end],
@@ -283,10 +367,20 @@ def update_spatial(
                     support[start:end],
                     sn[start:end],
                     T,
+                    max_iter,
+                    tol,
                 )
                 for start, end in batches
             )
-        all_results = [item for batch in batch_lists for item in batch]
+        all_results = [item for batch_res, _ in per_batch for item in batch_res]
+        total_unconverged = sum(batch_unconv for _, batch_unconv in per_batch)
+
+    if total_unconverged > 0:
+        print(
+            f"  update_spatial: {total_unconverged}/{n_pixels} pixels hit "
+            f"max_iter={max_iter} before converging (tol={tol}). Increase "
+            f"CNMFeParams.spatial_max_iter or loosen spatial_tol to tighten."
+        )
 
     # Accumulate per-component pixel values
     new_data: dict[int, dict[int, float]] = {k: {} for k in range(K)}
@@ -306,7 +400,10 @@ def update_spatial(
 
         ai_flat = np.zeros(n_pixels, dtype=np.float32)
         ai_flat[pixel_ids] = values
-        ai_flat = threshold_footprint(ai_flat, dims, max_thr=max_thr)
+        ai_flat = threshold_footprint(
+            ai_flat, dims, max_thr=max_thr, closing_radius=closing_radius,
+            circular_max_dist_factor=circular_max_dist_factor,
+        )
 
         nz = np.where(ai_flat > 0)[0]
         if len(nz) == 0:

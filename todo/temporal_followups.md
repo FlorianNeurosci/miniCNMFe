@@ -1,22 +1,17 @@
-# Temporal-path follow-ups (after sn-collapse fix)
+# Temporal-path follow-ups
 
-The OASIS-collapse bug was that `sn` was estimated from `C_raw[k]` —
-the trace returned by greedy init, which runs on the
-center-surround-*filtered* movie and therefore has its
-high-frequency content stripped. The PSD-based noise estimator then
-returned `sn ≈ 0.005`, OASIS had no noise budget, and `model.C`
-collapsed to a near-flat tail.
-
-Fixed by switching to the closed-form footprint-weighted formula:
+Live follow-up items on the OASIS / AR-estimation path. The original
+`sn`-collapse bug (sn estimated from the centre-surround-filtered
+`C_raw[k]` with stripped high-frequency content → near-zero `sn` →
+OASIS collapse) was fixed in commit `4831330` by switching to the
+closed-form footprint-weighted formula
 
     sn_k = ‖a · sn_flat‖₂ / ‖a‖²
 
-`sn_flat` is already computed by `estimate_noise` on the raw movie,
-so the new path is mathematically principled (assumes per-pixel
-independent noise — the standard CNMF assumption) and cheap.
-
-The items below were identified during the investigation but
-deferred to keep that fix tightly scoped.
+with `sn_flat` from `estimate_noise(Y)`. Items below were identified
+during that investigation and are still open. See also
+`todo/oasis_oversmoothing.md` for the current actionable A/B on the
+over-smoothing symptom.
 
 ## 0. Rank-1 BG (`global_bg_rank=1`) fit broken after Phase-D revert
 
@@ -56,41 +51,26 @@ pixels and survive the subtraction. Polynomial detrend
 aren't polynomial-shaped. Same with detrend on the projection trace.
 
 **What would actually work** (any one of):
+- **Bayesian prior on g** — **implemented 2026-05-21.** Set
+  `CNMFeParams.decay_time_ms` + `frame_rate_hz` (and optionally
+  `g_prior_weight`); the Yule-Walker estimate is shrunk toward
+  `g_target = exp(-1 / (fps · τ_ms / 1000))` and `fudge_factor` is
+  bypassed. Plumbed through every `estimate_ar_params` call site
+  (pipeline init, greedy init, `update_temporal` fallback). This is
+  now the recommended fix for the upward-biased `g` problem.
 - **High-pass / rolling-window detrend** with window ≫ calcium tau
   but ≪ drift correlation length (e.g. ~60 frames vs τ_cal ≈ 10).
   Subtracts the large-scale slow drift while preserving transients.
 - **Decay-segment-only g estimator** — detect candidate transients,
   fit g on inter-spike decay intervals (CaImAn's
   `constrained_foopsi` path does this).
-- **Noise-constrained OASIS** (item #2 below) — sidesteps the issue:
-  with the correct sn budget, OASIS doesn't depend on a tight g.
+- **Noise-constrained OASIS** — already done; the fallback now uses
+  L1 + λ bisection (commit `a8948d6`). With the correct sn budget,
+  OASIS still depends on a tight g, but the symptom is now over-smoothing
+  rather than collapse. See `todo/oasis_oversmoothing.md` for the
+  concrete A/B that lowers `fudge_factor` and detrends the OASIS input.
 
-## 2. ~~CaImAn-style noise-constrained OASIS~~ — DONE (in the fallback)
-
-**What was wrong.** The pure-Python `_oasis_ar1_pava` fallback accepted
-`sn` in its signature but never referenced it — it was plain isotonic
-LS under the AR constraint, no noise budget, no L1 penalty. With
-`oasis-deconvolution` not installed in `claude_cnmfe` (the PyPI name
-doesn't resolve, and the GitHub install is blocked by the auto-mode
-classifier), every deconv call had silently been falling back to that
-unconstrained PAVA — which is why the sn fix from commit `4831330`
-had no visible effect on `model.C`.
-
-**Fix.** Rewrote `_oasis_ar1_pava` as constrained foopsi (Friedrich
-2017 §2.1): minimise `‖y − c‖² + lam·Σ s[t]` subject to the AR
-constraint, with `lam` chosen by bisection so the residual variance
-matches `T · sn²`. Pure Python, no new deps. The pool-value update
-is `max(0, (num − lam/2) / den)` — only change from plain PAVA is the
-`lam/2` shrinkage. Bisection runs ~10 PAVA sweeps per neuron.
-
-**End-to-end effect (realistic miniscope fixture).** With the L1 fix
-plus correct `sn` (commit 4831330), `r(C, truth)` rises from 0.02 to
-0.08 with the wrong g, and to ~0.15 if `fudge_factor` is also lowered
-(item #1). The realistic fixture's ideal-projection ceiling is
-`r ≈ 0.20` (item #4) — most of the remaining gap is data-quality, not
-algorithmic.
-
-## 3. Robust (spike-aware) detrend → raise the detrend defaults
+## 2. Robust (spike-aware) detrend → raise the detrend defaults
 
 **Why it matters.** The polynomial detrend introduced in commit
 `77a7adb` is a least-squares fit; sparse positive spikes pull the
@@ -106,7 +86,7 @@ the median → re-weight those points → repeat 2–3 times. The lower
 envelope of the trace becomes the bleach trajectory; spikes don't
 participate in the fit.
 
-## 4. Realistic-miniscope `r(IDEAL_proj, truth) ≈ 0.20` ceiling
+## 3. Realistic-miniscope `r(IDEAL_proj, truth) ≈ 0.20` ceiling
 
 **Why it matters.** On the realistic-miniscope fixture, the noisy
 projection `(a_true · Y) / ‖a_true‖²` (the *best* `C+YrA` any

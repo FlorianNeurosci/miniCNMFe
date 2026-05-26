@@ -47,6 +47,8 @@ def estimate_ar_params(
     fudge_factor: float = 0.96,
     lags: int = 5,
     detrend_order: int = 0,
+    g_prior: float | None = None,
+    g_prior_weight: float = 0.5,
 ) -> tuple[np.ndarray, float]:
     """Estimate AR(p) decay constants and noise std from a fluorescence trace.
 
@@ -56,13 +58,15 @@ def estimate_ar_params(
        ``detrend_order`` if a slow bleach / scope-warmup trend would
        otherwise inflate the autocorrelation).
     3. Fit AR(p) by solving the Yule-Walker equations on the autocorrelation.
-    4. Apply fudge_factor to prevent over-estimating the decay (slight bias).
+    4. Either shrink toward ``g_prior`` (Bayesian path) or multiply by
+       ``fudge_factor`` (legacy shrinkage toward zero).
 
     Args:
         trace: (T,) fluorescence trace.
         p: AR model order (1 or 2).
         noise_range: Frequency band [f_low, f_high] * Nyquist for noise estimate.
         fudge_factor: Shrinkage applied to g (< 1 avoids over-estimated decay).
+            Ignored when ``g_prior`` is provided.
         lags: Number of autocorrelation lags used.
         detrend_order: NON-STANDARD. Polynomial order subtracted from the trace
             before Yule-Walker. ``0`` (default) = mean only (standard
@@ -70,6 +74,15 @@ def estimate_ar_params(
             (typical photobleaching) so the AR estimate reflects calcium
             dynamics and not the bleach trajectory. Order 3+ starts to
             over-fit the AR(1) envelope and biases g downward.
+        g_prior: Bayesian-prior target for the dominant decay coefficient
+            g[0]. Typically derived from indicator τ + frame rate via
+            ``g_target = exp(-1 / (fps * τ_ms / 1000))``. ``None``
+            (default) selects the legacy ``fudge_factor`` path.
+        g_prior_weight: Shrinkage weight on the prior, ``w ∈ [0, 1]``.
+            ``0`` = pure Yule-Walker, ``1`` = pin at ``g_prior``. Only used
+            when ``g_prior`` is not None. For AR(p > 1) the prior shrinkage
+            applies to ``g[0]`` only; higher-order coefficients use the
+            legacy path.
 
     Returns:
         g: AR coefficients, shape (p,).
@@ -96,11 +109,26 @@ def estimate_ar_params(
     R = np.array([[ac[abs(i - j)] for j in range(p)] for i in range(p)])
     r = ac[1 : p + 1]
     try:
-        g = np.linalg.solve(R, r)
+        g_yw = np.linalg.solve(R, r)
     except np.linalg.LinAlgError:
-        g = np.array([fudge_factor ** (1.0 / max(p, 1))] * p)
+        # Fallback if Yule-Walker is singular: use prior if available,
+        # otherwise the legacy fudge-derived seed.
+        if g_prior is not None:
+            g_yw = np.array([float(g_prior)] * p)
+        else:
+            g_yw = np.array([fudge_factor ** (1.0 / max(p, 1))] * p)
 
-    g = g * fudge_factor
+    if g_prior is not None:
+        # Bayesian shrinkage on g[0] only; higher orders keep the legacy
+        # fudge_factor path so AR(p>1) stays consistent with its existing
+        # multi-coefficient shape.
+        w = float(np.clip(g_prior_weight, 0.0, 1.0))
+        g = g_yw.copy().astype(np.float64)
+        g[0] = (1.0 - w) * float(g_yw[0]) + w * float(g_prior)
+        if p > 1:
+            g[1:] = g[1:] * fudge_factor
+    else:
+        g = g_yw * fudge_factor
     # Clip to (0, 1) for stability
     g = np.clip(g, 0.0, 0.9999)
     return g.astype(np.float32), float(sn)
@@ -318,6 +346,8 @@ def update_temporal(
     sn_cached: np.ndarray | None = None,
     deconvolve: bool = True,
     detrend_order: int = 0,
+    g_prior: float | None = None,
+    g_prior_weight: float = 0.5,
 ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], np.ndarray]:
     """Refine temporal traces by block coordinate descent.
 
@@ -394,9 +424,16 @@ def update_temporal(
         sn_per_k = np.zeros(K, dtype=np.float32)
         for k in range(K):
             try:
-                g_k, sn_k = estimate_ar_params(C[k], p=ar_order)
+                g_k, sn_k = estimate_ar_params(
+                    C[k], p=ar_order,
+                    g_prior=g_prior, g_prior_weight=g_prior_weight,
+                )
             except Exception:
-                g_k = np.array([0.9 ** (1.0 / max(ar_order, 1))] * ar_order, dtype=np.float32)
+                fallback_g = (
+                    float(g_prior) if g_prior is not None
+                    else 0.9 ** (1.0 / max(ar_order, 1))
+                )
+                g_k = np.array([fallback_g] * ar_order, dtype=np.float32)
                 sn_k = float(np.std(C[k])) if np.std(C[k]) > 0 else 1.0
             g_per_k.append(g_k)
             sn_per_k[k] = sn_k

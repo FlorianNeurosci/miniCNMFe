@@ -163,6 +163,28 @@ After initialization the movie is stored as `(H·W, T)` — pixels as rows, time
 - After `merge_components` reorders K, `_cache_after_merge(members_per_group)` updates the cache by inheriting from `members[0]` — no re-estimation, no drift.
 - Re-estimating from a deconvolved trace re-applies `fudge_factor=0.96` and drifts `g` toward 0 across iterations. **Do not re-introduce per-iteration estimation.**
 
+### Bayesian prior on `g` via `decay_time_ms` + `frame_rate_hz`
+When **both** `CNMFeParams.decay_time_ms` and `CNMFeParams.frame_rate_hz` are
+set, the pipeline derives `g_target = exp(-1 / (fps · τ_ms / 1000))` and
+shrinks the Yule-Walker estimate toward it:
+
+    g = (1 - g_prior_weight) · g_yw + g_prior_weight · g_target
+
+`g_prior_weight` defaults to 0.5; bump toward 1 on drift-heavy recordings
+(Yule-Walker is upward-biased there). `fudge_factor` is **bypassed** on the
+prior path — the prior already encodes the physical bound. If either field
+is `None`, the legacy `fudge_factor` shrinkage applies.
+
+Suggested `decay_time_ms` values (single-AP τ, somatic, approximate; vary
+1.5–2× with cell type / AP count / expression):
+- GCaMP6f ~140, jGCaMP7f ~160
+- jGCaMP8f ~70, jGCaMP8m ~180, jGCaMP8s ~350
+- GCaMP6s/7s ~1000
+
+The prior threads through every `estimate_ar_params` call site (pipeline
+init, greedy init, `update_temporal` fallback) so `g` is consistent
+end-to-end. See `todo/oasis_oversmoothing.md` for the diagnostic this fixes.
+
 ### Two trace flavours: `C` vs `C + YrA`
 - `model.C` — OASIS-deconvolved (clean AR(1) shape). Use for spike-event detection.
 - `model.YrA` — residual at each footprint after the final BCD pass.
@@ -323,7 +345,14 @@ todo/speedup.md                Implementation guide for future speed improvement
 - `seed_suppress_factor: float = 2.0` — controls greedy-init suppression disk size
 - `circular_max_dist_factor: float = 2.5` — `circular_constraint` cutoff
 - `merge_centre_dist_factor: float = 2.0` — centre-distance fallback for `merge_components`
-- `global_ar: bool = False` — `True` = one `g` estimated from pooled `C_raw`; `False` = per-neuron `g` from each `C_raw[k]`. Both modes estimate once from raw traces and cache; neither re-estimates from deconvolved traces.
+- `global_ar: bool = True` — `True` (default) = one `g` estimated from pooled `C_raw`; `False` = per-neuron `g` from each `C_raw[k]`. Both modes estimate once from raw traces and cache; neither re-estimates from deconvolved traces. With the prior path enabled (see below), `False` is the more defensible choice — each neuron's Yule-Walker estimate gets shrunk toward the same physical-units target independently, preserving real per-neuron variability.
+- `fudge_factor: float = 0.96` — legacy Yule-Walker shrinkage. **Bypassed when the prior path is enabled.**
+- `decay_time_ms: float | None = None`, `frame_rate_hz: float | None = None` — when both are set, enable the Bayesian prior on `g` (see *Bayesian prior on `g`* section above). Indicator τ table:
+  - GCaMP6f ~140, jGCaMP7f ~160
+  - jGCaMP8f ~70, jGCaMP8m ~180, jGCaMP8s ~350
+  - GCaMP6s / 7s ~1000
+- `g_prior_weight: float = 0.5` — shrinkage weight for the prior path. 0 = pure Yule-Walker, 1 = pin at target. Bump toward 1 on drift-heavy recordings.
+- `ar_detrend_order: int = 0`, `temporal_detrend_order: int = 0` — NON-STANDARD polynomial detrend orders. Set ≥1 to strip slow drift before Yule-Walker (`ar_detrend_order`) and/or before OASIS (`temporal_detrend_order`). Defaults preserve standard CNMF-E behaviour.
 
 `make_miniscope_movie` / `make_synthetic_movie` parameters added (in `tests/`):
 - `motion_max_shift: float = 0.0` — peak drift amplitude in pixels; 0 = no motion (backward-compatible)

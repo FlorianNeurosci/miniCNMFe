@@ -181,9 +181,32 @@ Per-component estimation on $T \approx 300$ traces has a $\sim 0.1$ spread in th
 
    Solve the Toeplitz system $\mathbf{R}\,\mathbf{g} = \mathbf{r}$ where $[\mathbf{R}]_{ij} = r(|i-j|)$ and $[\mathbf{r}]_k = r(k+1)$.
 
-3. **Fudge**: $\mathbf{g} \leftarrow 0.96\,\mathbf{g}$, clipped to $[0, 0.9999]$.
+3. **Shrinkage** — two paths, selected automatically:
+
+   **(a) Bayesian prior** (when both `CNMFeParams.decay_time_ms` and `frame_rate_hz` are set). Derive the indicator's physical target
+
+   $$g_\text{target} = \exp\!\left(-\frac{1}{f_\text{Hz}\cdot \tau_\text{ms}/1000}\right)$$
+
+   and shrink the dominant coefficient toward it:
+
+   $$g_0 \leftarrow (1 - w)\,g_{0,\text{yw}} + w\,g_\text{target},\qquad w = g_\text{prior\_weight} \in [0,1]$$
+
+   Higher-order coefficients (for AR$(p>1)$) keep the legacy multiplier $\mathbf{g}_{1:} \leftarrow 0.96\,\mathbf{g}_{1:}$ since the prior is a single-scalar target.
+
+   **(b) Legacy multiplicative** (when either `decay_time_ms` or `frame_rate_hz` is `None`): $\mathbf{g} \leftarrow \texttt{fudge\_factor}\cdot\mathbf{g}$ with `fudge_factor=0.96` default. Unitless prior toward 0.
+
+   Both paths end with $\mathbf{g} \leftarrow \mathrm{clip}(\mathbf{g}, 0, 0.9999)$ for numerical stability.
 
 4. **Cache**: store $\mathbf{g}_k = \mathbf{g}$ (broadcast to all components) and $\hat{\sigma}_k$. After merging, the cache for component $j$ inherits from the strongest member: $\mathbf{g}_j \leftarrow \mathbf{g}_{\text{members}_j[0]}$ (no re-estimation, no drift).
+
+**Why the prior path matters.** On miniscope data the ring background often
+under-subtracts slow drift, so the autocorrelation $r(1)$ is contaminated by
+the drift and Yule-Walker reports $g_\text{yw} \to 1$ for any indicator.
+$\texttt{fudge\_factor}$ then clamps every estimate at the ceiling regardless
+of the indicator's true $\tau$. The Bayesian prior replaces this unitless
+shrinkage with a physical-units-grounded target — calibrate $\tau_\text{ms}$
+from the indicator (GCaMP6f ~140, jGCaMP8m ~180, jGCaMP8s ~350, etc.) and the
+prior anchors $\mathbf{g}$ where biology says it should be.
 
 ### 6.3 OASIS Deconvolution (AR(1))
 

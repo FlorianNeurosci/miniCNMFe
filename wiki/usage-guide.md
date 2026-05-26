@@ -323,6 +323,49 @@ Default `1` works for GCaMP6s/GCaMP7 at typical frame rates.
 
 ---
 
+### `decay_time_ms` + `frame_rate_hz` — Bayesian prior on the calcium decay (`g`)
+
+The AR(1) decay coefficient `g` is normally estimated from the data via
+Yule-Walker. On clean recordings this works fine. On 1-photon miniscope data,
+slow un-subtracted background inflates the lag-1 autocorrelation and pushes
+`g_yw → 1` regardless of the indicator's true decay time — so the
+deconvolved `C` becomes a sticky AR tail that eats subsequent spikes.
+
+Fix: tell the pipeline what indicator and frame rate you actually used.
+
+```python
+params = CNMFeParams(
+    ...,
+    decay_time_ms=180,     # single-AP τ in ms (table below)
+    frame_rate_hz=20,      # recording fps
+    g_prior_weight=0.5,    # 0 = pure data, 1 = pin at target; 0.5 default
+)
+```
+
+The pipeline derives `g_target = exp(-1 / (fps · τ_ms / 1000))` and shrinks
+every Yule-Walker estimate toward it. `fudge_factor` is bypassed.
+
+| Indicator | τ (single-AP, somatic) |
+|---|---|
+| GCaMP6f | ~140 ms |
+| jGCaMP7f | ~160 ms |
+| jGCaMP8f | ~70 ms |
+| jGCaMP8m | ~180 ms |
+| jGCaMP8s | ~350 ms |
+| GCaMP6s / 7s | ~1000 ms |
+
+Values vary 1.5–2× with cell type, AP count, expression level — these are
+typical somatic numbers from the indicator papers. On drift-heavy
+recordings or recordings where you trust the indicator value more than the
+data, bump `g_prior_weight` toward 1 (e.g. 0.8). Leave either field as
+`None` to fall back to the legacy `fudge_factor` shrinkage.
+
+For mixed populations (e.g. pyramidal + PV interneurons) consider
+`global_ar=False` so each neuron's `g_yw` shrinks toward the prior
+independently, preserving per-cell variability.
+
+---
+
 ### `merge_thr_corr` and `merge_thr_overlap` — merging thresholds
 
 Pairs of components with temporal correlation above `merge_thr_corr` **and** (Jaccard overlap above `merge_thr_overlap` **or** centre-of-mass distance below `merge_centre_dist_factor * sigma`) are merged.
@@ -494,6 +537,14 @@ Should not occur in the current version (floor-division fix applied). If you see
 ### Temporal traces look "snappy" / poorly correlated with ground truth
 
 Use `model.C + model.YrA` instead of `model.C` for shape comparison. `model.C` is OASIS-deconvolved (strict AR(1) shape, may distort spike timing slightly); `C + YrA` is the noisy projected trace (preserves data shape).
+
+### `model.C` flattens into one event with a long smooth tail ("shark fin")
+
+The AR coefficient `g` is biased upward — typically because the ring background under-subtracted slow drift and Yule-Walker reads it as a long calcium tail. Check `model.g[0][0]`: if it's near 0.96 (the default `fudge_factor` ceiling), `g` has pinned. Fix by setting `decay_time_ms` + `frame_rate_hz` on `CNMFeParams` (see [§ Parameter Tuning Guide](#decay_time_ms--frame_rate_hz--bayesian-prior-on-the-calcium-decay-g)). For 8m at 20 Hz, `g_target ≈ 0.76`.
+
+### `model.C + model.YrA` dips below zero
+
+Expected — not a bug. `C + YrA` is the projection of the ring-background-*subtracted* movie. The ring is a linear regression; its residual is roughly mean-zero, so half of all pixel-frames sit below the fitted background after subtraction. Plus per-pixel shot noise is centred around the bg estimate, not around zero. Negative excursions are noise, not signal — they don't indicate the decomposition is wrong. For plotting, subtract a per-row percentile (e.g. `model.C_projected - np.percentile(model.C_projected, 5, axis=1, keepdims=True)`) to float the trace above zero. CaImAn's `Y_r` has the same property for the same reasons.
 
 ### Windows multiprocessing hangs
 

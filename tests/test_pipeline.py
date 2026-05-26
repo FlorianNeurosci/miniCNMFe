@@ -101,6 +101,63 @@ class TestCNMFePipeline:
                 f"footprint-weighted estimator at all."
             )
 
+    def test_decay_time_prior_pulls_g_toward_target(self, synth_small):
+        """Setting decay_time_ms + frame_rate_hz should drive model.g toward
+        the indicator's target g, not the un-anchored Yule-Walker estimate.
+
+        Sanity check that the prior path is plumbed end-to-end through the
+        pipeline. We don't assert an exact value (synth_small's g may differ
+        from our target), only that the prior strongly pulls toward it.
+        """
+        movie = synth_small["movie"]
+        # 100 ms decay at 20 Hz ⇒ g_target = exp(-50/100) ≈ 0.607
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.5, min_pnr=3.0,
+            n_iter_main=1, n_iter_temporal=1,
+            decay_time_ms=100.0, frame_rate_hz=20.0,
+            g_prior_weight=0.95,
+        )
+        model = CNMFe(params).fit(movie, do_motion_correction=False)
+
+        if model.A.shape[1] == 0:
+            pytest.skip("No neurons found; thresholds too tight")
+
+        g_target = float(np.exp(-1.0 / (20.0 * 100.0 / 1000.0)))
+        g_arr = np.array([float(g[0]) for g in model.g])
+        # With weight 0.95 every component's g should be within ~0.05 of target.
+        assert abs(g_arr.mean() - g_target) < 0.05, (
+            f"mean g={g_arr.mean():.3f} vs target={g_target:.3f}"
+        )
+
+    def test_decay_time_prior_disabled_when_either_none(self, synth_small):
+        """If only decay_time_ms or only frame_rate_hz is set, fall back to
+        the legacy fudge_factor path (no prior applied).
+        """
+        movie = synth_small["movie"]
+        # Only decay_time_ms set, frame_rate_hz None -> no prior path
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.5, min_pnr=3.0,
+            n_iter_main=1, n_iter_temporal=1,
+            decay_time_ms=100.0, frame_rate_hz=None,
+        )
+        model_a = CNMFe(params).fit(movie, do_motion_correction=False)
+
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.5, min_pnr=3.0,
+            n_iter_main=1, n_iter_temporal=1,
+        )
+        model_b = CNMFe(params).fit(movie, do_motion_correction=False)
+
+        # Both should produce identical g (prior never engaged).
+        if model_a.A.shape[1] == 0 or model_b.A.shape[1] == 0:
+            pytest.skip("No neurons found; thresholds too tight")
+        ga = np.array([float(g[0]) for g in model_a.g])
+        gb = np.array([float(g[0]) for g in model_b.g])
+        # Same seed in greedy init, same params otherwise: g vectors equal.
+        assert np.allclose(ga, gb), (
+            f"prior should be disabled when frame_rate_hz=None: {ga} vs {gb}"
+        )
+
     def test_output_shapes(self, synth_small):
         movie = synth_small["movie"]
         T, H, W = movie.shape

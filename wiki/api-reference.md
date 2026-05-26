@@ -47,7 +47,18 @@ class CNMFeParams:
 
     # Temporal update / deconvolution
     ar_order: int = 1                          # AR model order (1 or 2)
+    global_ar: bool = True                     # True = one g from pooled C_raw; False = per-neuron g
     n_iter_temporal: int = 2                   # BCD iterations per temporal update
+    fudge_factor: float = 0.96                 # Yule-Walker shrinkage (legacy path; bypassed when prior is set)
+
+    # Bayesian-prior on g (preferred over fudge_factor when known)
+    decay_time_ms: float | None = None         # Indicator τ (single-AP, somatic); see indicator table
+    frame_rate_hz: float | None = None         # Recording fps; both required to enable prior
+    g_prior_weight: float = 0.5                # Shrinkage weight; 0=pure data, 1=pin at target
+
+    # Trace detrending (NON-STANDARD knobs; default 0 = legacy CNMF-E)
+    ar_detrend_order: int = 0                  # Polynomial order subtracted before Yule-Walker
+    temporal_detrend_order: int = 0            # Polynomial order subtracted before OASIS
 
     # Merging
     merge_thr_corr: float = 0.85               # Min temporal correlation to merge
@@ -57,13 +68,32 @@ class CNMFeParams:
     # Main loop
     n_iter_main: int = 2                       # Full spatial+temporal+merge cycles
 
-    # AR coefficient strategy
-    global_ar: bool = False                    # True = one g from pooled C_raw; False = per-neuron g
-
     # Parallelism
     n_jobs: int = 1                            # Workers (-1 = all CPUs, 1 = serial)
     device: str = "cpu"                        # 'cpu' or 'cuda' (requires CuPy)
 ```
+
+**Bayesian g prior.** When both `decay_time_ms` and `frame_rate_hz` are set, the
+pipeline derives `g_target = exp(-1 / (fps · τ_ms / 1000))` and shrinks every
+Yule-Walker estimate toward it:
+
+    g = (1 - g_prior_weight) · g_yw + g_prior_weight · g_target
+
+`fudge_factor` is bypassed on this path (the prior already encodes the
+physical bound). Suggested `decay_time_ms` (single-AP τ, somatic):
+
+| Indicator | τ (ms) |
+|---|---|
+| GCaMP6f | ~140 |
+| jGCaMP7f | ~160 |
+| jGCaMP8f | ~70 |
+| jGCaMP8m | ~180 |
+| jGCaMP8s | ~350 |
+| GCaMP6s / 7s | ~1000 |
+
+Values vary 1.5–2× with cell type, AP count, expression level. Bump
+`g_prior_weight` toward 1 on drift-heavy recordings where Yule-Walker is
+upward-biased.
 
 ---
 
@@ -452,6 +482,10 @@ def update_temporal(
     device: str = "cpu",
     g_cached: list[np.ndarray] | None = None,
     sn_cached: np.ndarray | None = None,
+    deconvolve: bool = True,
+    detrend_order: int = 0,
+    g_prior: float | None = None,
+    g_prior_weight: float = 0.5,
 ) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], np.ndarray]
 ```
 
@@ -461,6 +495,8 @@ Block coordinate descent temporal refinement. **Returns** `(C, S, g_per_k, sn_pe
 - `n_jobs!=1`: Jacobi (parallel, all components updated simultaneously)
 
 **`g_cached` / `sn_cached`**: pass pre-estimated AR coefficients and noise stds to skip per-call estimation. Critical for avoiding drift — without caching, `g` is re-estimated each call from the previously-deconvolved trace, and `estimate_ar_params` re-applies the `fudge_factor=0.96` shrinkage each time, drifting `g` toward 0 over iterations. The pipeline estimates `g` once after init from a pooled `C_raw.ravel()` trace and threads the cache through every call. If `None`, estimation runs once before the BCD loop on the input `C`.
+
+**`g_prior` / `g_prior_weight`**: Bayesian shrinkage target on the dominant AR coefficient. The pipeline derives `g_prior` from `CNMFeParams.decay_time_ms` + `frame_rate_hz` and threads it here (alongside greedy init's call site) so the entire pipeline uses a consistent `g`. Used only on the fallback path when `g_cached` is `None`.
 
 ---
 
@@ -485,10 +521,15 @@ def estimate_ar_params(
     noise_range: tuple[float, float] = (0.25, 0.5),
     fudge_factor: float = 0.96,
     lags: int = 5,
+    detrend_order: int = 0,
+    g_prior: float | None = None,
+    g_prior_weight: float = 0.5,
 ) -> tuple[np.ndarray, float]
 ```
 
 Estimate AR(p) decay constants `g` (shape `(p,)`) and noise std `sn` from a trace.
+
+**Two shrinkage paths.** If `g_prior` is provided (set by the pipeline when `CNMFeParams.decay_time_ms` and `frame_rate_hz` are both non-None), the dominant AR coefficient `g[0]` is computed as a convex combination `(1 - g_prior_weight) · g_yw + g_prior_weight · g_prior` and `fudge_factor` is bypassed. For `p > 1`, higher-order coefficients still use the legacy `fudge_factor` multiplier — the prior is a single-scalar target meaningful only for the dominant decay. If `g_prior is None`, the entire `g` vector is multiplied by `fudge_factor` (legacy behaviour).
 
 ---
 

@@ -44,6 +44,44 @@ class TestEstimateArParams:
         assert g.shape == (1,)
         assert np.isscalar(sn)
 
+    def test_prior_pulls_g_toward_target(self):
+        """With g_prior set, the result should shrink toward the target."""
+        # Build a drift-contaminated trace so naive Yule-Walker over-estimates.
+        rng = np.random.default_rng(7)
+        T = 600
+        drift = np.cumsum(rng.standard_normal(T)) * 0.05    # near-random walk
+        ar = np.zeros(T, dtype=np.float64)
+        for t in range(1, T):
+            ar[t] = 0.7 * ar[t - 1] + (rng.random() < 0.04) * 1.0
+        trace = (ar + drift).astype(np.float32)
+
+        g_baseline, _ = estimate_ar_params(trace, p=1)
+        g_strong, _ = estimate_ar_params(trace, p=1, g_prior=0.7, g_prior_weight=0.95)
+        g_weak, _ = estimate_ar_params(trace, p=1, g_prior=0.7, g_prior_weight=0.05)
+
+        assert abs(float(g_strong[0]) - 0.7) < 0.05, (
+            f"strong prior should land near 0.7, got {float(g_strong[0]):.3f}"
+        )
+        # Weak prior leans on data — the drift biases YW upward, so g_weak
+        # should sit above 0.7 and close to the no-prior baseline.
+        assert float(g_weak[0]) > float(g_strong[0]), (
+            "weak prior should pull less than strong prior"
+        )
+        assert abs(float(g_weak[0]) - float(g_baseline[0])) < 0.1, (
+            "weak prior should not move far from the data-only estimate"
+        )
+
+    def test_no_prior_unchanged(self):
+        """g_prior=None must reproduce the legacy fudge_factor path exactly."""
+        data = make_ar1_trace(T=400, g=0.85, sn=0.2)
+        g_legacy, sn_legacy = estimate_ar_params(data["trace"], p=1, fudge_factor=0.96)
+        g_explicit_none, sn_explicit_none = estimate_ar_params(
+            data["trace"], p=1, fudge_factor=0.96,
+            g_prior=None, g_prior_weight=0.5,
+        )
+        assert float(g_legacy[0]) == float(g_explicit_none[0])
+        assert sn_legacy == sn_explicit_none
+
 
 class TestDeconvolve:
     def test_output_shapes(self):

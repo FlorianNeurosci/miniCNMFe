@@ -214,6 +214,8 @@ def greedy_corr_pnr(
     seed_suppress_factor: float = 2.0,
     circular_max_dist_factor: float = 2.5,
     corrpnr_stride: int = 1,
+    g_prior: float | None = None,
+    g_prior_weight: float = 0.5,
 ) -> tuple[sp.csc_matrix, np.ndarray, np.ndarray, np.ndarray]:
     """Find initial neurons using a greedy CORR-PNR strategy.
 
@@ -333,7 +335,10 @@ def greedy_corr_pnr(
 
             # Deconvolve temporal trace
             try:
-                g, sn = estimate_ar_params(ci, p=ar_order)
+                g, sn = estimate_ar_params(
+                    ci, p=ar_order,
+                    g_prior=g_prior, g_prior_weight=g_prior_weight,
+                )
                 c_clean, s, bl = deconvolve(ci, g, sn)
             except Exception:
                 c_clean = ci.copy()
