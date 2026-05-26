@@ -98,14 +98,14 @@ graph TD
 | `Y_bg` | float32 | `(H·W, T)` | `background.subtract_background` |
 | `S` | float32 | `(K, T)` | `temporal.update_temporal` |
 | `YrA` | float32 | `(K, T)` | `pipeline.fit` (residual at each footprint after final BCD; `C + YrA` = noisy projection) |
-| `shifts` | float32 | `(T, 2)` | `motion_correction.motion_correct` |
+| `shifts` | float32 | `(T, 2)` | `motion_correction.motion_correction_rigid` |
 
 ### Pipeline step by step
 
 ```
 movie_arr (T, H, W)
     │
-    ▼ motion_correct()
+    ▼ motion_correction_rigid()  (or fit_mc / fused fit_mc_from_avis)
 movie_arr (T, H, W)  +  shifts (T, 2)
     │
     ├──► estimate_noise() ──────────────────► sn (H, W)
@@ -164,7 +164,7 @@ Parallelism is **axis-aligned** — partitioning along frames, flattened pixels,
 |------|------|--------|--------------|
 | `correlation_pnr` (PSF conv) | frames (T) | `scipy.ndimage.convolve` | one frame |
 | `greedy_corr_pnr` (PSF conv) | frames (T) | `scipy.ndimage.convolve` | one frame |
-| `motion_correct` | frames (T) | `_shift_and_correct_frame` | one frame |
+| `motion_correction_rigid` | frames (T) | `_filter_estimate_apply` (per batch via `_process_batch`) | one frame |
 | `compute_W` (ring background) | pixels (H·W) | `_ring_pixel_batch` | 500 pixels per batch |
 | `update_spatial` | pixels (H·W) | `_spatial_pixel_batch` | 256 pixels per batch |
 | `update_temporal` (OASIS) | neurons (K) | `_deconvolve_with` | one component |
@@ -192,7 +192,7 @@ After initialisation, the movie is stored as `(H·W, T)` — pixels as rows, tim
 All math is reimplemented from scratch using numpy/scipy/skimage/sklearn. CaImAn source is referenced for algorithm design only.
 
 ### Module-level worker functions
-Functions dispatched by `joblib.Parallel` (e.g. `_shift_and_correct_frame`, `_deconvolve_with`) are always defined at the **top level** of their module, not as lambdas or nested functions. This is required for pickling on Windows (`spawn` process start method). `_deconvolve_with` replaced the older `_deconvolve_one` and takes pre-computed `g`/`sn` so it does not re-estimate AR params per call.
+Functions dispatched by `joblib.Parallel` (e.g. `_filter_estimate_apply`, `_deconvolve_with`) are always defined at the **top level** of their module, not as lambdas or nested functions. This is required for pickling on Windows (`spawn` process start method). `_deconvolve_with` replaced the older `_deconvolve_one` and takes pre-computed `g`/`sn` so it does not re-estimate AR params per call.
 
 ### Bayesian-prior path for AR coefficient `g`
 `estimate_ar_params` has two shrinkage paths. The legacy path multiplies the Yule-Walker estimate by `fudge_factor` (default `0.96`) — a unitless prior toward zero. The prior path takes `g_prior = exp(-1 / (fps · τ_ms / 1000))` derived from `CNMFeParams.decay_time_ms` + `frame_rate_hz` and shrinks toward it: `g = (1 - g_prior_weight) · g_yw + g_prior_weight · g_prior`. `fudge_factor` is bypassed on the prior path.

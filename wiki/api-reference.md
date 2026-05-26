@@ -21,6 +21,11 @@ class CNMFeParams:
     max_shift: tuple[int, int] = (20, 20)     # Max (dy, dx) shift in pixels
     upsample_factor: int = 10                  # Subpixel precision = 1/upsample_factor
     mc_n_iter: int = 1                         # Number of correction passes (CaImAn default is 1)
+    mc_gSig_filt: float | None = None          # High-pass Gaussian radius for MC (None = use sigma)
+    mc_batch_size: int = 200                   # Frames per streaming/parallel MC batch
+    mc_template_max_frames: int = 2000         # Cap on frames sampled to build the MC template
+    mc_output_chunk_t: int | None = None       # Output zarr time chunk (None = match source)
+    mc_output_dtype: str = "float32"           # Output zarr dtype for the corrected movie
 
     # Spatial filtering / PSF
     sigma: float = 3.0                         # Neuron Gaussian radius in pixels
@@ -36,19 +41,29 @@ class CNMFeParams:
     init_max_corr_bg: float = 0.4              # "Background pixel" threshold inside extract_spatial_temporal
     seed_suppress_factor: float = 2.0          # Suppression disk after extraction = factor * sigma
     circular_max_dist_factor: float = 2.5      # circular_constraint cutoff = factor * estimated_radius
+    init_stride: int | None = None             # Temporal stride for greedy init (None = auto, max(1, T//5000))
+    init_corrpnr_stride: int | None = None     # Temporal stride for the CORR/PNR summary images (None = auto)
 
     # Background (ring model)
     ring_size_factor: float = 1.5              # ring_radius = factor * (2*sigma + 1)
     ring_lambda: float = 1e-5                  # Ridge regularisation for ring regression
+    ring_constrain_sum: bool = False           # Constrain ring weights to sum to 1 (see ring-constrain-sum)
+    global_bg_rank: int = 0                    # Extra low-rank global background components (0 = ring only)
+    bg_tsub: int = 5                           # Temporal subsample factor when fitting W / b0
 
     # Spatial update
-    dilation_radius: int = 3                   # Support dilation for LassoLars
+    dilation_radius: int = 2                   # Support dilation for LassoLars
     spatial_max_thr: float = 0.1               # Zero footprint pixels < this fraction of peak
+    spatial_close_radius: int = 1              # Morphological close radius on the support mask
+    spatial_max_iter: int = 1000               # LassoLars max iterations
+    spatial_tol: float = 1e-4                  # LassoLars convergence tolerance
+    spatial_circular_max_dist_factor: float = 1.5  # circular cutoff applied after the spatial update
 
     # Temporal update / deconvolution
     ar_order: int = 1                          # AR model order (1 or 2)
     global_ar: bool = True                     # True = one g from pooled C_raw; False = per-neuron g
     n_iter_temporal: int = 2                   # BCD iterations per temporal update
+    skip_first_deconv: bool = True             # Skip OASIS on the first temporal pass (speed; see todo/speedup)
     fudge_factor: float = 0.96                 # Yule-Walker shrinkage (legacy path; bypassed when prior is set)
 
     # Bayesian-prior on g (preferred over fudge_factor when known)
@@ -67,11 +82,22 @@ class CNMFeParams:
 
     # Main loop
     n_iter_main: int = 2                       # Full spatial+temporal+merge cycles
+    sample_frames: int = 1000                  # Frames sampled for noise/CORR-PNR summaries
+
+    # Auto-evaluation (non-destructive tagging)
+    auto_eval_snr_amp_thr: float = 3.0         # Mean-amplitude SNR threshold (0 = disable SNR check)
 
     # Parallelism
     n_jobs: int = 1                            # Workers (-1 = all CPUs, 1 = serial)
     device: str = "cpu"                        # 'cpu' or 'cuda' (requires CuPy)
 ```
+
+**Downsample-once rescale.** `params.downscaled(ssub, tsub)` returns a **copy**
+with the unit-bearing fields rescaled for a movie binned by `ssub` (space) /
+`tsub` (time): `sigma /= ssub`, `min_pixel //= ssub²`, `border_px //= ssub`,
+`max_shift //= ssub`, `mc_gSig_filt /= ssub`, `frame_rate_hz /= tsub`.
+`decay_time_ms` is a physical time and is left **unchanged**. Express params once
+in native units and call `.downscaled(...)` for the binned pipeline.
 
 **Bayesian g prior.** When both `decay_time_ms` and `frame_rate_hz` are set, the
 pipeline derives `g_target = exp(-1 / (fps · τ_ms / 1000))` and shrinks every
@@ -110,8 +136,15 @@ class CNMFe:
         movie: zarr.Array | np.ndarray,
         do_motion_correction: bool = True,
         output_dir: str | Path | None = None,
+        Y_flat_zarr: zarr.Array | None = None,
+        evaluate: bool = True,
     ) -> "CNMFe": ...
 ```
+
+`fit()` is a **thin wrapper** that composes the standalone stages
+`fit_mc` (optional) → `fit_extract` → `evaluate`. The decomposition is
+bit-for-bit identical to the old monolith at `n_jobs=1`
+(`tests/test_stage_split.py`).
 
 **`fit()` parameters**
 
@@ -120,6 +153,77 @@ class CNMFe:
 | `movie` | `zarr.Array` or `np.ndarray` | Input movie, shape `(T, H, W)` |
 | `do_motion_correction` | `bool` | Run rigid motion correction first (default `True`) |
 | `output_dir` | `str \| Path \| None` | Save motion-corrected movie here as zarr (optional) |
+| `Y_flat_zarr` | `zarr.Array \| None` | Pre-transposed pixel-major store (see `transpose_zarr_to_pixel_major`) for true T-streaming; peak RAM then independent of T |
+| `evaluate` | `bool` | Run the non-destructive auto-eval pass (default `True`) |
+
+**Staged entry points** — `fit()` composes these; call them directly for a
+disk handoff between stages (the four `run_*.py` CLIs wrap them):
+
+```python
+def fit_mc(self, movie, output_dir=None) -> zarr.Array | np.ndarray: ...
+def fit_extract(self, movie, *, Y_flat_zarr=None, output_dir=None, evaluate=True) -> "CNMFe": ...
+def evaluate(self) -> "CNMFe": ...
+```
+
+- `fit_mc` — in-memory rigid motion correction; returns the corrected movie (zarr handle if `output_dir` given, else numpy). Motion correction is **not** part of `fit_extract`.
+- `fit_extract` — noise estimation through the BCD loop, final temporal pass, and `YrA`. **Resolution-agnostic**: runs on whatever movie it is handed (full or downsampled). Contains the streaming `Y_flat_zarr` auto-derive logic.
+- `evaluate` — the non-destructive auto-eval. Reads **only** `self.A` + `self.sn`, so it can be re-run on a freshly `load()`-ed model to retune `min_pixel` / `auto_eval_snr_amp_thr` without re-extracting.
+
+**Fused AVI → motion-corrected zarr** (wraps `cnmfe.avi_mc.concat_avis_to_mc_zarr`, documented below):
+
+```python
+def fit_mc_from_avis(
+    self,
+    folder: str | Path,
+    output_dir: str | Path,
+    *,
+    pattern: str = "*.avi",
+    skip_if_exists: bool = False,
+    ssub: int = 1,
+    tsub: int = 1,
+) -> zarr.Array: ...
+```
+
+Decode an AVI folder + apply rigid motion correction in one pass, writing only
+`<output_dir>/mc.zarr` — no intermediate `session.zarr`. `ssub` / `tsub` bin
+frames (block-mean) **before** MC; pass `params.downscaled(ssub, tsub)` so MC
+knobs match the binned grid. Returns the open `mc.zarr` handle.
+
+**Upsample a downsampled model back to native resolution:**
+
+```python
+def upsample_to_native(
+    self,
+    *,
+    orig_dims: tuple[int, int] | None = None,
+    orig_T: int | None = None,
+    ssub: int | None = None,
+    tsub: int | None = None,
+    ds_meta: dict | str | Path | None = None,
+    spatial_order: int = 1,
+) -> "CNMFe": ...
+```
+
+Returns a **new, non-destructive** model with `A` (bilinear) and
+`C`/`YrA`/`C_raw` (linear) interpolated to the native grid/rate — for overlaying
+footprints on a native reference image and plotting against native-rate signals.
+This is **interpolation, not recovery** (the native movie is gone in
+downsample-once). The returned model is **inspection-only**: `S` stays at the
+downsampled rate, and `W`/`b0`/`f`/`shifts` are dropped — do not re-run the BCD
+on it. Supply native `(H, W)` / `T` via `orig_dims`+`orig_T`, the `ssub`/`tsub`
+factors, or a `ds_meta` dict/path (only `downsample_movie` writes a
+`ds_meta.json`).
+
+**Persistence:**
+
+```python
+def save(self, output_dir: str | Path) -> None: ...
+@staticmethod
+def load(output_dir: str | Path) -> "CNMFe": ...
+```
+
+`save()` writes `A`/`C`/`S`/`C_raw`/`YrA`/`W`/`b0`/`sn`/`g`/`shifts`/`params`
+plus `accepted_mask.npy` and `eval_info.npz`; `load()` restores them.
 
 **Result attributes** (available after `fit()`)
 
@@ -136,6 +240,8 @@ class CNMFe:
 | `g` | `list[np.ndarray]` | `K × (p,)` | Per-component AR coefficients used for OASIS (pooled estimate from `C_raw` then cached, not re-estimated each iteration) |
 | `sn_per_k` | `np.ndarray` | `(K,)` | Per-component noise std used for OASIS |
 | `shifts` | `np.ndarray \| None` | `(T, 2)` | Per-frame (dy, dx) shifts, or `None` |
+| `accepted_mask` | `np.ndarray` | `(K,)` bool | Components passing both auto-eval checks (pixel-count floor AND mean-amplitude SNR). **Nothing is dropped** — slice `A`/`C`/`S`/`YrA` by this mask to use accepted components only. |
+| `eval_info` | `dict` | — | Per-component auto-eval stats: `pixel_count`, `snr_amp`, `pixel_pass`, `snr_pass`, plus the thresholds applied. |
 | `dims` | `tuple[int, int]` | — | `(H, W)` image dimensions |
 
 > [!TIP]
@@ -153,7 +259,8 @@ def avi_to_zarr(
     dest: str | Path,
     chunk_t: int = 100,
     grayscale: bool = True,
-    dtype: str = "float32",
+    dtype: str = "uint8",
+    compression: bool = True,
 ) -> zarr.Array
 ```
 
@@ -176,33 +283,100 @@ Open an existing zarr store. `mode="r"` for read-only, `"r+"` to append.
 ### `save_zarr`
 
 ```python
-def save_zarr(arr: np.ndarray, path: str | Path, chunk_t: int = 100) -> zarr.Array
+def save_zarr(
+    arr: np.ndarray,
+    path: str | Path,
+    chunk_t: int = 100,
+    dtype: str = "float32",
+    compression: bool = True,
+) -> zarr.Array
 ```
 
 Persist an in-memory `(T, H, W)` array to zarr. Useful for saving intermediate results.
 
 ---
 
-## `cnmfe.motion_correction`
-
-### `motion_correct`
+### `transpose_zarr_to_pixel_major`
 
 ```python
-def motion_correct(
-    movie: zarr.Array | np.ndarray,
-    upsample_factor: int = 10,
-    max_shift: tuple[int, int] = (20, 20),
-    n_iter: int = 2,
-    output_path: str | Path | None = None,
-    template_frames: int = 200,
-    update_interval: int = 100,
-    n_jobs: int = 1,
-) -> tuple[np.ndarray, np.ndarray]
+def transpose_zarr_to_pixel_major(
+    src: str | Path,
+    dest: str | Path,
+    *,
+    pixel_chunk: int = 4096,
+    time_chunk: int = 2000,
+    dtype: str = "float32",
+    compression: bool = True,
+    src_batch_frames: int = 2000,
+    skip_if_exists: bool = True,
+    verbose: bool = True,
+) -> zarr.Array
 ```
 
-Rigid motion correction. Template initialised from the mean of the first `template_frames` frames; updated as a running mean every `update_interval` frames.
+One-time on-disk transpose of a `(T, H, W)` zarr into a pixel-major `(H·W, T)`
+store. Pixel ordering matches `make_2d` (pixel `(h, w)` → flat `h*W + w`). Pass
+the result as `fit(..., Y_flat_zarr=...)` to run **true T-streaming** extraction —
+peak RAM independent of T, bounded by `K·T·4` (traces) + per-batch buffers.
+Open the result later with `open_zarr_pixel_major`.
 
-**Returns:** `(corrected_movie, shifts)` where `corrected_movie` has shape `(T, H, W)` and `shifts` has shape `(T, 2)`.
+---
+
+### `open_zarr_pixel_major`
+
+```python
+def open_zarr_pixel_major(path: str | Path, mode: str = "r") -> zarr.Array
+```
+
+Open a pixel-major `(H·W, T)` store produced by `transpose_zarr_to_pixel_major`.
+
+---
+
+## `cnmfe.motion_correction`
+
+### `motion_correction_rigid`
+
+```python
+def motion_correction_rigid(
+    movie: zarr.Array | np.ndarray,
+    output_path: str | Path | None = None,
+    max_shift: tuple[int, int] = (20, 20),
+    gSig_filt: float = 7,
+    upsample_factor: int = 10,
+    niter_rig: int = 1,
+    bin_window: int = 10,
+    template: np.ndarray | None = None,
+    batch_size: int = 200,
+    n_jobs: int = 1,
+    template_max_frames: int = 2000,
+    output_chunk_t: int | None = None,
+    output_dtype: str = "float32",
+    compression: bool = True,
+    verbose: bool = True,
+) -> tuple[zarr.Array | np.ndarray, np.ndarray]
+```
+
+The **canonical** rigid motion correction. Two execution paths chosen
+automatically:
+
+- **Streaming (zarr-backed)** — used when the input is a `zarr.Array` *or*
+  `output_path` is given. Reads/writes batches; peak RAM is
+  `(batch_size + template_max_frames) · H · W · 4` bytes, independent of T.
+  Zarr input **requires** `output_path`. For `niter_rig > 1` it ping-pongs
+  between two scratch zarrs and moves the final result to `output_path`.
+- **In-memory** — numpy input, no `output_path`. Same algorithm, returns a
+  numpy corrected movie. Kept for the small-movie test path.
+
+Uses `cv2.filter2D` high-pass filtering and `cv2.warpAffine` to apply shifts
+(matching CaImAn; scipy/FFT equivalents introduce a ~4–5 px offset — do not
+substitute). The template is built from a strided sample of up to
+`template_max_frames` frames, bin-median-reduced over `bin_window`.
+
+**Returns:** `(corrected, shifts)` — `corrected` is a `zarr.Array` handle (zarr
+path) or `(T, H, W)` numpy array (in-memory path); `shifts` is `(T, 2)`.
+
+> `CNMFe.fit_mc(movie, output_dir=...)` is the convenience entry for big movies;
+> pass a `zarr.Array` + `output_dir` and the corrected movie is written to
+> `<output_dir>/mc.zarr` without materialising T frames in RAM.
 
 ---
 
@@ -214,20 +388,117 @@ def estimate_shifts(
     template: np.ndarray,
     upsample_factor: int = 10,
     max_shift: tuple[int, int] = (20, 20),
+    gSig_filt: float | None = None,
 ) -> np.ndarray
 ```
 
-Compute subpixel `(dy, dx)` shift between `frame` and `template` via phase cross-correlation. Returns shape `(2,)`.
+Thin wrapper around `register_translation_caiman`. Computes the subpixel
+`(dy, dx)` shift between `frame` and `template`; if `gSig_filt` is set, both are
+high-pass filtered first. Returns shape `(2,)`.
 
 ---
 
 ### `apply_shift`
 
 ```python
-def apply_shift(frame: np.ndarray, shift: np.ndarray) -> np.ndarray
+def apply_shift(img: np.ndarray, shift: np.ndarray) -> np.ndarray
 ```
 
-Apply a `(dy, dx)` shift to `frame` via Fourier-domain phase multiplication. No spatial interpolation artifacts.
+Apply a `(dy, dx)` shift to `img` (alias for `apply_shift_caiman`, which uses
+`cv2.warpAffine` with cubic interpolation — matches CaImAn's pixel grid).
+
+---
+
+## `cnmfe.avi_mc` — Fused AVI → motion-corrected zarr
+
+### `concat_avis_to_mc_zarr`
+
+```python
+def concat_avis_to_mc_zarr(
+    folder: str | Path,
+    output_path: str | Path,
+    params: CNMFeParams,
+    *,
+    pattern: str = "*.avi",
+    n_jobs: int | None = None,
+    skip_if_exists: bool = False,
+    n_template_avis: int = 10,
+    ssub: int = 1,
+    tsub: int = 1,
+    verbose: bool = True,
+) -> tuple[zarr.Array, np.ndarray]
+```
+
+Decode an AVI folder and apply rigid motion correction in a **single pass**,
+writing only `mc.zarr` — **no intermediate `session.zarr`** is materialised
+(saves ~5 min and ~6 GB on a network mount for a 100k-frame session vs. running
+`concat_avis_to_zarr` + `fit_mc` separately). `CNMFe.fit_mc_from_avis` wraps this.
+
+Pipeline: pre-scan each AVI for `(count, H, W)` → build the MC template from a
+strided subset of `n_template_avis` files → re-decode every AVI in parallel and
+motion-correct batches into `mc.zarr` + a `(T, 2)` shifts buffer.
+
+**Inline downsampling** (`ssub` / `tsub`): decoders bin frames (block-mean) to
+float32 **before** MC; the template and output shape come from the per-file
+binned counts (`sum(n_i // tsub)`, `H//ssub`, `W//ssub`). Pass
+`params.downscaled(ssub, tsub)` so `max_shift` / `mc_gSig_filt` match the binned
+grid. Output uses heavyweight `clevel=5` + bitshuffle (mc.zarr is read many times
+during extraction). `params.mc_n_iter > 1` is supported via a scratch-zarr handoff
+to `motion_correction_rigid` for the remaining passes.
+
+**Returns:** `(mc_zarr, shifts)`.
+
+---
+
+## `cnmfe.downsample` — Spatial/temporal binning + re-upsampling
+
+### `downsample_movie`
+
+```python
+def downsample_movie(
+    src: str | Path,
+    dest: str | Path,
+    *,
+    ssub: int = 1,
+    tsub: int = 1,
+    src_batch_frames: int = 2000,
+    chunk_t: int = 500,
+    dtype: str = "float32",
+    compression: bool = True,
+    skip_if_exists: bool = True,
+    write_meta: bool = True,
+    verbose: bool = True,
+) -> zarr.Array
+```
+
+Streaming block-mean of an existing `(T, H, W)` zarr by `ssub` (space) / `tsub`
+(time). Non-divisible dims are trimmed to a multiple of the factor before
+binning; the trailing `< tsub` frames are dropped (output T = `T // tsub`). When
+`write_meta`, a `ds_meta.json` sidecar (`ssub`, `tsub`, `orig_dims`, `orig_T`) is
+written next to `dest` — feed it to `run_extract.py --ds-meta` or
+`CNMFe.upsample_to_native(ds_meta=...)`.
+
+**Returns:** open downsampled `zarr.Array`.
+
+---
+
+### `upsample_footprints`
+
+```python
+def upsample_footprints(A, ds_dims, native_dims, order: int = 1)
+```
+
+Interpolate footprints `A` `(ds_H·ds_W, K)` from the downsampled grid to
+`native_dims` `(H, W)` via per-column `cv2.resize`. Returns `(H·W, K)`.
+
+### `upsample_traces`
+
+```python
+def upsample_traces(C, native_T: int, kind: str = "linear")
+```
+
+Interpolate traces `C` `(K, T_ds)` to `native_T` columns via per-row `np.interp`.
+Used by `CNMFe.upsample_to_native` — **interpolation, not recovery**.
 
 ---
 
@@ -240,7 +511,10 @@ def correlation_pnr(
     movie: zarr.Array | np.ndarray,
     sigma: float | None = None,
     center_psf: bool = True,
+    noise_range: tuple[float, float] = (0.25, 0.5),
     n_jobs: int = 1,
+    device: str = "cpu",
+    stride: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]
 ```
 
@@ -248,6 +522,7 @@ Compute CORR and PNR summary images.
 
 - If `sigma` is given, apply center-surround PSF filtering first.
 - If `center_psf=False` or `sigma=None`, skip filtering (use when movie is already filtered).
+- `stride` subsamples frames in time for the summary (speed on long recordings).
 
 **Returns:** `(cn, pnr)` both shape `(H, W)`.
 
@@ -433,6 +708,10 @@ def update_spatial(
     dilation_radius: int = 3,
     n_jobs: int = 1,
     max_thr: float = 0.1,
+    closing_radius: int = 1,
+    max_iter: int = 1000,
+    tol: float = 1e-4,
+    circular_max_dist_factor: float = 1.5,
 ) -> sp.csc_matrix
 ```
 
@@ -459,10 +738,16 @@ For each pixel, return indices of components whose dilated footprint covers that
 ### `threshold_footprint`
 
 ```python
-def threshold_footprint(ai: np.ndarray, dims: tuple[int, int], max_thr: float = 0.1) -> np.ndarray
+def threshold_footprint(
+    ai: np.ndarray,
+    dims: tuple[int, int],
+    max_thr: float = 0.1,
+    closing_radius: int = 1,
+    circular_max_dist_factor: float = 1.5,
+) -> np.ndarray
 ```
 
-Clean a spatial footprint: median filter → zero pixels below 10% of max → keep largest connected component. Input is flat `(H·W,)`. **Returns** flat `(H·W,)`.
+Clean a spatial footprint: median filter → zero pixels below `max_thr × max` → morphological close (`closing_radius`) → keep largest connected component → zero pixels beyond `circular_max_dist_factor × radius` from the centroid. Input is flat `(H·W,)`. **Returns** flat `(H·W,)`.
 
 ---
 
