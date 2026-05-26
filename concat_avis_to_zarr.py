@@ -99,6 +99,9 @@ def _decode_avi_worker(
     the absolute `start` index carried by each batch lets the writer place
     them correctly when batches from different files arrive interleaved.
 
+    ``start_offset`` is the file's exact absolute position in the output
+    zarr, computed by the caller from the pre-scan frame counts.
+
     On any exception, the exception is appended to `errors`, `stop_event`
     is set, and a `_DECODER_DONE` sentinel is sent so the writer can
     bail out.
@@ -193,7 +196,7 @@ def concat_avis_to_zarr(
     folder: "str | Path",
     output_path: "str | Path | None" = None,
     pattern: str = "*.avi",
-    chunk_t: int = 100,
+    chunk_t: int = 500,
     dtype: str = "uint8",
     grayscale: bool = True,
     skip_if_exists: bool = False,
@@ -201,6 +204,8 @@ def concat_avis_to_zarr(
     grayscale_method: str = "luma",
     queue_maxsize: "int | None" = None,
     verbose: bool = True,
+    clevel: int = 3,
+    shuffle: str = "shuffle",
 ):
     """Concatenate numbered AVIs in `folder` into a single time-chunked zarr.
 
@@ -211,12 +216,26 @@ def concat_avis_to_zarr(
     gives a roughly N× speed-up on intra-coded codecs (MJPEG / motion-JPEG —
     the common miniscope case), capped by IO and memory bandwidth.
 
+    Pipeline:
+      1. Pre-scan every AVI via ``_count_and_shape`` (a pyav walk that
+         counts frames) so the output zarr is sized exactly and per-file
+         offsets are known up front.
+      2. Allocate the output zarr.
+      3. Spawn `n_jobs` decoder threads (one per AVI, admitted via a
+         semaphore) that decode frames in parallel and push them through
+         a bounded queue.
+      4. The writer drains the queue and writes batches to the zarr at
+         the position dictated by each file's pre-scan offset.
+
     Args:
         folder: Directory containing the AVI files.
         output_path: Output zarr path. Default: `<folder>/movie.zarr`.
         pattern: Glob pattern. Default `"*.avi"`. Use e.g. `"realistic_*.avi"`
             to pick a subset.
-        chunk_t: Frames per time chunk in the output zarr.
+        chunk_t: Frames per time chunk in the output zarr. Default 500 —
+            chosen so a 100k-frame session uses ~200 chunk writes instead
+            of ~1000; matters on network-mounted output stores where each
+            chunk write is a round-trip.
         dtype: On-disk dtype. Default `"uint8"` (matches 8-bit miniscope AVIs).
             Use `"float32"` for already-corrected/float intermediates.
         grayscale: Convert RGB → gray at read time. Default True.
@@ -226,8 +245,8 @@ def concat_avis_to_zarr(
         n_jobs: Number of parallel decoder threads. ``1`` keeps the original
             serial path (single decoder + inline writes). ``>=2`` enables the
             producer-consumer pipeline. ``None`` (default) picks
-            ``min(cpu_count, len(avis), 4)`` — beyond ~4 the speedup
-            plateaus because of IO / memory bandwidth.
+            ``min(cpu_count, len(avis))`` — more in-flight reads materially
+            help when the source AVIs sit on a network mount.
         grayscale_method: ``"luma"`` (default, fast) decodes directly to a
             ``(H, W) uint8`` Y-plane via pyav's ``format="gray8"``.
             ``"mean"`` decodes RGB and averages channels (the historical
@@ -236,7 +255,14 @@ def concat_avis_to_zarr(
         queue_maxsize: Bounded-queue depth for the parallel pipeline.
             ``None`` (default) = ``2 * n_jobs``. Larger uses more RAM, smaller
             risks starving the writer.
-        verbose: Print progress lines.
+        verbose: Print progress + per-phase timing lines.
+        clevel: blosc compression level for the output zarr. Default 3 —
+            ~3× faster compress than the project-wide default of 5, with
+            ~10 % size penalty on uint8 imaging data. The writer thread is
+            single-threaded so freeing it up keeps decoders un-stalled.
+        shuffle: blosc shuffle filter — ``"shuffle"`` (byte, default;
+            fast), ``"bitshuffle"`` (slower, ~10 % smaller), or
+            ``"noshuffle"``.
 
     Returns:
         Open zarr.Array with shape (T_total, H, W).
@@ -247,6 +273,9 @@ def concat_avis_to_zarr(
             dimensions disagree across files, or unknown ``grayscale_method``.
         FileExistsError: output exists and `skip_if_exists` is False.
     """
+    import time as _time
+    _t0_total = _time.time()
+
     if grayscale_method not in ("luma", "mean"):
         raise ValueError(
             f"grayscale_method must be 'luma' or 'mean', got {grayscale_method!r}"
@@ -282,7 +311,13 @@ def concat_avis_to_zarr(
         print(f"Found {len(avis)} AVI files: "
               f"{avis[0].name} ... {avis[-1].name}")
 
-    # --- Pre-scan: count frames and validate spatial dimensions -------------
+    # --- Pre-scan: walk every AVI to count frames + check spatial dims ------
+    # Necessary because the output zarr must be created with an exact T;
+    # decoder threads then write to known per-file offsets and there is no
+    # resize-at-end pass. Over a network mount this can be a few seconds
+    # per file (pyav has to scan the stream to count frames in MJPG); the
+    # cost is reported in the timing line at the end.
+    _t0_probe = _time.time()
     if verbose:
         print("Scanning frame counts ...", flush=True)
     counts: list[int] = []
@@ -299,28 +334,36 @@ def concat_avis_to_zarr(
         counts.append(n)
         if verbose:
             print(f"  {avi.name}: {n} frames  ({H}x{W})", flush=True)
-
     T_total = sum(counts)
     if verbose:
         print(f"\nTotal: {T_total} frames  x  {ref_H}x{ref_W} px")
+    _probe_secs = _time.time() - _t0_probe
 
     # --- Create zarr --------------------------------------------------------
+    _t0_create = _time.time()
     from cnmfe.io import _open_array
     store = _open_array(out_path, "w",
                         shape=(T_total, ref_H, ref_W),
                         chunks=(chunk_t, ref_H, ref_W),
                         dtype=dtype,
-                        compression=True)
+                        compression=True,
+                        clevel=clevel,
+                        shuffle=shuffle)
+    _create_secs = _time.time() - _t0_create
     if verbose:
         print(f"\nWriting -> {out_path}")
-        print(f"  shape={store.shape}  chunks={store.chunks}  dtype={dtype}",
-              flush=True)
+        print(f"  shape={store.shape}  chunks={store.chunks}  dtype={dtype}  "
+              f"compression=lz4 clevel={clevel} shuffle={shuffle}", flush=True)
 
     # --- Pick parallel vs serial path --------------------------------------
     if n_jobs is None:
-        n_jobs = min(os.cpu_count() or 1, len(avis), 4)
+        # Raise the historical 4-cap: on network-mounted sources more
+        # in-flight reads materially help. Locally, decoders are cheap
+        # relative to the (single) compressing writer.
+        n_jobs = min(os.cpu_count() or 1, len(avis))
     n_jobs = max(1, int(n_jobs))
 
+    _t0_decode = _time.time()
     if n_jobs == 1:
         write_start = _run_serial(
             avis, counts, store, chunk_t, dtype, grayscale, grayscale_method,
@@ -333,10 +376,19 @@ def concat_avis_to_zarr(
             avis, counts, store, chunk_t, dtype, grayscale, grayscale_method,
             n_jobs, queue_maxsize, verbose,
         )
+    _decode_secs = _time.time() - _t0_decode
 
     if verbose:
+        total_secs = _time.time() - _t0_total
+        bytes_total = T_total * ref_H * ref_W * np.dtype(dtype).itemsize
+        gbps = bytes_total / max(total_secs, 1e-3) / 1e9
         print(f"\nDone. Zarr written to: {out_path}")
         print(f"  Total frames written: {write_start}")
+        print(f"  Timing: pre-scan {_probe_secs:.1f}s  "
+              f"create {_create_secs:.2f}s  "
+              f"decode+write {_decode_secs:.1f}s  "
+              f"total {total_secs:.1f}s  "
+              f"({gbps:.2f} GB/s raw equivalent)")
 
     return store
 
@@ -386,7 +438,6 @@ def _run_serial(avis, counts, store, chunk_t, dtype, grayscale,
             if verbose:
                 print(f"{counts[avi_idx]} frames", flush=True)
     else:
-        # RGB or "mean" grayscale: go through the imageio iterator.
         for avi_idx, avi in enumerate(avis):
             if verbose:
                 print(f"  [{avi_idx + 1}/{len(avis)}] {avi.name} ...",
@@ -474,8 +525,8 @@ def main() -> None:
                         help="Output zarr path (default: <folder>/movie.zarr)")
     parser.add_argument("--pattern", default="*.avi",
                         help="Glob pattern for AVI files (default: *.avi)")
-    parser.add_argument("--chunk-t", type=int, default=100,
-                        help="Frames per time chunk in zarr (default: 100)")
+    parser.add_argument("--chunk-t", type=int, default=500,
+                        help="Frames per time chunk in zarr (default: 500)")
     parser.add_argument("--dtype", default="uint8",
                         help="On-disk dtype (default: uint8; use float32 for float intermediates)")
     parser.add_argument("--color", action="store_true",
@@ -483,7 +534,7 @@ def main() -> None:
     parser.add_argument("--skip-if-exists", action="store_true",
                         help="If output zarr already exists, reuse it (default: error)")
     parser.add_argument("--n-jobs", type=int, default=None,
-                        help="Parallel decoder threads (default: auto = min(cpu, len(avis), 4); "
+                        help="Parallel decoder threads (default: auto = min(cpu, len(avis)); "
                              "1 = original serial path)")
     parser.add_argument("--grayscale-method", choices=("luma", "mean"),
                         default="luma",
@@ -492,6 +543,13 @@ def main() -> None:
     parser.add_argument("--queue-maxsize", type=int, default=None,
                         help="Bounded-queue depth in the parallel pipeline "
                              "(default: 2 * n_jobs)")
+    parser.add_argument("--clevel", type=int, default=3,
+                        help="blosc compression level for the output zarr "
+                             "(default: 3, fast)")
+    parser.add_argument("--shuffle", choices=("shuffle", "bitshuffle", "noshuffle"),
+                        default="shuffle",
+                        help="blosc shuffle filter (default: 'shuffle' = byte "
+                             "shuffle, fast)")
     args = parser.parse_args()
 
     try:
@@ -506,6 +564,8 @@ def main() -> None:
             n_jobs=args.n_jobs,
             grayscale_method=args.grayscale_method,
             queue_maxsize=args.queue_maxsize,
+            clevel=args.clevel,
+            shuffle=args.shuffle,
             verbose=True,
         )
     except (FileNotFoundError, ValueError, FileExistsError) as exc:

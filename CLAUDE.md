@@ -255,6 +255,80 @@ The regression test is `tests/test_pipeline.py::test_auto_evaluation_rejects_gho
 The project uses zarr v3 (`zarr >= 3.0`). The v3 API differs from v2 in chunk
 specification and store opening. Do not regress to v2 patterns.
 
+### Fused AVI → MC (`cnmfe/avi_mc.py`)
+`concat_avis_to_mc_zarr` (and the convenience wrapper
+`CNMFe.fit_mc_from_avis`) decode an AVI folder and apply rigid motion
+correction in a **single pipeline**, writing only `mc.zarr` to disk. No
+intermediate `session.zarr` is materialised — that saves ~5 min and ~6 GB
+on a network mount for a 100k-frame session compared with running
+`concat_avis_to_zarr` + `fit_mc` separately.
+
+Pipeline shape:
+1. Pre-scan every AVI for `(frame_count, H, W)` (same walk as the
+   non-fused concat).
+2. **Template phase**: decode a strided subset of `n_template_avis`
+   (default 10) into a RAM buffer, stride-sample it down to
+   `params.mc_template_max_frames`, high-pass filter the samples and
+   bin-median them.
+3. **Fused MC phase**: re-decode every AVI in parallel via
+   `_decode_avi_worker` (reused verbatim from `concat_avis_to_zarr`). A
+   queue-consuming writer pulls `(start, batch_uint8)` tuples, runs
+   `_process_batch` (parallelised per-frame MC from
+   `cnmfe/motion_correction.py`), and writes the float32 corrected
+   batch + shifts into `mc.zarr` / a `(T, 2)` shifts buffer.
+
+**`mc_n_iter > 1`** is supported: the fused first pass writes a scratch
+zarr at `<output_path>.parent / (".<output_path.name>.fused.zarr")`,
+then `motion_correction_rigid` is called against that scratch with
+`niter_rig = mc_n_iter - 1` to run the remaining iterations (its
+ping-pong scratch handling kicks in for niter_rig ≥ 2). Shifts are
+summed across the fused pass and the handoff (matching the existing
+`shifts_total += shifts_iter` accumulation in
+`_motion_correction_streaming`). The fused scratch is removed in a
+`finally` block so a mid-iteration crash doesn't leak a multi-GB
+orphan onto the network share. Even for `mc_n_iter > 1` the user
+still skips the raw `session.zarr` intermediate.
+
+Output zarr uses the heavyweight `clevel=5` + `bitshuffle` compression
+(mc.zarr is read many times during extraction, so ratio matters).
+This is the opposite of the concat output's `clevel=3` + byte-shuffle
+choice, where the writer is the bottleneck.
+
+Live-session example: `live_runs/run_session.ipynb` calls
+`model.fit_mc_from_avis(folder, output_dir=...)`. The notebook keeps
+the raw `before/after` diagnostic plots by pulling a strided sample
+of frames directly from the AVIs (no zarr round-trip).
+
+### `concat_avis_to_zarr` configuration
+`concat_avis_to_zarr` does a per-file pre-scan via `_count_and_shape` to
+get exact frame counts before allocating the output zarr — this lets the
+parallel decoders write to known offsets and avoids any resize-at-end pass.
+The pre-scan is reported in the timing line so users can see how long it
+took on their setup (typically a few seconds per file over a network mount,
+i.e. ~30–60 s for 100 AVIs).
+
+Output zarr defaults: `clevel=3` + `shuffle="shuffle"` (byte shuffle) instead
+of the project-wide `clevel=5` + `bitshuffle`. ~3× faster compress with
+~10 % larger files on uint8 imaging data. The writer is single-threaded so
+freeing it up is the only way to keep decoders un-stalled on
+network-mounted output. `_open_array` in `cnmfe/io.py` accepts `clevel` and
+`shuffle` parameters to expose this — defaults remain the heavyweight
+combination for callers (MC, temp stores) that prioritise ratio.
+
+Expected runtimes for the typical 100k-frame miniscope session
+(100 AVIs × 1000 frames × 600×600 uint8):
+- Local SSD source and output: **~2–3 min**.
+- Network mount (both source AVIs and output zarr): **~5–7 min**.
+- If you want to skip the intermediate `session.zarr` entirely (saving ~5
+  min on network mounts), use the fused AVI→MC entrypoint
+  `concat_avis_to_mc_zarr` (see *Fused AVI→MC* below).
+
+Defaults bumped:
+- `chunk_t`: 100 → 500 (fewer chunk writes; halves the network round-trips
+  on the writer side).
+- `n_jobs` cap: removed (was `min(cpu_count, len(avis), 4)`; now
+  `min(cpu_count, len(avis))`). More in-flight reads help on network mounts.
+
 ---
 
 ## Non-obvious bugs that were already fixed — do not re-introduce
@@ -318,7 +392,8 @@ cnmfe/                         Main package
   spatial.py                   compute_support, threshold_footprint, update_spatial
   temporal.py                  estimate_ar_params, deconvolve, update_temporal, _deconvolve_with
   merging.py                   merge_components  (4-tuple return)
-  pipeline.py                  CNMFeParams (dataclass), CNMFe.fit()
+  avi_mc.py                    Fused AVI -> mc.zarr in one pass (skips session.zarr)
+  pipeline.py                  CNMFeParams (dataclass), CNMFe.fit(), CNMFe.fit_mc_from_avis()
 tests/
   conftest.py                  make_synthetic_movie() — clean fixture; supports motion_max_shift
   miniscope_simulator.py       make_miniscope_movie() — realistic 1p movie with bg/ghosts/vasc/bleach/shot noise/8-bit/motion

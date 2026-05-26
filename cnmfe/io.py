@@ -28,22 +28,41 @@ def _open_array(
     chunks=None,
     dtype=None,
     compression: bool = True,
+    clevel: int = 5,
+    shuffle: str = "bitshuffle",
 ) -> zarr.Array:
     """Create or open a zarr array using v3 API.
 
-    When compression=True (default) uses blosc+lz4+bitshuffle — lossless,
-    fast to decompress, and typically 2–10× smaller than uncompressed float32
-    or uint8 imaging data.
+    When compression=True (default) uses blosc+lz4 — lossless, fast to
+    decompress, and typically 2–10× smaller than uncompressed float32 or
+    uint8 imaging data.
+
+    ``clevel`` and ``shuffle`` tune the speed/ratio trade-off:
+    - ``clevel=5, shuffle="bitshuffle"`` (default): best ratio for float32
+      intermediates; ~0.5 GB/s single-thread compress.
+    - ``clevel=3, shuffle="shuffle"``: ~3–5× faster compress for uint8 raw
+      data, ~10–15 % larger files. Used by ``concat_avis_to_zarr`` so the
+      single writer thread doesn't starve decoder workers.
     """
     if mode == "w":
         codecs = None
         if compression:
+            shuffle_enum = {
+                "bitshuffle": zcodecs.BloscShuffle.bitshuffle,
+                "shuffle":    zcodecs.BloscShuffle.shuffle,
+                "noshuffle":  zcodecs.BloscShuffle.noshuffle,
+            }.get(shuffle)
+            if shuffle_enum is None:
+                raise ValueError(
+                    f"shuffle must be 'bitshuffle' / 'shuffle' / 'noshuffle', "
+                    f"got {shuffle!r}"
+                )
             codecs = [
                 zcodecs.BytesCodec(),
                 zcodecs.BloscCodec(
                     cname="lz4",
-                    clevel=5,
-                    shuffle=zcodecs.BloscShuffle.bitshuffle,
+                    clevel=int(clevel),
+                    shuffle=shuffle_enum,
                 ),
             ]
         return zarr.open_array(

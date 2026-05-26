@@ -163,3 +163,22 @@ class TestOutputShape:
         assert z.shape == (75, 32, 64)
         assert z.chunks == (10, 32, 64)
         assert np.dtype(z.dtype) == np.dtype("uint8")
+
+
+class TestNonUniformLengths:
+    """Pre-scan + exact-offset path tolerates files of arbitrary length —
+    middle files shorter or longer than their neighbours, last file short.
+    """
+
+    def test_non_uniform_lengths(self, tmp_path):
+        src = tmp_path / "session"
+        src.mkdir()
+        _write_synthetic_avi(src / "0.avi", T=15, H=24, W=24, seed=1)
+        _write_synthetic_avi(src / "1.avi", T=8,  H=24, W=24, seed=2)
+        _write_synthetic_avi(src / "2.avi", T=22, H=24, W=24, seed=3)
+
+        z = concat_avis_to_zarr(
+            src, output_path=tmp_path / "out.zarr",
+            chunk_t=10, n_jobs=2, verbose=False,
+        )
+        assert z.shape == (45, 24, 24), z.shape

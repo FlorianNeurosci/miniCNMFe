@@ -656,6 +656,69 @@ class CNMFe:
         )
         return corrected
 
+    def fit_mc_from_avis(
+        self,
+        folder: "str | Path",
+        output_dir: "str | Path",
+        *,
+        pattern: str = "*.avi",
+        skip_if_exists: bool = False,
+    ) -> "zarr.Array":
+        """Fused AVI -> motion-corrected zarr in one pass.
+
+        Skips the intermediate `session.zarr` that the two-step
+        `concat_avis_to_zarr` + `fit_mc` flow produces. On a network mount
+        this typically saves ~5 min and ~6 GB of disk for a 100k-frame
+        session.
+
+        Writes ``<output_dir>/mc.zarr`` (float32, motion-corrected) and
+        ``<output_dir>/shifts.npy``. Stores ``self.shifts`` and ``self.dims``
+        for symmetry with ``fit_mc``.
+
+        Handles ``params.mc_n_iter`` ≥ 1. For ``mc_n_iter == 1`` the fused
+        path writes ``mc.zarr`` directly from the AVIs. For
+        ``mc_n_iter > 1`` it writes the fused first pass to a scratch zarr
+        and hands the remaining iterations off to
+        ``motion_correction_rigid`` (which rebuilds the template from the
+        corrected output of each pass). The scratch is cleaned up
+        automatically.
+
+        Args:
+            folder: Directory containing numbered AVI files (0.avi, ...).
+            output_dir: Output directory. ``mc.zarr`` + ``shifts.npy`` go
+                here.
+            pattern: Glob pattern for AVI selection.
+            skip_if_exists: If ``mc.zarr`` is already in ``output_dir``,
+                reuse it (and ``shifts.npy`` if present).
+
+        Returns:
+            Open zarr.Array of the corrected movie, shape (T, H, W) float32.
+        """
+        # Local import: avi_mc depends on the top-level concat_avis_to_zarr
+        # script, which we don't want as a hard dep of `pipeline`.
+        from cnmfe.avi_mc import concat_avis_to_mc_zarr
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mc_path = output_dir / "mc.zarr"
+
+        mc_zarr, shifts = concat_avis_to_mc_zarr(
+            folder,
+            mc_path,
+            self.params,
+            pattern=pattern,
+            skip_if_exists=skip_if_exists,
+            verbose=True,
+        )
+
+        self.shifts = shifts
+        self.dims = (int(mc_zarr.shape[1]), int(mc_zarr.shape[2]))
+
+        if shifts is not None:
+            np.save(output_dir / "shifts.npy", shifts)
+
+        return mc_zarr
+
     def fit(
         self,
         movie: "zarr.Array | np.ndarray",

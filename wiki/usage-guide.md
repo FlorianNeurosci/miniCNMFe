@@ -255,8 +255,23 @@ The `tutorial_demo.ipynb` notebook opens a zarr lazily, runs the full pipeline, 
 |------|---------|-------------|
 | `--output PATH` | `<folder>/movie.zarr` | Output zarr path |
 | `--pattern GLOB` | `*.avi` | Glob to select AVI files |
-| `--chunk-t N` | `100` | Frames per time chunk |
+| `--chunk-t N` | `500` | Frames per time chunk |
 | `--color` | off | Keep RGB channels (default: grayscale) |
+| `--n-jobs N` | auto | Parallel decoder threads. Default: `min(cpu_count, len(avis))`; pass a smaller value to cap |
+| `--clevel N` | `3` | blosc compression level for the output (3 = fast, 5 = balanced, 9 = small) |
+| `--shuffle MODE` | `shuffle` | blosc shuffle filter: `shuffle` (byte, fast), `bitshuffle` (slower, ~10 % smaller), `noshuffle` |
+
+#### Expected runtimes
+
+For a typical 100k-frame miniscope session (100 AVIs × 1000 frames × 600×600 uint8):
+
+- **Local SSD** source and output: 2–3 min.
+- **Network mount** for both source AVIs and output zarr: 5–7 min.
+
+If you don't need to inspect the raw (pre-MC) zarr separately, use the
+fused AVI→MC entrypoint (`cnmfe.avi_mc.concat_avis_to_mc_zarr`) instead —
+it writes only the motion-corrected zarr in a single pass and saves ~5 min
+on network mounts by skipping the intermediate.
 
 ### `full_pipeline.py` options
 
