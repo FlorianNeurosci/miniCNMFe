@@ -113,6 +113,24 @@ class TestDeconvolve:
         assert (s >= -1e-6).all()
         assert c.shape == (200,)
 
+    def test_pava_fallback_reconstructs_clean_ar1(self):
+        """PAVA fallback must faithfully reconstruct a clean AR(1) trace.
+
+        Regression guard for the merge-condition bug: the pool-boundary test used
+        bare ``g`` instead of ``g**pool_length``, which over-merged smooth exact-g
+        decays and collapsed the trace — a clean AR(1) reconstructed at only
+        r~0.4, dropping ``model.C`` vs ground truth from ~0.96 to ~0.58 whenever
+        the ``oasis-deconvolution`` package was absent. This calls the fallback
+        directly (so the result is independent of whether the package is
+        installed) on a NOISELESS trace, where a correct OASIS returns the input
+        almost exactly.
+        """
+        data = make_ar1_trace(T=600, g=0.9, sn=0.0, seed=3)   # trace == C_true
+        c, s, _ = _oasis_ar1_pava(data["trace"], data["g"], sn=0.0)
+        r = float(np.corrcoef(c, data["C_true"])[0, 1])
+        assert r > 0.95, f"PAVA reconstruction of clean AR(1) only r={r:.3f} (merge-condition regression?)"
+        assert (s >= -1e-6).all()
+
 
 class TestUpdateTemporal:
     def test_output_shapes(self, synth_small):

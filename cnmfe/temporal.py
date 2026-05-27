@@ -165,7 +165,13 @@ def _oasis_pava_run(y_bl: np.ndarray, g: float, lam: float) -> np.ndarray:
 
     i = 0
     while i < len(pool_start) - 1:
-        if pool_val[i] * g > pool_val[i + 1]:
+        # Boundary constraint c[t] >= g·c[t-1]: pool i ends at value
+        # val_i·g^(len_i-1), so pool i+1 must start at >= g·(val_i·g^(len_i-1))
+        # = val_i·g^(len_i). Merge when that is violated. (Using bare `g` here
+        # instead of `g**len_i` spuriously over-merges smooth exact-g decays and
+        # collapses the trace — it reconstructs a clean AR(1) at only r~0.4.)
+        # The small tolerance suppresses float-noise merges on exact-g decays.
+        if pool_val[i] * (g ** pool_length[i]) > pool_val[i + 1] + 1e-9:
             merge(i)
             pool_start.pop(i + 1)
             pool_length.pop(i + 1)
