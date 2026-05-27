@@ -21,6 +21,37 @@ from cnmfe._utils import get_xp, to_numpy
 
 
 # ---------------------------------------------------------------------------
+# Physical decay time <-> AR(1) coefficient
+# ---------------------------------------------------------------------------
+
+def g_from_decay_time(decay_time_ms: float, frame_rate_hz: float) -> float:
+    """AR(1) decay coefficient for an indicator with decay τ at a frame rate.
+
+    ``g = exp(-1 / (fps · τ_s)) = exp(-1 / (fps · τ_ms / 1000))`` — the per-frame
+    fraction of fluorescence retained by a single exponential of time constant
+    ``decay_time_ms``. This is the same expression used to build the Bayesian
+    ``g`` prior in ``pipeline.fit_extract``; exposed here so the synthetic
+    simulator can generate traces with a physically meaningful, settable decay
+    (e.g. GCaMP8m τ≈180 ms) instead of an arbitrary AR coefficient.
+
+    Approximate single-AP somatic decay τ (ms): GCaMP6f ~140, jGCaMP7f ~160,
+    jGCaMP8f ~70, jGCaMP8m ~180, jGCaMP8s ~350, GCaMP6s/7s ~1000.
+    """
+    return float(np.exp(-1.0 / (frame_rate_hz * decay_time_ms / 1000.0)))
+
+
+def decay_time_from_g(g: float, frame_rate_hz: float) -> float:
+    """Inverse of :func:`g_from_decay_time`: decay τ (ms) from an AR(1) ``g``.
+
+    ``τ_ms = -1000 / (fps · ln g)``. ``g`` is clipped to ``(0, 1)`` for safety,
+    so recovered coefficients of 0 or ≥1 do not blow up. Use this to report a
+    pipeline's estimated ``g`` (ours or CaImAn) in interpretable physical units.
+    """
+    g = float(np.clip(g, 1e-6, 0.999999))
+    return float(-1000.0 / (frame_rate_hz * np.log(g)))
+
+
+# ---------------------------------------------------------------------------
 # AR parameter estimation
 # ---------------------------------------------------------------------------
 

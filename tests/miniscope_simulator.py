@@ -5,8 +5,11 @@ the messy features you typically see in real 1p endoscopic recordings:
 
 - Heterogeneous neuron sizes, eccentricities, orientations, and minor
   irregularity (not all identical Gaussians).
-- Heterogeneous calcium dynamics: per-neuron AR(1) decay ``g``, firing rate,
-  and per-spike amplitude. Optional bursting.
+- Calcium dynamics from a real indicator's decay time: per-neuron AR(1) ``g``
+  derived from ``decay_time_ms`` (default GCaMP8m, τ≈180 ms) at the given
+  ``fps``, with a small biological spread, plus heterogeneous firing rate and
+  per-spike amplitude and optional bursting. Set ``decay_time_ms=None`` to fall
+  back to the legacy arbitrary ``ar_decay_range`` draw.
 - Multi-component drifting background with several spatial scales and
   temporal correlation lengths.
 - "Ghost" cells: large out-of-focus blurry blobs that are NOT real neurons
@@ -39,7 +42,9 @@ def make_miniscope_movie(
     irregularity: float = 0.15,
     fire_rate_range: tuple[float, float] = (0.5, 4.0),  # Hz
     spike_amp_range: tuple[float, float] = (0.6, 2.0),
-    ar_decay_range: tuple[float, float] = (0.86, 0.96),
+    decay_time_ms: float | None = 180.0,  # indicator decay τ; default GCaMP8m
+    decay_time_jitter: float = 0.10,      # per-neuron fractional spread on τ
+    ar_decay_range: tuple[float, float] = (0.86, 0.96),  # legacy: used iff decay_time_ms is None
     burst_prob: float = 0.30,
     # ---- background ----
     bg_strength: float = 4.0,
@@ -75,7 +80,9 @@ def make_miniscope_movie(
         C_true    : (K, T) float32   — true calcium traces
         S_true    : (K, T) float32   — true spike trains (with amplitudes)
         centers   : (K, 2) int       — true neuron (row, col)
-        g_true    : (K,) float32     — per-neuron AR(1) decay
+        g_true    : (K,) float32     — per-neuron AR(1) decay (from decay_time_ms
+                    + fps when set, else the legacy ar_decay_range draw)
+        decay_time_ms : float | None — indicator decay τ used (None = legacy path)
         sn_true   : float            — combined read noise std
         bleach    : (T,) float32     — photobleaching curve applied
         vignette  : (H, W) float32   — vignette mask applied
@@ -137,7 +144,21 @@ def make_miniscope_movie(
     # -----------------------------------------------------------------------
     # Calcium traces — heterogeneous AR(1), variable spike amplitudes, bursts
     # -----------------------------------------------------------------------
-    g_true = rng.uniform(*ar_decay_range, size=K).astype(np.float32)
+    if decay_time_ms is not None:
+        # Cells share an indicator (default GCaMP8m): derive each neuron's AR(1)
+        # g from a physical decay time at this frame rate, with a small
+        # biological spread on τ (depth / expression differences).
+        from cnmfe.temporal import g_from_decay_time
+        tau_k = decay_time_ms * (
+            1.0 + decay_time_jitter * rng.uniform(-1.0, 1.0, size=K)
+        )
+        tau_k = np.clip(tau_k, 1.0, None)
+        g_true = np.array(
+            [g_from_decay_time(float(t), fps) for t in tau_k], dtype=np.float32
+        )
+    else:
+        # Legacy path: arbitrary per-neuron AR coefficients (no physical decay).
+        g_true = rng.uniform(*ar_decay_range, size=K).astype(np.float32)
     fire_rates = rng.uniform(*fire_rate_range, size=K) / fps   # spikes/frame
 
     S_true = np.zeros((K, T), dtype=np.float32)
@@ -301,6 +322,7 @@ def make_miniscope_movie(
         "S_true":        S_true,
         "centers":       centers_arr,
         "g_true":        g_true,
+        "decay_time_ms": decay_time_ms,
         "sn_true":       float(read_noise_std),
         "ar_decay":      float(np.mean(g_true)),
         "bleach":        bleach,
