@@ -429,3 +429,228 @@ def greedy_corr_pnr(
     C_raw = np.vstack(C_raw_list)
     centers = np.array(centers_list, dtype=np.int32)
     return A, C, C_raw, centers
+
+
+# ---------------------------------------------------------------------------
+# [NON-STANDARD speed] Patch-based parallel initialization
+#
+# The greedy loop above is inherently sequential (each extraction mutates the
+# residual the next seed reads), so it can't be threaded directly. Instead we
+# tile the FOV into OVERLAPPING spatial patches, run the proven `greedy_corr_pnr`
+# on each patch in parallel *processes* (the loop is GIL-bound — the one place
+# we deviate from the `prefer="threads"` convention), remap footprints to global
+# coordinates, and de-duplicate neurons detected in patch overlaps via
+# `merge_components`. Opt-in through CNMFeParams.init_patches.
+# ---------------------------------------------------------------------------
+
+def _tile_grid(
+    H: int, W: int, patch_size: int, patch_overlap: int
+) -> list[tuple[int, int, int, int]]:
+    """Overlapping patch grid covering (H, W). Returns (r0, r1, c0, c1) tiles.
+
+    Adjacent patches step by ``patch_size - patch_overlap``; the last patch on
+    each axis is clamped to the edge so the whole FOV is covered.
+    """
+    step = max(1, patch_size - patch_overlap)
+
+    def axis_starts(length: int) -> list[int]:
+        if length <= patch_size:
+            return [0]
+        starts = list(range(0, length - patch_size + 1, step))
+        if starts[-1] != length - patch_size:
+            starts.append(length - patch_size)
+        return starts
+
+    tiles: list[tuple[int, int, int, int]] = []
+    for r0 in axis_starts(H):
+        r1 = min(r0 + patch_size, H)
+        for c0 in axis_starts(W):
+            c1 = min(c0 + patch_size, W)
+            tiles.append((r0, r1, c0, c1))
+    return tiles
+
+
+def _greedy_patch_worker(
+    patch_movie: np.ndarray,
+    row_off: int,
+    col_off: int,
+    H: int,
+    W: int,
+    sigma: float,
+    min_corr: float,
+    min_pnr: float,
+    min_pixel: int,
+    ar_order: int,
+    min_corr_neuron: float,
+    max_corr_bg: float,
+    seed_suppress_factor: float,
+    circular_max_dist_factor: float,
+    corrpnr_stride: int,
+    g_prior: "float | None",
+    g_prior_weight: float,
+) -> "tuple[sp.csc_matrix, np.ndarray, np.ndarray, np.ndarray]":
+    """Run `greedy_corr_pnr` on ONE patch; remap footprints/centres to global.
+
+    Module-level for loky pickling. Inner parallelism is forced off
+    (``n_jobs=1, device="cpu"``) — patch-level parallelism is the outer layer.
+    ``border_px=0`` because patch borders are interior FOV (edge rejection is
+    applied globally by the driver). ``max_neurons=None`` — the cap is global.
+    """
+    from threadpoolctl import threadpool_limits
+
+    ph, pw = patch_movie.shape[1], patch_movie.shape[2]
+    # The parent's threadpool_limits context does NOT cross the process
+    # boundary under loky, so cap inner BLAS here too.
+    with threadpool_limits(limits=1, user_api="blas"):
+        A_p, C_p, C_raw_p, centers_p = greedy_corr_pnr(
+            patch_movie,
+            sigma=sigma,
+            min_corr=min_corr,
+            min_pnr=min_pnr,
+            max_neurons=None,
+            min_pixel=min_pixel,
+            border_px=0,
+            ar_order=ar_order,
+            n_jobs=1,
+            device="cpu",
+            min_corr_neuron=min_corr_neuron,
+            max_corr_bg=max_corr_bg,
+            seed_suppress_factor=seed_suppress_factor,
+            circular_max_dist_factor=circular_max_dist_factor,
+            corrpnr_stride=corrpnr_stride,
+            g_prior=g_prior,
+            g_prior_weight=g_prior_weight,
+        )
+
+    k = A_p.shape[1]
+    if k == 0:
+        T_init = patch_movie.shape[0]
+        return (
+            sp.csc_matrix((H * W, 0), dtype=np.float32),
+            np.empty((0, T_init), dtype=np.float32),
+            np.empty((0, T_init), dtype=np.float32),
+            np.empty((0, 2), dtype=np.int32),
+        )
+
+    # Remap patch-local pixel indices (lr*pw + lc) to global flat indices.
+    lr, lc = np.divmod(np.arange(ph * pw), pw)
+    gidx = (row_off + lr) * W + (col_off + lc)
+    coo = A_p.tocoo()
+    A_global = sp.csc_matrix(
+        (coo.data, (gidx[coo.row], coo.col)), shape=(H * W, k), dtype=np.float32
+    )
+    centers_global = (centers_p + np.array([row_off, col_off])).astype(np.int32)
+    return A_global, C_p, C_raw_p, centers_global
+
+
+def _empty_init(H: int, W: int, T: int):
+    return (
+        sp.csc_matrix((H * W, 0), dtype=np.float32),
+        np.empty((0, T), dtype=np.float32),
+        np.empty((0, T), dtype=np.float32),
+        np.empty((0, 2), dtype=np.int32),
+    )
+
+
+def greedy_corr_pnr_patched(
+    movie: np.ndarray,
+    sigma: float,
+    min_corr: float = 0.8,
+    min_pnr: float = 10.0,
+    max_neurons: "int | None" = None,
+    min_pixel: int = 3,
+    border_px: int = 0,
+    ar_order: int = 1,
+    min_corr_neuron: float = 0.8,
+    max_corr_bg: float = 0.4,
+    seed_suppress_factor: float = 2.0,
+    circular_max_dist_factor: float = 2.5,
+    corrpnr_stride: int = 1,
+    g_prior: "float | None" = None,
+    g_prior_weight: float = 0.5,
+    patch_size: int = 64,
+    patch_overlap: int = 16,
+    n_jobs: int = 1,
+    merge_thr_corr: float = 0.85,
+    merge_thr_overlap: float = 0.5,
+    merge_centre_dist_factor: float = 2.0,
+) -> "tuple[sp.csc_matrix, np.ndarray, np.ndarray, np.ndarray]":
+    """Patch-parallel greedy init. Same return contract as `greedy_corr_pnr`.
+
+    Tiles the in-RAM ``(T, H, W)`` movie into overlapping patches, runs
+    `greedy_corr_pnr` per patch in parallel processes, concatenates the
+    global-remapped components, and merges border duplicates. Peak extra RAM is
+    ``≈ n_jobs × T × patch_size² × 4`` bytes (per-worker patch copies).
+    """
+    from joblib import Parallel, delayed
+
+    from cnmfe.merging import merge_components
+
+    movie = np.asarray(movie, dtype=np.float32)
+    T, H, W = movie.shape
+    tiles = _tile_grid(H, W, patch_size, patch_overlap)
+
+    results = Parallel(n_jobs=n_jobs)(
+        delayed(_greedy_patch_worker)(
+            np.ascontiguousarray(movie[:, r0:r1, c0:c1]),
+            r0, c0, H, W,
+            sigma, min_corr, min_pnr, min_pixel, ar_order,
+            min_corr_neuron, max_corr_bg, seed_suppress_factor,
+            circular_max_dist_factor, corrpnr_stride, g_prior, g_prior_weight,
+        )
+        for (r0, r1, c0, c1) in tiles
+    )
+
+    results = [r for r in results if r[0].shape[1] > 0]
+    if not results:
+        return _empty_init(H, W, T)
+
+    A_all = sp.hstack([r[0] for r in results], format="csc")
+    C_all = np.vstack([r[1] for r in results]).astype(np.float32)
+    C_raw_all = np.vstack([r[2] for r in results]).astype(np.float32)
+    centers_all = np.vstack([r[3] for r in results]).astype(np.int32)
+
+    # Reject detections within border_px of the global FOV edge (each patch ran
+    # with border_px=0 since patch borders are interior, not image edges).
+    if border_px > 0:
+        keep = (
+            (centers_all[:, 0] >= border_px)
+            & (centers_all[:, 0] < H - border_px)
+            & (centers_all[:, 1] >= border_px)
+            & (centers_all[:, 1] < W - border_px)
+        )
+        if not keep.any():
+            return _empty_init(H, W, T)
+        A_all = A_all[:, keep].tocsc()
+        C_all = C_all[keep]
+        C_raw_all = C_raw_all[keep]
+        centers_all = centers_all[keep]
+
+    # De-duplicate the same neuron detected in two overlapping patches: its two
+    # copies have near-identical traces (high |Pearson|) and centres within a
+    # few px — exactly the centre-distance fallback case in merge_components.
+    A_dedup, C_dedup, _, members = merge_components(
+        A_all, C_all,
+        thr_corr=merge_thr_corr,
+        thr_overlap=merge_thr_overlap,
+        ar_order=ar_order,
+        sigma=sigma,
+        dims=(H, W),
+        centre_dist_factor=merge_centre_dist_factor,
+    )
+    # Keep C_raw / centres aligned with the merged order (mirror pipeline.fit).
+    C_raw_dedup = np.vstack(
+        [C_raw_all[m].mean(axis=0).clip(min=0) for m in members]
+    ).astype(np.float32)
+    centers_dedup = np.vstack([centers_all[m[0]] for m in members]).astype(np.int32)
+
+    # Global max_neurons cap (top-K by footprint energy ‖a‖²), post-dedup.
+    if max_neurons is not None and A_dedup.shape[1] > max_neurons:
+        energy = np.asarray(A_dedup.power(2).sum(axis=0)).ravel()
+        top = np.sort(np.argsort(energy)[::-1][:max_neurons])
+        A_dedup = A_dedup[:, top].tocsc()
+        C_dedup = C_dedup[top]
+        C_raw_dedup = C_raw_dedup[top]
+        centers_dedup = centers_dedup[top]
+
+    return A_dedup, C_dedup, C_raw_dedup, centers_dedup

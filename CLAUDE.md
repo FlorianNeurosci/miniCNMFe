@@ -150,8 +150,48 @@ and apply the resulting shift to the full (uncropped) frame.
 ### Module-level worker functions
 All functions dispatched by `joblib.Parallel` are defined at module top level (not as
 lambdas or nested functions). Required for `spawn`-based pickling on Windows.
-Workers: `_shift_and_correct_frame`, `_ring_pixel_batch`, `_spatial_pixel_batch`,
-`_deconvolve_with` (in `temporal.py` — replaced the older `_deconvolve_one`; takes pre-computed `g`/`sn` so it doesn't re-estimate per call).
+Workers: `_filter_estimate_apply` (motion correction, per batch via `_process_batch`),
+`_ring_pixel_batch`, `_spatial_pixel_batch`, `_deconvolve_with` (in `temporal.py` —
+replaced the older `_deconvolve_one`; takes pre-computed `g`/`sn` so it doesn't
+re-estimate per call), `_project_onto_batch` (`background.py`) / `_yflat_proj_batch`
+(`pipeline.py`) for threaded streaming `Y.T @ A`, and `_greedy_patch_worker`
+(`initialization.py`) for patch-parallel init.
+
+**Threads vs processes.** Every parallel step uses `prefer="threads"` (the inner
+kernels — `cv2`/`ndi` convolve, BLAS matmul, sklearn CD — release the GIL) under
+`threadpool_limits(limits=1, user_api="blas")`. The **one exception** is
+patch-parallel init (`greedy_corr_pnr_patched`), which uses the default loky
+**process** backend: the greedy seed loop is pure-Python and GIL-bound, so threads
+wouldn't help. Process workers must set their own `threadpool_limits` inside the
+worker body (the parent context does not cross the process boundary).
+
+### Patch-based parallel initialization (opt-in — `init_patches`)
+The greedy seed loop (`greedy_corr_pnr`) is the dominant **serial** bottleneck in
+extraction and can't be threaded (each extraction subtracts its component from the
+residual the next seed reads). `CNMFeParams.init_patches=True` (default **off**)
+switches the pipeline init to `greedy_corr_pnr_patched`: tile the in-RAM
+`(T_init, H, W)` init sample into **overlapping** patches, run the unchanged
+`greedy_corr_pnr` on each in parallel processes (inner `n_jobs=1`, `border_px=0`,
+`max_neurons=None`), remap each patch's footprints/centres to global coords,
+concatenate, and **dedup** border duplicates with `merge_components` (the
+centre-distance fallback — duplicate copies of one neuron have near-identical
+traces + close centres). `border_px` and `max_neurons` are applied **globally**
+after dedup. Gated on `min(H,W) >= init_patch_min_fov` (default 128) and CPU only.
+Defaults derive from `sigma`: `patch_size = max(int(12·sigma), 48)`,
+`patch_overlap = int(4·sigma)` (overlap > `patch_radius ≈ 3·sigma` so a border
+neuron is fully captured in — and merged across — both patches). Because it's
+opt-in and the default path is byte-identical, the `test_stage_split.py`
+bit-for-bit regression still holds. Regression test:
+`test_pipeline.py::test_patched_init_recovers_same_neurons_as_global`.
+
+### Streaming `Y.T @ A` projections are threaded (`n_jobs`)
+The two zarr/streaming projection loops — `BackgroundSubtractor.project_onto`
+(final `YrA`) and the strided-init full-T trace recovery in `pipeline.fit_extract`
+— are independent per-pixel-batch sums, now parallelized with
+`Parallel(prefer="threads")` + `np.add.reduce`. The `n_jobs==1` path keeps the
+exact serial accumulation order (so bit-for-bit tests hold); `n_jobs>1` reorders
+the reduction (float32 drift ~1e-6). `project_onto` gained an `n_jobs` kwarg
+(threaded from `pipeline.fit_extract` and `temporal.update_temporal`).
 
 ### Flat pixel representation
 After initialization the movie is stored as `(H·W, T)` — pixels as rows, time as columns.

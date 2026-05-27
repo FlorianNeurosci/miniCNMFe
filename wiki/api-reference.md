@@ -43,6 +43,11 @@ class CNMFeParams:
     circular_max_dist_factor: float = 2.5      # circular_constraint cutoff = factor * estimated_radius
     init_stride: int | None = None             # Temporal stride for greedy init (None = auto, max(1, T//5000))
     init_corrpnr_stride: int | None = None     # Temporal stride for the CORR/PNR summary images (None = auto)
+    init_patches: bool = False                 # Opt-in patch-PARALLEL greedy init (CPU only); OFF = single-FOV greedy
+    init_patch_size: int | None = None         # patch side px; None -> max(int(12*sigma), 48)
+    init_patch_overlap: int | None = None      # overlap px between patches; None -> int(4*sigma)
+    init_patch_min_fov: int = 128              # only tile when min(H, W) >= this; else fall back to global init
+    init_patch_n_jobs: int | None = None       # patch workers (processes); None -> n_jobs
 
     # Background (ring model)
     ring_size_factor: float = 1.5              # ring_radius = factor * (2*sigma + 1)
@@ -657,6 +662,35 @@ Greedy CORR-PNR neuron initialisation.
 | `C` | `(K, T)` | Deconvolved traces |
 | `C_raw` | `(K, T)` | Raw (pre-deconvolution) traces |
 | `centers` | `(K, 2)` | Neuron `(row, col)` coordinates |
+
+---
+
+### `greedy_corr_pnr_patched`
+
+```python
+def greedy_corr_pnr_patched(
+    movie, sigma, ...,                # same greedy knobs as greedy_corr_pnr
+    patch_size: int = 64,
+    patch_overlap: int = 16,
+    n_jobs: int = 1,
+    merge_thr_corr: float = 0.85,
+    merge_thr_overlap: float = 0.5,
+    merge_centre_dist_factor: float = 2.0,
+) -> tuple[sp.csc_matrix, np.ndarray, np.ndarray, np.ndarray]
+```
+
+**Patch-parallel** drop-in for `greedy_corr_pnr` (same `(A, C, C_raw, centers)`
+return contract). The greedy seed loop is inherently sequential (each extraction
+mutates the residual the next seed reads), so it can't be threaded directly.
+Instead this tiles the in-RAM `(T, H, W)` movie into **overlapping** spatial
+patches, runs `greedy_corr_pnr` on each patch in parallel **processes** (the loop
+is GIL-bound — the one place the codebase uses processes rather than threads),
+remaps each patch's footprints/centres to global coordinates, concatenates, then
+de-duplicates neurons detected in patch overlaps via `merge_components` (the
+centre-distance fallback). Edge rejection (`border_px`) and `max_neurons` are
+applied **globally** after dedup. Peak extra RAM ≈ `n_jobs × T × patch_size² × 4`
+bytes. CPU only. Driven by `CNMFeParams.init_patches` (default off) — see the
+`init_patch_*` params and the `CNMFe.fit` init branch.
 
 ---
 

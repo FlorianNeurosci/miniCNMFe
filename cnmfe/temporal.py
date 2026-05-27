@@ -402,7 +402,7 @@ def update_temporal(
     # materialise the full (H*W, T) residual. GPU path requires a dense
     # numpy input — fall back to CPU projection when given a subtractor.
     if hasattr(Y_flat, "project_onto"):
-        YA = Y_flat.project_onto(A)
+        YA = Y_flat.project_onto(A, n_jobs=n_jobs)
         AA = (A.T @ A).toarray() if sp.issparse(A) else np.asarray(A.T @ A)
     elif xp is not np:
         # GPU: convert A to dense for fast matmul (K is small; A is H*W × K)

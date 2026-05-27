@@ -581,6 +581,18 @@ def subtract_background(
     return X - W.dot(X)
 
 
+def _project_onto_batch(
+    bg: "BackgroundSubtractor", A_csr, start: int, end: int
+) -> np.ndarray:
+    """One pixel-batch contribution to ``Y_bg.T @ A`` → ``(T, K)``.
+
+    Module-level for joblib pickling. Dispatched with ``prefer="threads"``,
+    so it closes over ``bg`` (no pickling of the zarr handle / sparse W).
+    """
+    Y_chunk = bg.slice(start, end)                       # (B, T)
+    return np.asarray(Y_chunk.T @ A_csr[start:end], dtype=np.float32)
+
+
 class BackgroundSubtractor:
     """Lazy ring-background subtractor — on-demand pixel-row slices.
 
@@ -691,6 +703,7 @@ class BackgroundSubtractor:
         self,
         A: "sp.spmatrix | np.ndarray",
         batch_size: int = 4096,
+        n_jobs: int = 1,
     ) -> np.ndarray:
         """``Y_bg.T @ A``  →  ``(T, K)`` without materialising Y_bg.
 
@@ -726,11 +739,27 @@ class BackgroundSubtractor:
                 YA -= self.f[:, None] * bfA[None, :]
             return YA
 
-        # Zarr / streaming path: per-pixel batches.
+        # Zarr / streaming path: per-pixel batches (independent, summed).
         n_pix = self.shape[0]
-        for start in range(0, n_pix, batch_size):
-            end = min(start + batch_size, n_pix)
-            Y_chunk = self.slice(start, end)        # (B, T)
-            A_chunk = A_csr[start:end]               # (B, K), sparse or dense
-            YA += np.asarray(Y_chunk.T @ A_chunk, dtype=np.float32)
-        return YA
+        if n_jobs == 1:
+            for start in range(0, n_pix, batch_size):
+                end = min(start + batch_size, n_pix)
+                Y_chunk = self.slice(start, end)        # (B, T)
+                A_chunk = A_csr[start:end]               # (B, K), sparse or dense
+                YA += np.asarray(Y_chunk.T @ A_chunk, dtype=np.float32)
+            return YA
+
+        # Each batch reads a zarr slab + does a BLAS matmul (releases the
+        # GIL); threads avoid pickling the zarr handle / sparse W. Cap inner
+        # BLAS to 1 thread per worker to prevent oversubscription.
+        from joblib import Parallel, delayed
+        from threadpoolctl import threadpool_limits
+
+        with threadpool_limits(limits=1, user_api="blas"):
+            parts = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(_project_onto_batch)(
+                    self, A_csr, start, min(start + batch_size, n_pix)
+                )
+                for start in range(0, n_pix, batch_size)
+            )
+        return np.add.reduce(parts) if parts else YA

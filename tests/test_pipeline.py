@@ -230,6 +230,63 @@ class TestCNMFePipeline:
         # post-init projection. Check shape.
         assert m3.C.shape == (m3.A.shape[1], movie.shape[0])
 
+    def test_patched_init_recovers_same_neurons_as_global(self):
+        """Patch-parallel init (opt-in) recovers the same neurons as global init.
+
+        Tiles a 160×160 FOV into overlapping patches, runs greedy init per
+        patch in parallel, and merges border duplicates. The result should
+        match the single-FOV greedy init in neuron count and spatial footprints,
+        with no duplicate detections surviving in the overlaps.
+        """
+        from tests.conftest import make_synthetic_movie
+
+        H, W = 96, 96
+        synth = make_synthetic_movie(
+            n_neurons=8, dims=(H, W), T=400, noise_std=0.3, bg_strength=0.6, seed=2,
+        )
+        movie = synth["movie"]
+        K_true = synth["A_true"].shape[1]
+
+        common = dict(sigma=3.0, min_corr=0.85, min_pnr=10.0,
+                      n_iter_main=1, n_iter_temporal=1, init_stride=1, n_jobs=1)
+        m_global = CNMFe(CNMFeParams(**common, init_patches=False)).fit(
+            movie, do_motion_correction=False
+        )
+        # 48-px patches with 16-px overlap tile the 96×96 FOV into a 3×3 grid.
+        m_patched = CNMFe(CNMFeParams(
+            **common, init_patches=True,
+            init_patch_size=48, init_patch_overlap=16, init_patch_min_fov=32,
+        )).fit(movie, do_motion_correction=False)
+
+        # The comparison is only meaningful if global init recovered neurons.
+        assert m_global.A.shape[1] >= K_true // 2, "global init found too few"
+
+        # Patched and global agree on neuron count (±1).
+        assert abs(m_patched.A.shape[1] - m_global.A.shape[1]) <= 1, (
+            f"patched K={m_patched.A.shape[1]} vs global K={m_global.A.shape[1]}"
+        )
+
+        # Every ground-truth neuron that GLOBAL recovers, PATCHED recovers too.
+        mg = match_components(m_global.A, synth["A_true"])
+        mp = match_components(m_patched.A, synth["A_true"])
+        for k in range(K_true):
+            if mg[k][2] > 0.85:
+                assert mp[k][2] > 0.85, (
+                    f"patched missed neuron {k} that global found "
+                    f"(global r={mg[k][2]:.3f}, patched r={mp[k][2]:.3f})"
+                )
+
+        # Dedup worked: no two patched footprints share a centre of mass (true
+        # neurons are ≥ 11 px apart, so any pair < 5 px would be a duplicate).
+        A_p = np.asarray(m_patched.A.todense())
+        yy, xx = np.mgrid[:H, :W]
+        coords = np.stack([yy.ravel(), xx.ravel()], axis=1).astype(np.float64)
+        cms = [coords.T @ A_p[:, k] / A_p[:, k].sum()
+               for k in range(A_p.shape[1]) if A_p[:, k].sum() > 0]
+        if len(cms) > 1:
+            from scipy.spatial.distance import pdist
+            assert pdist(np.array(cms)).min() > 5.0, "duplicate footprints survived"
+
     def test_init_corrpnr_stride_recovers_footprints(self):
         """init_corrpnr_stride must not break neuron recovery.
 
@@ -479,6 +536,70 @@ class TestCNMFePipeline:
         )
         # And the contracted C_raw matches across paths.
         np.testing.assert_allclose(m_str.C_raw, m_mem.C_raw, atol=1e-3, rtol=1e-3)
+
+        # YrA (and hence the projected trace C+YrA) is the quantity built most
+        # directly from BackgroundSubtractor.project_onto -- the ONE place the
+        # numpy and zarr paths use different formulas (algebraic identity vs
+        # per-batch accumulation; cnmfe/background.py project_onto). Pin it so
+        # that float-level divergence there can never grow unnoticed.
+        np.testing.assert_allclose(m_str.YrA, m_mem.YrA, atol=1e-3, rtol=1e-3)
+        np.testing.assert_allclose(
+            m_str.C + m_str.YrA, m_mem.C + m_mem.YrA, atol=1e-3, rtol=1e-3,
+        )
+
+    def test_fit_Y_flat_zarr_parallel_matches_in_memory(self, synth, tmp_path):
+        """Streaming-vs-RAM equivalence must also hold with n_jobs=-1.
+
+        The existing equivalence tests run serially (default n_jobs=1), so the
+        threaded project_onto / update_temporal / compute_W code paths are never
+        checked for cross-path agreement. Run the deep pipeline both ways under
+        parallelism and assert the same components, footprints, traces, spikes,
+        and projected trace.
+        """
+        from cnmfe.io import save_zarr, transpose_zarr_to_pixel_major
+        import zarr as _zarr
+
+        movie_np = synth["movie"].astype(np.float32)
+        T, H, W = movie_np.shape
+
+        src_path = tmp_path / "src.zarr"
+        save_zarr(movie_np, str(src_path))
+        src_zarr = _zarr.open_array(str(src_path), mode="r")
+
+        pixel_path = tmp_path / "pixel.zarr"
+        Y_flat_zarr = transpose_zarr_to_pixel_major(
+            src_path, pixel_path,
+            pixel_chunk=256, time_chunk=200,
+            verbose=False,
+        )
+
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.7, min_pnr=3.0,
+            n_iter_main=2, n_iter_temporal=2,
+            n_jobs=-1,
+        )
+        m_mem = CNMFe(params).fit(movie_np, do_motion_correction=False)
+        m_str = CNMFe(params).fit(
+            src_zarr, do_motion_correction=False, Y_flat_zarr=Y_flat_zarr,
+        )
+
+        assert m_str.A.shape == m_mem.A.shape, (
+            f"K mismatch: streaming={m_str.A.shape[1]}, in-mem={m_mem.A.shape[1]}"
+        )
+        # Tolerance matches the serial equivalence tests (1e-3). The parallel
+        # reductions use np.add.reduce over an ordered batch list, so they stay
+        # deterministic; observed divergence on this fixture is well under 1e-3.
+        np.testing.assert_allclose(
+            np.asarray(m_str.A.todense()),
+            np.asarray(m_mem.A.todense()),
+            atol=1e-3, rtol=1e-3,
+        )
+        np.testing.assert_allclose(m_str.C, m_mem.C, atol=1e-3, rtol=1e-3)
+        np.testing.assert_allclose(m_str.S, m_mem.S, atol=1e-3, rtol=1e-3)
+        np.testing.assert_allclose(m_str.YrA, m_mem.YrA, atol=1e-3, rtol=1e-3)
+        np.testing.assert_allclose(
+            m_str.C + m_str.YrA, m_mem.C + m_mem.YrA, atol=1e-3, rtol=1e-3,
+        )
 
     def test_fit_zarr_movie_with_output_dir_auto_streams(self, synth_small, tmp_path):
         """Passing a zarr movie + output_dir without Y_flat_zarr must auto-derive

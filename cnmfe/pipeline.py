@@ -17,7 +17,7 @@ import scipy.sparse as sp
 from cnmfe._utils import make_2d
 from cnmfe.background import BackgroundSubtractor, compute_W
 from cnmfe.evaluate import auto_evaluate_components
-from cnmfe.initialization import greedy_corr_pnr
+from cnmfe.initialization import greedy_corr_pnr, greedy_corr_pnr_patched
 from cnmfe.io import transpose_zarr_to_pixel_major
 from cnmfe.merging import merge_components
 from cnmfe.motion_correction import motion_correction_rigid
@@ -91,6 +91,16 @@ def _Y_times_vec(Y_flat, v, axis: int) -> np.ndarray:
         e = min(s + batch, n_pix)
         out += np.asarray(Y_flat[s:e], dtype=np.float32).T @ v[s:e]
     return out
+
+
+def _yflat_proj_batch(Y_flat, A_csr, s: int, e: int) -> np.ndarray:
+    """One pixel-batch contribution to ``Y_flat.T @ A`` → ``(T, K)``.
+
+    Module-level for joblib pickling. Dispatched with ``prefer="threads"``;
+    each batch reads a zarr slab and does a GIL-releasing BLAS matmul.
+    """
+    Y_chunk = np.asarray(Y_flat[s:e], dtype=np.float32)
+    return np.asarray(Y_chunk.T @ A_csr[s:e], dtype=np.float32)
 
 
 def _fit_global_bg_rank1(
@@ -221,6 +231,15 @@ class CNMFeParams:
     # near-identical seed map at a fraction of the cost. None auto-selects
     # max(1, T_init // 2000) so the sweep sees ~2000 frames regardless of T.
     init_corrpnr_stride: "int | None" = None
+    # [NON-STANDARD speed] Patch-based PARALLEL initialization (opt-in, OFF by
+    # default so behaviour is bit-for-bit unchanged). When True and the FOV is
+    # large enough, the greedy init is tiled into overlapping spatial patches
+    # run in parallel processes, then border duplicates are merged. CPU only.
+    init_patches: bool = False
+    init_patch_size: "int | None" = None     # patch side px; None -> max(int(12*sigma), 48)
+    init_patch_overlap: "int | None" = None  # overlap px; None -> int(4*sigma) (> patch_radius ~3*sigma)
+    init_patch_min_fov: int = 128            # only tile when min(H, W) >= this; else global init
+    init_patch_n_jobs: "int | None" = None   # patch workers; None -> n_jobs
 
     # --- Background (ring model) ---
     ring_size_factor: float = 1.5  # ring radius = ring_size_factor * (2*sigma+1)
@@ -1139,25 +1158,66 @@ class CNMFe:
                 f"(weight={p.g_prior_weight})"
             )
 
-        A, C_init, C_raw_init, centers = greedy_corr_pnr(
-            init_movie,
-            sigma=p.sigma,
-            min_corr=p.min_corr,
-            min_pnr=p.min_pnr,
-            max_neurons=p.max_neurons,
-            min_pixel=p.min_pixel,
-            border_px=p.border_px,
-            ar_order=p.ar_order,
-            n_jobs=p.n_jobs,
-            device=p.device,
-            min_corr_neuron=p.init_min_corr_neuron,
-            max_corr_bg=p.init_max_corr_bg,
-            seed_suppress_factor=p.seed_suppress_factor,
-            circular_max_dist_factor=p.circular_max_dist_factor,
-            corrpnr_stride=corrpnr_stride,
-            g_prior=g_target,
-            g_prior_weight=p.g_prior_weight,
+        use_patches = (
+            p.init_patches
+            and min(H, W) >= p.init_patch_min_fov
+            and p.device == "cpu"
         )
+        if use_patches:
+            patch_size = p.init_patch_size or max(int(12 * p.sigma), 48)
+            patch_overlap = (
+                p.init_patch_overlap
+                if p.init_patch_overlap is not None
+                else int(4 * p.sigma)
+            )
+            patch_n_jobs = p.init_patch_n_jobs or p.n_jobs
+            print(
+                f"  Patch-parallel init: patch_size={patch_size}, "
+                f"overlap={patch_overlap}, n_jobs={patch_n_jobs}"
+            )
+            A, C_init, C_raw_init, centers = greedy_corr_pnr_patched(
+                init_movie,
+                sigma=p.sigma,
+                min_corr=p.min_corr,
+                min_pnr=p.min_pnr,
+                max_neurons=p.max_neurons,
+                min_pixel=p.min_pixel,
+                border_px=p.border_px,
+                ar_order=p.ar_order,
+                min_corr_neuron=p.init_min_corr_neuron,
+                max_corr_bg=p.init_max_corr_bg,
+                seed_suppress_factor=p.seed_suppress_factor,
+                circular_max_dist_factor=p.circular_max_dist_factor,
+                corrpnr_stride=corrpnr_stride,
+                g_prior=g_target,
+                g_prior_weight=p.g_prior_weight,
+                patch_size=patch_size,
+                patch_overlap=patch_overlap,
+                n_jobs=patch_n_jobs,
+                merge_thr_corr=p.merge_thr_corr,
+                merge_thr_overlap=p.merge_thr_overlap,
+                merge_centre_dist_factor=p.merge_centre_dist_factor,
+            )
+        else:
+            A, C_init, C_raw_init, centers = greedy_corr_pnr(
+                init_movie,
+                sigma=p.sigma,
+                min_corr=p.min_corr,
+                min_pnr=p.min_pnr,
+                max_neurons=p.max_neurons,
+                min_pixel=p.min_pixel,
+                border_px=p.border_px,
+                ar_order=p.ar_order,
+                n_jobs=p.n_jobs,
+                device=p.device,
+                min_corr_neuron=p.init_min_corr_neuron,
+                max_corr_bg=p.init_max_corr_bg,
+                seed_suppress_factor=p.seed_suppress_factor,
+                circular_max_dist_factor=p.circular_max_dist_factor,
+                corrpnr_stride=corrpnr_stride,
+                g_prior=g_target,
+                g_prior_weight=p.g_prior_weight,
+            )
         # Free the strided init movie before allocating C_raw at full T.
         if init_stride > 1:
             del init_movie
@@ -1201,13 +1261,26 @@ class CNMFe:
                 YA_init = np.asarray(Y_flat.T @ A, dtype=np.float32)      # (T, K)
             else:
                 # Streaming Y_flat.T @ A: sum pixel-batched contributions.
-                YA_init = np.zeros((T, A.shape[1]), dtype=np.float32)
                 A_csr = A.tocsr()
                 proj_batch = 4096
-                for s in range(0, H * W, proj_batch):
-                    e = min(s + proj_batch, H * W)
-                    Y_chunk = np.asarray(Y_flat[s:e], dtype=np.float32)
-                    YA_init += np.asarray(Y_chunk.T @ A_csr[s:e], dtype=np.float32)
+                if p.n_jobs == 1:
+                    YA_init = np.zeros((T, A.shape[1]), dtype=np.float32)
+                    for s in range(0, H * W, proj_batch):
+                        e = min(s + proj_batch, H * W)
+                        Y_chunk = np.asarray(Y_flat[s:e], dtype=np.float32)
+                        YA_init += np.asarray(Y_chunk.T @ A_csr[s:e], dtype=np.float32)
+                else:
+                    from joblib import Parallel, delayed
+                    from threadpoolctl import threadpool_limits
+
+                    with threadpool_limits(limits=1, user_api="blas"):
+                        parts = Parallel(n_jobs=p.n_jobs, prefer="threads")(
+                            delayed(_yflat_proj_batch)(
+                                Y_flat, A_csr, s, min(s + proj_batch, H * W)
+                            )
+                            for s in range(0, H * W, proj_batch)
+                        )
+                    YA_init = np.add.reduce(parts)
             C_raw = (YA_init / nA_init[None, :]).T.astype(np.float32)     # (K, T)
             C = C_raw.copy()
         else:
@@ -1451,7 +1524,7 @@ class CNMFe:
         # noisy projection preserves shape and typically correlates > 0.9.
         AA_final = (A.T @ A).toarray()
         nA_final = np.maximum(np.diag(AA_final), 1e-10)
-        YA_final = Y_bg.project_onto(A)                                   # (T, K)
+        YA_final = Y_bg.project_onto(A, n_jobs=p.n_jobs)                  # (T, K)
         crosstalk = AA_final @ C - np.diag(AA_final)[:, None] * C        # (K, T)
         YrA = (YA_final.T - crosstalk) / nA_final[:, None] - C           # (K, T)
 

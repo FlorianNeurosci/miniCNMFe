@@ -79,31 +79,33 @@ def _spatial_pixel_batch(
     #   arg, so we pass `lam * T` to match `Lasso(alpha=lam)`.
     results: list[tuple[int, int, float]] = []
     n_unconverged = 0
-    for i, active in enumerate(support_batch):
-        if len(active) == 0:
-            continue
-        C_active = C[active]              # (n_active, T)
-        y_p = Y_batch[i]                  # (T,)
-        sn_p = float(sn_batch[i])
+    # Suppress sklearn's per-pixel ConvergenceWarning once for the whole batch
+    # (entering a catch_warnings context per pixel — ~256× here, 90k× per
+    # update — is pure-Python GIL-bound overhead that threads can't hide). The
+    # aggregate unconverged count is reported once by update_spatial.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        for i, active in enumerate(support_batch):
+            if len(active) == 0:
+                continue
+            C_active = C[active]              # (n_active, T)
+            y_p = Y_batch[i]                  # (T,)
+            sn_p = float(sn_batch[i])
 
-        # X = C_active.T  (samples x features), so Gram = X.T @ X.
-        # Cython solver is float64-only; the casts are cheap (small Gram /
-        # Xy / coef arrays, n_active typically 1-5).
-        gram = np.ascontiguousarray(C_active @ C_active.T, dtype=np.float64)
-        max_energy = float(np.max(np.diag(gram))) if gram.size > 0 else 1.0
-        lam = 0.5 * sn_p * np.sqrt(max(max_energy, 1e-10)) / T
-        if lam == 0:
-            continue
+            # X = C_active.T  (samples x features), so Gram = X.T @ X.
+            # Cython solver is float64-only; the casts are cheap (small Gram /
+            # Xy / coef arrays, n_active typically 1-5).
+            gram = np.ascontiguousarray(C_active @ C_active.T, dtype=np.float64)
+            max_energy = float(np.max(np.diag(gram))) if gram.size > 0 else 1.0
+            lam = 0.5 * sn_p * np.sqrt(max(max_energy, 1e-10)) / T
+            if lam == 0:
+                continue
 
-        Xy = np.ascontiguousarray(C_active @ y_p, dtype=np.float64)
-        y_p_64 = np.ascontiguousarray(y_p, dtype=np.float64)
-        w = np.zeros(len(active), dtype=np.float64)
+            Xy = np.ascontiguousarray(C_active @ y_p, dtype=np.float64)
+            y_p_64 = np.ascontiguousarray(y_p, dtype=np.float64)
+            w = np.zeros(len(active), dtype=np.float64)
 
-        try:
-            # Suppress sklearn's per-pixel ConvergenceWarning here; we report
-            # the aggregate count once at the end of update_spatial instead.
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", ConvergenceWarning)
+            try:
                 w, _, _, n_iter = enet_coordinate_descent_gram(
                     w,                       # initial coef, mutated in place
                     float(lam) * T,          # alpha * n_samples
@@ -117,17 +119,17 @@ def _spatial_pixel_batch(
                     0,                       # random=0 -> cyclic, deterministic
                     1,                       # positive
                 )
-            if int(n_iter) >= int(max_iter):
-                n_unconverged += 1
-            coef = w
-        except Exception:
-            coef = np.zeros(len(active), dtype=np.float64)
+                if int(n_iter) >= int(max_iter):
+                    n_unconverged += 1
+                coef = w
+            except Exception:
+                coef = np.zeros(len(active), dtype=np.float64)
 
-        p_global = pixel_start + i
-        for idx, k in enumerate(active):
-            val = float(coef[idx])
-            if val > 0:
-                results.append((p_global, int(k), val))
+            p_global = pixel_start + i
+            for idx, k in enumerate(active):
+                val = float(coef[idx])
+                if val > 0:
+                    results.append((p_global, int(k), val))
     return results, n_unconverged
 
 
@@ -255,6 +257,32 @@ def threshold_footprint(
         )
 
     return ai2d.ravel().astype(np.float32)
+
+
+def _threshold_one_component(
+    k: int,
+    pixel_ids: np.ndarray,
+    values: np.ndarray,
+    n_pixels: int,
+    dims: tuple[int, int],
+    max_thr: float,
+    closing_radius: int,
+    circular_max_dist_factor: float,
+) -> tuple[int, np.ndarray, np.ndarray]:
+    """Build + clean one component's footprint. Module-level for joblib.
+
+    `threshold_footprint` is built on `scipy.ndimage` (median filter, closing,
+    label) which releases the GIL, so dispatching this per-component with
+    `prefer="threads"` gives real concurrency. Returns ``(k, nz, values_nz)``.
+    """
+    ai_flat = np.zeros(n_pixels, dtype=np.float32)
+    ai_flat[pixel_ids] = values
+    ai_flat = threshold_footprint(
+        ai_flat, dims, max_thr=max_thr, closing_radius=closing_radius,
+        circular_max_dist_factor=circular_max_dist_factor,
+    )
+    nz = np.where(ai_flat > 0)[0]
+    return k, nz, ai_flat[nz]
 
 
 # ---------------------------------------------------------------------------
@@ -387,31 +415,51 @@ def update_spatial(
     for p_global, k, val in all_results:
         new_data[k][p_global] = val
 
-    # Build new sparse matrix and clean each component's footprint
+    # Clean each component's footprint. Each component is independent and
+    # threshold_footprint releases the GIL (scipy.ndimage), so parallelize
+    # across K — this is otherwise a serial single-core stretch that grows
+    # with component count and FOV.
+    ks = [k for k in range(K) if new_data[k]]
+    pixel_ids = {
+        k: np.fromiter(new_data[k].keys(), dtype=np.int32, count=len(new_data[k]))
+        for k in ks
+    }
+    values = {
+        k: np.fromiter(new_data[k].values(), dtype=np.float32, count=len(new_data[k]))
+        for k in ks
+    }
+
+    if n_jobs == 1:
+        cleaned = [
+            _threshold_one_component(
+                k, pixel_ids[k], values[k], n_pixels, dims,
+                max_thr, closing_radius, circular_max_dist_factor,
+            )
+            for k in ks
+        ]
+    else:
+        from joblib import Parallel, delayed
+        from threadpoolctl import threadpool_limits
+
+        with threadpool_limits(limits=1, user_api="blas"):
+            cleaned = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(_threshold_one_component)(
+                    k, pixel_ids[k], values[k], n_pixels, dims,
+                    max_thr, closing_radius, circular_max_dist_factor,
+                )
+                for k in ks
+            )
+
+    # Build new sparse matrix (COO assembly is order-independent).
     rows_all: list[np.ndarray] = []
     cols_all: list[np.ndarray] = []
     data_all: list[np.ndarray] = []
-
-    for k in range(K):
-        if not new_data[k]:
-            continue
-        pixel_ids = np.array(list(new_data[k].keys()), dtype=np.int32)
-        values = np.array(list(new_data[k].values()), dtype=np.float32)
-
-        ai_flat = np.zeros(n_pixels, dtype=np.float32)
-        ai_flat[pixel_ids] = values
-        ai_flat = threshold_footprint(
-            ai_flat, dims, max_thr=max_thr, closing_radius=closing_radius,
-            circular_max_dist_factor=circular_max_dist_factor,
-        )
-
-        nz = np.where(ai_flat > 0)[0]
+    for k, nz, vals_nz in cleaned:
         if len(nz) == 0:
             continue
-
         rows_all.append(nz)
         cols_all.append(np.full(len(nz), k, dtype=np.int32))
-        data_all.append(ai_flat[nz])
+        data_all.append(vals_nz)
 
     if rows_all:
         rows = np.concatenate(rows_all)

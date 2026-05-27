@@ -400,6 +400,32 @@ class TestBackgroundSubtractor:
         z_proj = BackgroundSubtractor(z, W_mat, b0).project_onto(A, batch_size=40)
         np.testing.assert_allclose(z_proj, np_proj, atol=1e-3, rtol=1e-3)
 
+    def test_project_onto_parallel_matches_serial_on_zarr(self, tmp_path):
+        """project_onto(n_jobs>1) must match n_jobs=1 on a zarr-backed Y."""
+        import zarr as _zarr
+
+        rng = np.random.default_rng(77)
+        Y, W_mat, b0, dims = self._make_data(seed=9)
+        H, W, T = dims
+        z = _zarr.open_array(
+            str(tmp_path / "Yp.zarr"), mode="w",
+            shape=Y.shape, chunks=(32, 60), dtype="float32",
+        )
+        z[:] = Y
+
+        K = 4
+        A_dense = np.zeros((H * W, K), dtype=np.float32)
+        for k in range(K):
+            for pix in rng.choice(H * W, size=8, replace=False):
+                A_dense[pix, k] = rng.uniform(0.1, 0.5)
+        A = sp.csc_matrix(A_dense)
+
+        bg = BackgroundSubtractor(z, W_mat, b0)
+        serial = bg.project_onto(A, batch_size=40, n_jobs=1)
+        parallel = bg.project_onto(A, batch_size=40, n_jobs=2)
+        # Reduction order differs across threads -> small float32 drift only.
+        np.testing.assert_allclose(parallel, serial, atol=1e-4, rtol=1e-4)
+
 
 # ---------------------------------------------------------------------------
 # Constrained-ring (NON-STANDARD CNMF-E) tests
