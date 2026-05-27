@@ -11,6 +11,8 @@ Uses zarr v3 API (zarr >= 3.0).
 
 from __future__ import annotations
 
+import shutil
+import time
 from pathlib import Path
 from typing import Iterator
 
@@ -231,8 +233,8 @@ def transpose_zarr_to_pixel_major(
     src: str | Path,
     dest: str | Path,
     *,
-    pixel_chunk: int = 4096,
-    time_chunk: int = 2000,
+    pixel_chunk: int = 512,
+    time_chunk: int | None = None,
     dtype: str = "float32",
     compression: bool = True,
     src_batch_frames: int = 2000,
@@ -249,22 +251,37 @@ def transpose_zarr_to_pixel_major(
     The transpose is a one-time disk pass; afterwards extraction can run
     against ``dest`` without materialising the full movie in RAM.
 
+    **Chunk shape is tuned for the streaming read pattern**, which reads
+    contiguous pixel-row batches over the *full* time range. So:
+    - ``time_chunk=None`` (default) stores each pixel row's whole time series
+      in one chunk — a row read decompresses exactly what's needed, with no
+      time-axis read amplification. Caveat for very long recordings: the chunk
+      size is ``pixel_chunk * T * 4`` bytes (e.g. ``512 * 60000 * 4`` ≈ 117 MB),
+      so cap ``time_chunk`` if that is too large for your write RAM / object
+      store.
+    - ``pixel_chunk=512`` keeps reads close to the 256-pixel batches used by
+      ``compute_W`` / ``update_spatial`` (smaller = less pixel over-read per
+      batch; larger = fewer chunk fetches for ``project_onto``'s 4096 batches).
+
     Args:
         src: Path to the source ``(T, H, W)`` zarr (e.g. ``mc.zarr``).
         dest: Destination zarr path. Created if absent.
         pixel_chunk: Number of pixels per dest chunk along axis 0.
-        time_chunk: Number of frames per dest chunk along axis 1.
+        time_chunk: Frames per dest chunk along axis 1. ``None`` = full ``T``.
         dtype: Output dtype (default ``float32`` for downstream extraction).
-        compression: Use blosc lz4+bitshuffle (default ``True``).
+        compression: Use blosc lz4+bitshuffle (default ``True``). Keep ``True``
+            on a network mount (fewer bytes over the wire); try ``False`` on a
+            local SSD (skips per-read decompression, IO-bound only).
         src_batch_frames: Frames read from the source per IO batch.
             Peak RAM ≈ ``src_batch_frames * H * W * 4`` bytes.
         skip_if_exists: If the dest path already exists, return its handle
             without re-writing.
-        verbose: Print a progress bar.
+        verbose: Print a progress bar + elapsed time.
 
     Returns:
         Open zarr.Array with shape ``(H*W, T)``.
     """
+    t_start = time.perf_counter()
     src_arr = open_zarr(src)
     T, H, W = src_arr.shape
     n_pixels = H * W
@@ -276,10 +293,10 @@ def transpose_zarr_to_pixel_major(
                 print(f"Skipping transpose; {dest_path} already exists.")
             return zarr.open_array(str(dest_path), mode="r")
         # Caller asked for a fresh write — remove the old store.
-        import shutil
         shutil.rmtree(dest_path)
 
-    chunks_eff = (min(pixel_chunk, n_pixels), min(time_chunk, T))
+    time_chunk_eff = T if time_chunk is None else min(time_chunk, T)
+    chunks_eff = (min(pixel_chunk, n_pixels), time_chunk_eff)
     if verbose:
         print(
             f"Transposing {src} -> {dest_path}\n"
@@ -311,5 +328,64 @@ def transpose_zarr_to_pixel_major(
         dest_arr[:, t0:t1] = np.ascontiguousarray(chunk_2d)
 
     if verbose:
-        print(f"Done. Pixel-major zarr written to: {dest_path}")
+        print(
+            f"Done in {time.perf_counter() - t_start:.1f}s. "
+            f"Pixel-major zarr written to: {dest_path}"
+        )
     return dest_arr
+
+
+def stage_zarr_to_local(
+    src: str | Path,
+    local_dir: str | Path,
+    *,
+    skip_if_exists: bool = True,
+    verbose: bool = True,
+) -> zarr.Array:
+    """Copy a zarr store to local disk and return the open (read) handle.
+
+    For a store read repeatedly from a network mount — most importantly the
+    pixel-major ``Y_flat`` during streaming extraction, which is scanned ~5–6
+    times across the BCD loop — staging it to local SSD/tmpfs once turns N
+    network read-passes into one network copy + N local passes. Typically the
+    single biggest win on a network mount.
+
+    The copy is a plain directory copy (zarr v3 stores are directories), so the
+    chunking/compression of ``src`` is preserved verbatim.
+
+    For the auto-derive path (``fit_extract(zarr, output_dir=...)``), setting
+    ``CNMFeParams.yflat_dir`` to a local path achieves the same implicitly —
+    the transpose then reads ``mc.zarr`` from the network once and writes
+    ``Y_flat`` straight to local disk. Use this helper when you already have a
+    network-resident ``Y_flat`` (or want to stage ``mc.zarr`` itself).
+
+    Args:
+        src: Path to the source zarr store (2-D pixel-major or 3-D time-major).
+        local_dir: Destination directory; the store is copied to
+            ``local_dir / src.name``.
+        skip_if_exists: If the destination already exists, reuse it.
+        verbose: Print progress + elapsed time.
+
+    Returns:
+        Open zarr.Array handle at the local copy (read mode).
+    """
+    src_path = Path(src)
+    if not src_path.exists():
+        raise FileNotFoundError(f"Zarr store not found: {src_path}")
+    dest_path = Path(local_dir) / src_path.name
+
+    if dest_path.exists() and skip_if_exists:
+        if verbose:
+            print(f"Skipping stage; {dest_path} already exists.")
+        return zarr.open_array(str(dest_path), mode="r")
+
+    t_start = time.perf_counter()
+    if dest_path.exists():
+        shutil.rmtree(dest_path)
+    Path(local_dir).mkdir(parents=True, exist_ok=True)
+    if verbose:
+        print(f"Staging {src_path} -> {dest_path} ...")
+    shutil.copytree(src_path, dest_path)
+    if verbose:
+        print(f"Done in {time.perf_counter() - t_start:.1f}s.")
+    return zarr.open_array(str(dest_path), mode="r")

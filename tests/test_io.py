@@ -150,3 +150,56 @@ class TestTransposeToPixelMajor:
         _, src_path = self._save_source(tmp_path)
         with pytest.raises(ValueError, match="2-D pixel-major"):
             open_zarr_pixel_major(src_path)
+
+    def test_time_chunk_none_is_full_T(self, tmp_path):
+        """time_chunk=None (default) stores each pixel row's whole time series
+        in one chunk — the layout tuned for the streaming full-time read pattern.
+        """
+        src_movie, src_path = self._save_source(tmp_path, T=40, H=12, W=10)
+        dest_path = tmp_path / "dest.zarr"
+        dest = transpose_zarr_to_pixel_major(
+            src_path, dest_path, pixel_chunk=64, verbose=False,  # time_chunk default
+        )
+        T = src_movie.shape[0]
+        assert dest.chunks[1] == T
+        # Values still correct regardless of chunking.
+        from cnmfe._utils import make_2d
+        np.testing.assert_array_equal(np.asarray(dest), make_2d(src_movie))
+
+
+class TestStageZarrToLocal:
+    """Staging a (network) zarr store to local disk for repeated reads."""
+
+    def _save_source(self, tmp_path, T=30, H=8, W=6, seed=1):
+        rng = np.random.default_rng(seed)
+        movie = rng.standard_normal((T, H, W)).astype(np.float32)
+        src = tmp_path / "src.zarr"
+        save_zarr(movie, src, chunk_t=10)
+        return movie, src
+
+    def test_copies_values_exactly(self, tmp_path):
+        from cnmfe.io import stage_zarr_to_local
+
+        movie, src = self._save_source(tmp_path)
+        local = tmp_path / "local"
+        staged = stage_zarr_to_local(src, local, verbose=False)
+        assert (local / "src.zarr").exists()
+        np.testing.assert_array_equal(np.asarray(staged), movie)
+
+    def test_idempotent(self, tmp_path):
+        from cnmfe.io import stage_zarr_to_local
+
+        _, src = self._save_source(tmp_path)
+        local = tmp_path / "local"
+        first = stage_zarr_to_local(src, local, verbose=False)
+        mtime = (local / "src.zarr").stat().st_mtime
+        second = stage_zarr_to_local(src, local, verbose=False)
+        assert (local / "src.zarr").stat().st_mtime == mtime  # not re-copied
+        np.testing.assert_array_equal(np.asarray(first), np.asarray(second))
+
+    def test_missing_source_raises(self, tmp_path):
+        from cnmfe.io import stage_zarr_to_local
+
+        with pytest.raises(FileNotFoundError):
+            stage_zarr_to_local(tmp_path / "nope.zarr", tmp_path / "local",
+                                verbose=False)

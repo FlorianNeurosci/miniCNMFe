@@ -7,6 +7,7 @@ ring background → iterative spatial/temporal refinement.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -14,7 +15,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import scipy.sparse as sp
 
-from cnmfe._utils import make_2d
+from cnmfe._utils import StageTimer, make_2d
 from cnmfe.background import BackgroundSubtractor, compute_W
 from cnmfe.evaluate import auto_evaluate_components
 from cnmfe.initialization import greedy_corr_pnr, greedy_corr_pnr_patched
@@ -389,6 +390,24 @@ class CNMFeParams:
     # baseline still uses the full T; only the per-pixel BTB regression sees a strided
     # slice. Standard CNMF-E uses tsub=1.
     bg_tsub: int = 5
+
+    # --- Streaming store layout (true T-streaming extraction only) ---
+    # Control the pixel-major ``Y_flat`` store the auto-derive path builds when
+    # you call ``fit_extract(zarr, output_dir=...)`` (or run_extract.py without
+    # --in-memory). These only affect IO speed of the on-disk store — never the
+    # extracted results. See cnmfe.io.transpose_zarr_to_pixel_major.
+    # yflat_dir: where to write Y_flat_pixel.zarr. None = under output_dir.
+    #   Point at a LOCAL SSD/tmpfs to stage off a network mount (the transpose
+    #   reads mc.zarr from the network once; all BCD passes then read locally).
+    yflat_dir: "str | None" = None
+    # yflat_pixel_chunk / yflat_time_chunk: dest chunk shape. time_chunk None =
+    #   full T (one chunk per pixel row — best for the full-time read pattern).
+    yflat_pixel_chunk: int = 512
+    yflat_time_chunk: "int | None" = None
+    # yflat_compression: blosc lz4+bitshuffle. Keep True on a network mount
+    #   (fewer bytes over the wire); try False on a local SSD (no per-read
+    #   decompression, IO-bound only — costs ~H*W*T*4 bytes of disk).
+    yflat_compression: bool = True
 
     # --- Auto evaluation (post-BCD quality tagging — non-destructive) ---
     # [NON-STANDARD] `min_pixel` above is reused as a hard floor on footprint extent.
@@ -1139,6 +1158,7 @@ class CNMFe:
             self (for chaining).
         """
         p = self.params
+        timer = StageTimer()
 
         # --- Auto-derive Y_flat_zarr from a zarr movie + output_dir -----------
         # Passing a zarr.Array `movie` without Y_flat_zarr used to silently
@@ -1161,11 +1181,19 @@ class CNMFe:
                         "resolvable on-disk path. Pass Y_flat_zarr= explicitly "
                         "(e.g. via cnmfe.io.transpose_zarr_to_pixel_major)."
                     )
-                pixel_path = Path(output_dir) / "Y_flat_pixel.zarr"
+                # Default the store next to the results; `yflat_dir` can divert
+                # it to a local SSD/tmpfs so the BCD passes read off the network.
+                yflat_parent = Path(p.yflat_dir) if p.yflat_dir else Path(output_dir)
+                pixel_path = yflat_parent / "Y_flat_pixel.zarr"
                 pixel_path.parent.mkdir(parents=True, exist_ok=True)
-                Y_flat_zarr = transpose_zarr_to_pixel_major(
-                    src_path, pixel_path, verbose=True,
-                )
+                with timer.stage("transpose -> Y_flat"):
+                    Y_flat_zarr = transpose_zarr_to_pixel_major(
+                        src_path, pixel_path,
+                        pixel_chunk=p.yflat_pixel_chunk,
+                        time_chunk=p.yflat_time_chunk,
+                        compression=p.yflat_compression,
+                        verbose=True,
+                    )
                 auto_derived_y_flat = True
 
         # --- Streaming mode (Y_flat_zarr supplied or auto-derived) ------------
@@ -1221,7 +1249,9 @@ class CNMFe:
 
         # --- Step 2: Noise estimation ---
         print("Estimating noise...")
+        _t = time.perf_counter()
         self.sn = estimate_noise(stats_movie)   # (H, W)
+        timer.add("noise estimation", time.perf_counter() - _t)
 
         # # --- Step 3: Summary images ---
         # print("Computing CORR and PNR images...")
@@ -1279,6 +1309,7 @@ class CNMFe:
                 f"(weight={p.g_prior_weight})"
             )
 
+        _t = time.perf_counter()
         use_patches = (
             p.init_patches
             and min(H, W) >= p.init_patch_min_fov
@@ -1339,6 +1370,7 @@ class CNMFe:
                 g_prior=g_target,
                 g_prior_weight=p.g_prior_weight,
             )
+        timer.add("greedy init", time.perf_counter() - _t)
         # Free the strided init movie before allocating C_raw at full T.
         if init_stride > 1:
             del init_movie
@@ -1467,12 +1499,14 @@ class CNMFe:
         # --- Step 5: Initial ring background ---
         ring_radius = p.ring_size_factor * (2 * p.sigma + 1)
         print(f"Fitting ring-model background (radius={ring_radius:.1f}px, tsub={p.bg_tsub})...")
+        _t = time.perf_counter()
         W_mat, b0 = compute_W(
             Y_flat, A, C, dims, ring_radius,
             lambda_reg=p.ring_lambda, n_jobs=p.n_jobs, device=p.device,
             tsub=p.bg_tsub,
             constrain_sum=p.ring_constrain_sum,
         )
+        timer.add("compute_W", time.perf_counter() - _t)
 
         # --- Step 5b: Rank-1 global background bf · f(t) (opt-in, NON-STANDARD) ---
         bf: np.ndarray | None = None
@@ -1527,6 +1561,7 @@ class CNMFe:
             Y_bg = BackgroundSubtractor(Y_flat, W_mat, b0, bf=bf, f=f_bg)  # lazy (H*W, T)
 
             print("  Updating spatial footprints...")
+            _t = time.perf_counter()
             A = update_spatial(
                 Y_bg, C, A, sn_flat, dims,
                 p.dilation_radius, p.n_jobs, p.spatial_max_thr,
@@ -1535,6 +1570,7 @@ class CNMFe:
                 tol=p.spatial_tol,
                 circular_max_dist_factor=p.spatial_circular_max_dist_factor,
             )
+            timer.add("update_spatial", time.perf_counter() - _t)
 
             # Remove dead components (all-zero footprints)
             nA = np.asarray(A.power(2).sum(axis=0)).ravel()
@@ -1553,6 +1589,7 @@ class CNMFe:
 
             print("  Updating temporal traces...")
             _deconvolve = (iteration > 0) or (not p.skip_first_deconv)
+            _t = time.perf_counter()
             C, S, g_per_k, sn_per_k = update_temporal(
                 Y_bg, A, C, sn_flat, p.ar_order, p.n_iter_temporal,
                 n_jobs=p.n_jobs, device=p.device,
@@ -1561,6 +1598,7 @@ class CNMFe:
                 detrend_order=p.temporal_detrend_order,
                 g_prior=g_target, g_prior_weight=p.g_prior_weight,
             )
+            timer.add("update_temporal", time.perf_counter() - _t)
 
             print("  Merging correlated components...")
             A, C, n_merged, members_per_group = merge_components(
@@ -1577,6 +1615,7 @@ class CNMFe:
                 C_raw[m].mean(axis=0).clip(0) for m in members_per_group
             ]).astype(np.float32)
             if n_merged:
+                _t = time.perf_counter()
                 C, S, g_per_k, sn_per_k = update_temporal(
                     Y_bg, A, C, sn_flat, p.ar_order, 1,
                     n_jobs=p.n_jobs, device=p.device,
@@ -1585,6 +1624,7 @@ class CNMFe:
                     detrend_order=p.temporal_detrend_order,
                     g_prior=g_target, g_prior_weight=p.g_prior_weight,
                 )
+                timer.add("update_temporal", time.perf_counter() - _t)
             print(f"  {A.shape[1]} components ({n_merged} merged).")
 
             # Refresh the per-pixel baseline b0 from the refined (A, C).
@@ -1592,6 +1632,7 @@ class CNMFe:
             # ring's spatial structure is a property of the data, not of A/C,
             # so it remains valid across BCD iterations. Saves the expensive
             # per-pixel BTB solve every iteration (speedup.md Change 2).
+            _t = time.perf_counter()
             W_mat, b0 = compute_W(
                 Y_flat, A, C, dims, ring_radius,
                 lambda_reg=p.ring_lambda, n_jobs=p.n_jobs, device=p.device,
@@ -1599,6 +1640,7 @@ class CNMFe:
                 W_cached=W_mat,
                 constrain_sum=p.ring_constrain_sum,
             )
+            timer.add("compute_W (b0 refresh)", time.perf_counter() - _t)
 
             # Refresh the rank-1 global background warm-started from the
             # previous iteration's (bf, f). Two alternating-LS sweeps converge
@@ -1628,6 +1670,7 @@ class CNMFe:
         # Final deconvolution pass to get spike trains
         print("Final temporal update...")
         Y_bg = BackgroundSubtractor(Y_flat, W_mat, b0, bf=bf, f=f_bg)
+        _t = time.perf_counter()
         C, S, g_per_k, sn_per_k = update_temporal(
             Y_bg, A, C, sn_flat, p.ar_order, p.n_iter_temporal,
             n_jobs=p.n_jobs, device=p.device,
@@ -1635,6 +1678,7 @@ class CNMFe:
             detrend_order=p.temporal_detrend_order,
             g_prior=g_target, g_prior_weight=p.g_prior_weight,
         )
+        timer.add("final update_temporal", time.perf_counter() - _t)
 
         # Compute the residual projected onto each footprint:
         #   YrA[k, t] = (a_k . (Y_bg - A @ C)[:, t]) / ||a_k||^2
@@ -1645,7 +1689,9 @@ class CNMFe:
         # noisy projection preserves shape and typically correlates > 0.9.
         AA_final = (A.T @ A).toarray()
         nA_final = np.maximum(np.diag(AA_final), 1e-10)
+        _t = time.perf_counter()
         YA_final = Y_bg.project_onto(A, n_jobs=p.n_jobs)                  # (T, K)
+        timer.add("final YrA projection", time.perf_counter() - _t)
         crosstalk = AA_final @ C - np.diag(AA_final)[:, None] * C        # (K, T)
         YrA = (YA_final.T - crosstalk) / nA_final[:, None] - C           # (K, T)
 
@@ -1671,4 +1717,5 @@ class CNMFe:
             self.evaluate()
 
         print(f"Done. Extracted {A.shape[1]} neurons.")
+        print(timer.summary())
         return self

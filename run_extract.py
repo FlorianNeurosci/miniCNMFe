@@ -53,6 +53,17 @@ def main() -> None:
     parser.add_argument("--n-iter", type=int, default=None,
                         help="Main refinement cycles")
     parser.add_argument("--n-jobs", type=int, default=None)
+    # Streaming store layout (only affects on-disk IO speed, not results).
+    parser.add_argument("--yflat-dir", type=Path, default=None,
+                        help="Where to write the pixel-major Y_flat store "
+                             "(default: under the results dir). Point at a LOCAL "
+                             "SSD/tmpfs to stage off a network mount.")
+    parser.add_argument("--yflat-pixel-chunk", type=int, default=None,
+                        help="Pixels per Y_flat chunk (default 512)")
+    parser.add_argument("--yflat-time-chunk", type=int, default=None,
+                        help="Frames per Y_flat chunk (default: full T)")
+    parser.add_argument("--yflat-no-compress", action="store_true",
+                        help="Write Y_flat uncompressed (try on local SSD)")
     args = parser.parse_args()
 
     from cnmfe.io import open_zarr
@@ -76,6 +87,15 @@ def main() -> None:
         params.n_iter_main = args.n_iter
     if args.n_jobs is not None:
         params.n_jobs = args.n_jobs
+    # Streaming store layout (resolution-independent; downscaled() preserves these).
+    if args.yflat_dir is not None:
+        params.yflat_dir = str(args.yflat_dir)
+    if args.yflat_pixel_chunk is not None:
+        params.yflat_pixel_chunk = args.yflat_pixel_chunk
+    if args.yflat_time_chunk is not None:
+        params.yflat_time_chunk = args.yflat_time_chunk
+    if args.yflat_no_compress:
+        params.yflat_compression = False
 
     ssub = tsub = 1
     if args.ds_meta is not None:

@@ -658,6 +658,58 @@ class TestCNMFePipeline:
         )
         assert m_again.A.shape == m_mem.A.shape
 
+    def test_yflat_store_knobs_divert_location_and_preserve_results(
+        self, synth_small, tmp_path
+    ):
+        """The yflat_* params must (a) write Y_flat to yflat_dir instead of the
+        results dir, (b) honour the requested chunk shape / compression, and
+        (c) leave the extracted results identical to the in-memory path — these
+        knobs only affect on-disk IO, never the numerics.
+        """
+        from cnmfe.io import save_zarr
+        import zarr as _zarr
+
+        movie_np = synth_small["movie"].astype(np.float32)
+        T = movie_np.shape[0]
+
+        src_path = tmp_path / "src.zarr"
+        save_zarr(movie_np, str(src_path))
+        src_zarr = _zarr.open_array(str(src_path), mode="r")
+
+        # Y_flat goes to a SEPARATE dir, uncompressed, with a custom pixel chunk.
+        yflat_dir = tmp_path / "scratch"
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.5, min_pnr=3.0,
+            n_iter_main=1, n_iter_temporal=1,
+            yflat_dir=str(yflat_dir),
+            yflat_pixel_chunk=64,
+            yflat_compression=False,
+        )
+
+        results_dir = tmp_path / "results"
+        m_mem = CNMFe(params).fit(movie_np, do_motion_correction=False)
+        m_str = CNMFe(params).fit(
+            src_zarr, do_motion_correction=False, output_dir=results_dir,
+        )
+
+        # (a) Store written under yflat_dir, NOT under the results dir.
+        store = yflat_dir / "Y_flat_pixel.zarr"
+        assert store.exists()
+        assert not (results_dir / "Y_flat_pixel.zarr").exists()
+
+        # (b) Chunk shape + compression honoured.
+        z = _zarr.open_array(str(store), mode="r")
+        assert z.chunks == (64, T)            # time_chunk None -> full T
+
+        # (c) Results identical to in-memory (knobs are IO-only).
+        assert m_str.A.shape == m_mem.A.shape
+        np.testing.assert_allclose(
+            np.asarray(m_str.A.todense()),
+            np.asarray(m_mem.A.todense()),
+            atol=1e-3, rtol=1e-3,
+        )
+        np.testing.assert_allclose(m_str.C, m_mem.C, atol=1e-3, rtol=1e-3)
+
     def test_fit_Y_flat_zarr_rejects_bad_shape(self, synth_small, tmp_path):
         """Shape mismatch between Y_flat_zarr and the movie must raise."""
         from cnmfe.io import save_zarr

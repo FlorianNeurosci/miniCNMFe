@@ -2,13 +2,74 @@
 
 from __future__ import annotations
 
+import time
 import warnings
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Iterator
 
 import numpy as np
 
 if TYPE_CHECKING:
     from typing import Any
+
+
+# ---------------------------------------------------------------------------
+# Per-stage wall-clock timing
+# ---------------------------------------------------------------------------
+
+class StageTimer:
+    """Accumulate labelled wall-clock durations and render a summary.
+
+    Used by ``CNMFe.fit_extract`` to surface where time goes — especially the
+    repeated passes over an on-disk ``Y_flat`` store in streaming mode, where
+    the dominant cost is network/disk IO rather than compute. Repeated labels
+    (e.g. ``compute_W`` across BCD iterations) accumulate into one row with a
+    call count.
+
+    Example::
+
+        timer = StageTimer()
+        with timer.stage("compute_W"):
+            ...
+        print(timer.summary())
+    """
+
+    def __init__(self) -> None:
+        self._secs: dict[str, float] = {}
+        self._calls: dict[str, int] = {}
+        self._order: list[str] = []
+
+    def add(self, label: str, secs: float) -> None:
+        """Record ``secs`` against ``label`` (accumulates if repeated)."""
+        if label not in self._secs:
+            self._secs[label] = 0.0
+            self._calls[label] = 0
+            self._order.append(label)
+        self._secs[label] += secs
+        self._calls[label] += 1
+
+    @contextmanager
+    def stage(self, label: str):
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.add(label, time.perf_counter() - t0)
+
+    def summary(self, title: str = "Stage timings") -> str:
+        """Return a formatted table: per-label total seconds, call count, share."""
+        if not self._order:
+            return f"{title}: (no stages timed)"
+        total = sum(self._secs.values())
+        width = max(len(lbl) for lbl in self._order)
+        lines = [f"{title} (total {total:.1f}s):"]
+        for lbl in self._order:
+            secs = self._secs[lbl]
+            calls = self._calls[lbl]
+            count = f" x{calls}" if calls > 1 else ""
+            pct = (100.0 * secs / total) if total > 0 else 0.0
+            lines.append(f"  {lbl:<{width}}  {secs:7.1f}s  {pct:4.0f}%{count}")
+        return "\n".join(lines)
 
 
 def make_2d(movie: np.ndarray) -> np.ndarray:
