@@ -16,6 +16,7 @@ tags: [cnmfe, index, home]
 | [[architecture]] | Module map, dependency graph, data-flow diagrams |
 | [[api-reference]] | Every public function — signatures, parameters, return values |
 | [[usage-guide]] | Quick-start, parameter tuning, parallelism, cookbook |
+| [[caiman-comparison]] | Benchmarking vs CaImAn's CNMF-E — methodology, results, caveats |
 
 ---
 

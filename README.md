@@ -164,6 +164,26 @@ GPU speedup is most significant for large recordings (≥ 256 × 256, T ≥ 1000
 
 ---
 
+## Experimental features (use with care)
+
+The following pass the automated test suite (on synthetic data) but have **not
+yet been validated on real recordings**. They're off by default and don't change
+standard behaviour unless you enable them — but treat their output as provisional
+and sanity-check before relying on it:
+
+- **Cutout analysis** — `temporal_crop` / `spatial_crop` / `spatial_mask_path`
+  crop or mask the movie at ingestion (with `place_in_full_fov()` to map results
+  back). Note: not supported on the streaming `Y_flat_zarr` path.
+- **Detrending** — `ar_detrend_order` / `temporal_detrend_order` (polynomial
+  detrend before AR estimation / OASIS) and the `detrend_movie` preprocessor.
+  Non-standard; defaults are `0` (disabled = standard CNMF-E).
+- **Running many sessions concurrently** — one process per session with capped
+  BLAS threads (`OMP_NUM_THREADS=1`, etc.) and a unique scratch dir per session.
+  This workflow is **not covered by automated tests** — validate on a small batch
+  first.
+
+---
+
 ## Running tests
 
 ```bash

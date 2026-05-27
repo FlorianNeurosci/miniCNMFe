@@ -35,6 +35,30 @@ Major work done so far:
 - CLI pipeline runner: `full_pipeline.py` (loads zarr lazily, runs full pipeline, saves all results to disk)
 - Obsidian wiki (`wiki/`) updated for all of the above
 
+### Experimental — passing automated tests, NOT yet validated on real data
+
+These features work in the pytest suite (synthetic fixtures) but have **not been
+exercised by the maintainer on a real recording**. Treat results as provisional
+and sanity-check before relying on them. Defaults are chosen so none of these
+change standard behaviour unless explicitly enabled.
+
+1. **Cutout analysis** — `CNMFeParams.temporal_crop` / `spatial_crop` /
+   `spatial_mask_path` (`cnmfe/cutout.py`), applied at ingestion before MC, plus
+   `place_in_full_fov()` to map results back. Autotested (`tests/test_cutout.py`,
+   incl. end-to-end fit + fused AVI→MC). **Caveat:** incompatible with the
+   streaming `Y_flat_zarr` path (raises by design); not validated on real data.
+2. **Detrending** — the polynomial-detrend knobs `ar_detrend_order` (before
+   Yule-Walker) and `temporal_detrend_order` (before OASIS), and the standalone
+   `cnmfe/detrend.py:detrend_movie` preprocessor. NON-STANDARD; defaults `0`
+   (off) = standard CNMF-E. Autotested (`tests/test_detrend.py`,
+   `tests/test_temporal.py`, a pipeline run with orders=2) but not validated on
+   real recordings — tune cautiously.
+3. **Parallel sessions** — the concurrent multi-session recipe (see *Running
+   many sessions concurrently* below). **Not autotested AND not run end-to-end**
+   — the BLAS-cap and unique-`yflat_dir` requirements are reasoned from the code,
+   not verified. The weakest-tested of the three; validate on a small batch
+   first.
+
 ---
 
 ## Tech stack
@@ -120,6 +144,105 @@ Everything *on top of* `Y_flat` is streamed:
 
 The transpose is a one-time disk pass; pixel ordering matches `make_2d`
 (pixel `(h, w)` → flat `h*W + w`).
+
+**Streaming IO tuning (network vs SSD).** The streaming BCD loop makes ~5–6
+full passes over the on-disk `Y_flat` store (`compute_W` ×2, `update_spatial`,
+`update_temporal`/`project_onto` ×several, final YrA), so its cost is dominated
+by *store IO*, not compute. Tuning knobs — all of which affect **only IO speed,
+never the extracted results** (guarded by `tests/test_pipeline.py::test_fit_*Y_flat_zarr*`):
+
+- **`CNMFeParams.yflat_dir`** — where the auto-derive path
+  (`fit_extract(zarr, output_dir=...)` / `run_extract.py`) writes
+  `Y_flat_pixel.zarr`. Default `None` = under `output_dir`. **On a network
+  mount, point this at a local SSD/tmpfs:** the transpose reads `mc.zarr` from
+  the network *once*, writes `Y_flat` locally, and all BCD passes then read
+  locally. Usually the single biggest network win.
+- **`yflat_pixel_chunk` (512)** / **`yflat_time_chunk` (None = full T)** — dest
+  chunk shape, tuned for the contiguous-pixel-row / full-time read pattern. The
+  old hardcoded `4096×2000` over-read ~16× because the read batches are 256/4096
+  pixels. Smaller `pixel_chunk` = less pixel over-read; full-T time chunk = no
+  time-axis amplification. Caveat: chunk bytes = `pixel_chunk·T·4` (cap
+  `time_chunk` for very long T).
+- **`yflat_compression` (True)** — keep `True` on a **network** mount (fewer
+  bytes over the wire); try `False` on a **local SSD** (skips per-read
+  decompression, IO-bound only; costs ~`H·W·T·4` bytes of disk).
+- **`n_jobs=-1`** — parallelises the per-batch store reads + solves (default is
+  `1`, serial). On a high-latency network this hides round-trip latency.
+- **`cnmfe.io.stage_zarr_to_local(src, local_dir)`** — copies any zarr store to
+  local disk and returns the open handle, for users who already have a
+  network-resident `Y_flat` (pass the local handle as `Y_flat_zarr=`). Equivalent
+  to setting `yflat_dir` on the auto-derive path.
+- **`run_extract.py`** exposes `--yflat-dir`, `--yflat-pixel-chunk`,
+  `--yflat-time-chunk`, `--yflat-no-compress`.
+
+`fit_extract` prints a **per-stage wall-clock summary** at the end (via
+`cnmfe._utils.StageTimer`): `transpose -> Y_flat`, `compute_W`, `update_spatial`,
+`update_temporal`, `final YrA projection`, etc. — use it to see where the IO
+time actually goes before/after tuning.
+
+### Running many sessions concurrently (throughput)
+
+To process a batch of sessions, prefer **one process per session, each pinned to
+a small thread budget** over a single session on all cores. Independent sessions
+are embarrassingly parallel: no within-session thread-coordination overhead, and
+the serial-ish stages (greedy init is sequential; OASIS is inherently
+per-component sequential) of one session overlap the IO/compute of another. For
+total throughput (sessions/hour) this usually beats one session with `n_jobs=-1`.
+
+**The non-obvious gotcha — `n_jobs=1` is NOT a single-threaded process.** The
+serial code path does **not** cap BLAS (every `threadpool_limits(limits=1)` in
+the package wraps a `n_jobs!=1` parallel branch only — see `spatial.py`,
+`background.py`, `temporal.py`). So numpy/scipy (ring `BTB` solves, `project_onto`
+matmuls, LASSO) still spawn **one thread per core** even at `n_jobs=1`. Launch N
+such processes without capping BLAS and you get `N×cores` threads on `cores`
+CPUs → oversubscription thrash, *slower* than a single session. **Fix:** export
+the BLAS thread caps in each process's environment *before* numpy is imported:
+
+```bash
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+       NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1
+```
+
+**Second gotcha — give each session a unique `yflat_dir`.** The auto-derive path
+always names the store `Y_flat_pixel.zarr` under `yflat_dir` (or `output_dir`),
+so concurrent sessions sharing one `--yflat-dir` would **clobber each other's
+store** (a correctness bug). Each session needs its own scratch subdir (and its
+own results dir).
+
+Minimal launcher (one process per session, BLAS pinned, unique `yflat_dir`,
+at most `$JOBS` in flight via bash ≥ 4.3 `wait -n`; reads `mc.zarr` paths from
+stdin, forwards trailing args to `run_extract.py`):
+
+```bash
+#!/usr/bin/env bash
+set -uo pipefail   # not -e: one failing session must not abort the batch
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+       NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1
+JOBS="${JOBS:-$(nproc)}"; YFLAT_ROOT="${YFLAT_ROOT:-/tmp/cnmfe_yflat}"
+running=0
+while IFS= read -r mc; do
+  [[ -z "$mc" ]] && continue
+  key="$(readlink -f "$mc" | md5sum | cut -c1-8)"          # unique per session
+  ydir="$YFLAT_ROOT/$(basename "$(dirname "$mc")")_$key"
+  ( python run_extract.py "$mc" --n-jobs 1 --yflat-dir "$ydir" "$@" \
+      > "$ydir.log" 2>&1 && echo "OK   $mc" || echo "FAIL $mc ($ydir.log)" ) &
+  if (( ++running >= JOBS )); then wait -n; ((running--)); fi
+done
+wait
+# usage:  printf '%s\n' /net/data/*/mc.zarr | JOBS=8 YFLAT_ROOT=/local/ssd ./run_sessions.sh --params cfg.json
+```
+
+Notes:
+- `--yflat-dir` on a **local SSD** keeps the ~5–6 BCD passes local even when
+  `mc.zarr` lives on the network; only the one-time transpose hits the network.
+- Pick **N ≈ min(physical cores, RAM_budget / per-session peak, IO headroom)**.
+  Per-session peak RAM is bounded by streaming, but greedy init still
+  materialises a strided sample (the spike — see `todo/greedy_init_streaming.md`),
+  so budget for that × N. If you are **IO-bound on a network mount**, *fewer*
+  concurrent sessions can be faster — N readers contend for the same bandwidth.
+- A middle ground on many-core boxes: a few sessions each with a small `n_jobs`
+  (e.g. 4 × `n_jobs=4` on 16 cores) — still needs the BLAS env caps so each
+  session's BLAS doesn't fight its own joblib worker threads.
 
 Convenience wrappers added alongside `motion_correction_rigid`:
 - `apply_shift(img, shift)` — alias for `apply_shift_caiman`
@@ -228,8 +351,16 @@ end-to-end. See `todo/oasis_oversmoothing.md` for the diagnostic this fixes.
 ### Two trace flavours: `C` vs `C + YrA`
 - `model.C` — OASIS-deconvolved (clean AR(1) shape). Use for spike-event detection.
 - `model.YrA` — residual at each footprint after the final BCD pass.
-- `model.C + model.YrA` — noisy *projected* trace; preserves the data's actual shape. Pearson r against ground truth typically ≥ 0.94 here vs ~0.6–0.85 for `C` alone, because OASIS's `c[t] >= g·c[t-1]` constraint introduces small spike-timing distortions.
-- Use `C + YrA` for shape-faithful comparisons (cross-correlation with an external signal, regression, plotting raw fluorescence).
+- `model.C + model.YrA` — noisy *projected* trace; preserves the data's actual shape.
+- Both `C` and `C + YrA` correlate ≳ 0.95 with ground truth on AR(1) synthetic data
+  (on par with CaImAn). Use `C + YrA` for shape-faithful comparisons
+  (cross-correlation with an external signal, regression, plotting raw fluorescence)
+  and `C` for clean spike-event timing.
+- **Historical caveat (fixed May 2026):** `C` alone used to correlate only ~0.6
+  when the `oasis-deconvolution` package was **not installed** — a bug in the
+  pure-Python PAVA fallback (see *Bugs already fixed*), not an inherent OASIS
+  limitation. If you see `C` ≈ 0.6 while `C + YrA` ≈ 0.96, you are on old code or
+  a regressed fallback.
 
 ### Merge rule: temporal AND (spatial overlap OR centre proximity)
 `merge_components` merges component pair (i, j) when:
@@ -532,6 +663,23 @@ ground truth from the expected ~0.94 to ~0.76.
 thread cache through every `update_temporal` call. Inherited via `members[0]`
 after merging.
 
+### Pure-Python OASIS (PAVA) fallback merge condition
+`temporal.py:_oasis_pava_run` is the deconvolution used when the
+`oasis-deconvolution` package is **not** installed. Its pool-merge test was
+`pool_val[i] * g > pool_val[i+1]`, but the OASIS boundary constraint
+`c[t] >= g·c[t-1]` requires `pool_val[i] * g**pool_length[i] > pool_val[i+1]`.
+Using bare `g` (correct only for length-1 pools) over-merged smooth exact-`g`
+decays and collapsed the trace: deconvolving a **clean AR(1)** trace reconstructed
+it at only r ≈ 0.4, and `model.C` vs ground truth sat at ~0.58 instead of ~0.96
+(while `C + YrA` stayed ~0.96, masking it). Only bites without the compiled
+package — which is why it slipped CI (the package path was exercised there) and
+why it surfaced in the CaImAn comparison (run in an env without it).
+**Fix:** use `g ** pool_length[i]` (plus a tiny tolerance for float-noise on
+exact-`g` decays). Regression guard:
+`tests/test_temporal.py::test_pava_fallback_reconstructs_clean_ar1` asserts the
+fallback reconstructs a clean AR(1) at r > 0.95 (calls `_oasis_ar1_pava`
+directly, so it tests the fallback regardless of whether the package is present).
+
 ### `avi_to_zarr` imageio v3 shape extraction
 `iio.improps(src).shape` in imageio v3 returns `(T, H, W)` (full video shape), not `(H, W)`.
 Using `props.shape[:2]` silently extracted `(T, H)` as the spatial dimensions, creating a zarr
@@ -580,8 +728,11 @@ tutorial_realistic.ipynb       Tutorial on the realistic simulator + mp4 export 
 tutorial_caiman_compare.ipynb  Side-by-side CaImAn vs our CNMFe (requires CaImAn installed separately)
 tutorial_demo.ipynb            Realistic-use demo: AVI -> zarr -> lazy load -> full pipeline -> visualise
 CaImAn-main/                   Reference source only — never import from here for production
-todo/speedup.md                Implementation guide for future speed improvements (skip OASIS on first pass, cache W)
 ```
+
+(The former `todo/speedup.md` is gone — its two ideas are now implemented:
+"skip OASIS on first pass" = `CNMFeParams.skip_first_deconv`, "cache W" =
+`compute_W(..., W_cached=...)`.)
 
 `CNMFeParams` fields (excerpt of the params added or made adjustable in this round):
 - `init_min_corr_neuron: float = 0.8` (was hardcoded 0.9)
