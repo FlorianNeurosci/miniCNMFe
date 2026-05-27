@@ -228,14 +228,16 @@ class TestDriftRobustness:
         )
 
     def test_update_temporal_detrend_recovers_spikes(self):
-        """A trace = three sharp transients on top of an exponential bleach
-        should yield ~0 spikes when fed to OASIS raw (drift collapses the
-        deconvolution), and many spikes when fed via update_temporal's
-        detrend_order=3 path.
+        """Three sharp transients on top of an exponential bleach: the
+        polynomial detrend (detrend_order=3) must remove the drift before OASIS.
 
-        Setup: a 1-pixel "movie" with a single component whose footprint is a
-        single nonzero pixel; the projected trace is then exactly the data
-        for that pixel.
+        With a correct OASIS the raw (no-detrend) path can still hit the true
+        spike *times*, but the un-removed bleach leaks in as many spurious
+        spikes; the detrend path fires ~only the real ones. So the discriminator
+        is the false-positive spike count, not the hit count.
+
+        Setup: a 1-pixel "movie" with a single 1.0-weight footprint, so the
+        projected trace is exactly that pixel's data.
         """
         T = 800
         rng = np.random.default_rng(11)
@@ -282,15 +284,24 @@ class TestDriftRobustness:
                 for t in spike_frames
             )
 
-        hits_no = hits(S_no)
+        # False positives = spikes outside the ±3-frame windows around truth.
+        def n_false(S):
+            mask = np.ones(S.shape[1], dtype=bool)
+            for t in spike_frames:
+                mask[max(0, t - 3): t + 4] = False
+            return int((S[0, mask] > 0.5).sum())
+
         hits_yes = hits(S_yes)
+        fp_no, fp_yes = n_false(S_no), n_false(S_yes)
         assert hits_yes >= 2, (
             f"Expected ≥2 of 3 spikes recovered with detrend; got {hits_yes}. "
             f"S_yes nonzero count: {int((S_yes > 0.5).sum())}"
         )
-        assert hits_yes > hits_no, (
-            f"Detrended deconv must do strictly better than no-detrend. "
-            f"hits_yes={hits_yes}, hits_no={hits_no}"
+        # The bleach leaks into the raw deconvolution as spurious spikes; the
+        # detrend path must fire far fewer false positives.
+        assert fp_yes < fp_no, (
+            f"Detrend must suppress drift-induced false spikes: "
+            f"fp_yes={fp_yes}, fp_no={fp_no}"
         )
 
     def test_detrend_is_no_op_on_clean_trace(self):
