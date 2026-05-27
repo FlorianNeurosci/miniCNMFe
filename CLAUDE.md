@@ -367,6 +367,37 @@ the BCD on it). Native `(H,W)`/`T` must be supplied (only `downsample_movie`
 writes a `ds_meta.json`; the fused/concat paths don't), or passed via
 `ds_meta=`.
 
+### Cutout — crop the movie before extraction (`cnmfe/cutout.py`)
+Optional `CNMFeParams` fields restrict CNMFe to a sub-region/window, applied
+**once at ingestion, before MC** (NATIVE coords):
+- `temporal_crop=(t0,t1)`, `spatial_crop=(y0,y1,x0,x1)`, `spatial_mask_path`
+  (a bool `.npy`; its bbox sets/narrows the rect, pixels outside are zeroed).
+All `None` (default) = no cutout = bit-for-bit unchanged.
+
+Because `self.dims`/`T` flow from the (cropped) movie shape, everything
+downstream (ring indices, init, BCD) treats the cutout as "the movie" — no
+other changes. `fit()` and `fit_mc`/`fit_mc_from_avis` apply the crop and record
+`self.cutout`; **`fit_extract` does NOT crop** (its input is already the ROI),
+so the staged `fit_mc_from_avis → fit_extract(mc.zarr)` flow crops exactly once.
+`downscaled()` **clears** the crop fields (applied upstream of binning).
+
+`cnmfe/cutout.py`: `resolve_cutout` (rect ∩ mask-bbox, clamp, load mask),
+`apply_cutout` (slice + zero-outside-mask; numpy or zarr), and the map-back
+helpers used by **`CNMFe.place_in_full_fov(*, place_time=True)`** — a new model
+(parallels `upsample_to_native`) with footprints padded to the original FOV at
+the crop offset and traces embedded in the full timeline; `S`/traces zero
+outside the window, background/`shifts` dropped (inspection view).
+
+**Fused path:** `_decode_avi_worker` gained `crop_bbox`/`mask_local`/`frame_lo`/
+`frame_hi`; `concat_avis_to_mc_zarr` resolves the cutout after the pre-scan,
+computes per-file in-window frame ranges (temporal crop spans files via the
+global offset), crops the template too, and writes a `cutout.json` sidecar that
+`fit_mc_from_avis` loads onto `self.cutout`.
+
+**Caveat (deliberate):** spatial-crop-before-MC means MC can't pull content from
+outside the crop — minor edge artifacts within ~`max_shift` px of the border;
+leave a small margin around the ROI.
+
 ### Fused AVI → MC (`cnmfe/avi_mc.py`)
 `concat_avis_to_mc_zarr` (and the convenience wrapper
 `CNMFe.fit_mc_from_avis`) decode an AVI folder and apply rigid motion

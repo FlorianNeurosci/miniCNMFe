@@ -403,6 +403,13 @@ class CNMFeParams:
     # Standard CNMF-E has no comparable post-BCD quality filter.
     auto_eval_snr_amp_thr: float = 3.0
 
+    # --- Cutout (crop the movie before extraction; NATIVE coordinates) ---
+    # Applied ONCE at ingestion, before motion correction (see cnmfe/cutout.py).
+    # All None (default) = no cutout = bit-for-bit unchanged behaviour.
+    temporal_crop: "tuple[int, int] | None" = None       # (t0, t1), t1 exclusive
+    spatial_crop: "tuple[int, int, int, int] | None" = None  # (y0, y1, x0, x1)
+    spatial_mask_path: "str | None" = None               # path to a bool .npy (H, W)
+
     # --- Serialisation ---------------------------------------------------------
 
     def to_json(self, path: "str | Path") -> None:
@@ -420,8 +427,9 @@ class CNMFeParams:
         raw = json.loads(Path(path).read_text())
         valid_names = {f.name for f in fields(cls)}
         data = {k: v for k, v in raw.items() if k in valid_names}
-        if "max_shift" in data and isinstance(data["max_shift"], list):
-            data["max_shift"] = tuple(data["max_shift"])
+        for key in ("max_shift", "temporal_crop", "spatial_crop"):
+            if isinstance(data.get(key), list):
+                data[key] = tuple(data[key])
         return cls(**data)
 
     def downscaled(self, ssub: int, tsub: int) -> "CNMFeParams":
@@ -437,6 +445,11 @@ class CNMFeParams:
 
         ``decay_time_ms`` is a physical time and is left unchanged — only
         ``frame_rate_hz`` changes, which correctly raises the per-frame decay.
+
+        Cutout fields (``temporal_crop`` / ``spatial_crop`` /
+        ``spatial_mask_path``) are **cleared**: a cutout is applied at native
+        resolution upstream of binning, so the downsampled movie this params
+        copy describes is already cropped.
         """
         if ssub < 1 or tsub < 1:
             raise ValueError(f"ssub and tsub must be >= 1 (got {ssub}, {tsub})")
@@ -450,6 +463,9 @@ class CNMFeParams:
                           else self.mc_gSig_filt / ssub),
             frame_rate_hz=(None if self.frame_rate_hz is None
                            else self.frame_rate_hz / tsub),
+            temporal_crop=None,
+            spatial_crop=None,
+            spatial_mask_path=None,
         )
 
 
@@ -491,6 +507,7 @@ class CNMFe:
         self.mc_roi: "tuple[slice, slice] | None" = None  # ROI used for shift estimation
         self.accepted_mask: np.ndarray | None = None    # (K,) bool — passed auto-eval
         self.eval_info: dict | None = None              # full dict from auto_evaluate_components
+        self.cutout: dict | None = None                 # crop meta (cnmfe/cutout.py) if any
 
     # ------------------------------------------------------------------
     # Convenience accessors
@@ -586,6 +603,7 @@ class CNMFe:
             "dims": list(self.dims) if self.dims is not None else None,
             "K": int(self.A.shape[1]),
             "T": int(self.C.shape[1]),
+            "cutout": self.cutout,
         }
         (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
@@ -609,6 +627,7 @@ class CNMFe:
         manifest = json.loads((output_dir / "manifest.json").read_text())
         if manifest.get("dims") is not None:
             model.dims = tuple(manifest["dims"])
+        model.cutout = manifest.get("cutout")
 
         model.A = sp.load_npz(output_dir / "A.npz").tocsc()
         model.C = np.load(output_dir / "C.npy")
@@ -677,6 +696,9 @@ class CNMFe:
             or np.ndarray (if numpy input + no output_dir).
         """
         p = self.params
+
+        # Crop (if a cutout is set) before MC. Materialises the crop in RAM.
+        movie = self._ingest_cutout(movie)
 
         # Read shape without materializing the full movie when it's a zarr.
         T, H, W = int(movie.shape[0]), int(movie.shape[1]), int(movie.shape[2])
@@ -775,7 +797,47 @@ class CNMFe:
         if shifts is not None:
             np.save(output_dir / "shifts.npy", shifts)
 
+        # If a cutout was applied during decode, concat_avis_to_mc_zarr wrote a
+        # cutout.json sidecar; load it so place_in_full_fov works downstream.
+        cutout_json = output_dir / "cutout.json"
+        if cutout_json.exists():
+            self.cutout = json.loads(cutout_json.read_text())
+
         return mc_zarr
+
+    def _ingest_cutout(self, movie, *, Y_flat_zarr=None):
+        """Apply the params cutout (crop) to a raw ``(T, H, W)`` movie, once.
+
+        Returns the cropped float32 array (numpy) and records ``self.cutout``.
+        No-op (returns ``movie`` unchanged) when no cutout fields are set.
+        Raises if a cutout is combined with a pre-built ``Y_flat_zarr`` (the
+        crop must be baked into that store upstream).
+        """
+        from cnmfe.cutout import apply_cutout, public_spec, resolve_cutout
+
+        spec = resolve_cutout(
+            self.params,
+            (int(movie.shape[1]), int(movie.shape[2])),
+            int(movie.shape[0]),
+        )
+        if spec is None:
+            return movie
+        if Y_flat_zarr is not None:
+            raise ValueError(
+                "A cutout (temporal_crop/spatial_crop/spatial_mask_path) cannot "
+                "be combined with a pre-built Y_flat_zarr; bake the crop in "
+                "upstream or clear the crop params."
+            )
+        cropped = apply_cutout(movie, spec)
+        self.cutout = public_spec(spec)
+        self.cutout["spatial_mask_path"] = self.params.spatial_mask_path
+        y0, y1, x0, x1 = spec["bbox"]
+        t0, t1 = spec["t_range"]
+        print(
+            f"Cutout: T[{t0}:{t1}] H[{y0}:{y1}] W[{x0}:{x1}]"
+            f"{' +mask' if spec['masked'] else ''} -> {cropped.shape}"
+        )
+        return cropped
 
     def fit(
         self,
@@ -806,6 +868,9 @@ class CNMFe:
             self (for chaining).
         """
         p = self.params
+
+        # Crop the movie (if a cutout is set) before MC / extraction.
+        movie = self._ingest_cutout(movie, Y_flat_zarr=Y_flat_zarr)
 
         if do_motion_correction:
             if Y_flat_zarr is not None:
@@ -975,6 +1040,62 @@ class CNMFe:
             )
         # Extraction internals / ds-rate quantities aren't meaningful at the
         # native grid; the upsampled model is for inspection, not re-fitting.
+        new.W = None
+        new.b0 = None
+        new.b_f = None
+        new.f = None
+        new.shifts = None
+        return new
+
+    def place_in_full_fov(self, *, place_time: bool = True) -> "CNMFe":
+        """Return a NEW model with footprints/traces mapped back to the full FOV.
+
+        Inverse of the cutout: footprints are padded back to the original
+        ``(H, W)`` at the crop ``(y0, x0)`` offset, and (when ``place_time``)
+        the traces ``C``/``YrA``/``C_raw``/``S`` are embedded in the full
+        ``orig_T`` timeline at ``[t0:t1]`` (zeros outside the window). For
+        overlaying on the uncropped movie / anatomy and aligning with
+        full-length signals.
+
+        Non-destructive (``self`` unchanged). The returned model is for
+        inspection/overlay: the background model (``W``/``b0``/``b_f``/``f``)
+        and ``shifts`` are dropped. Requires that this model was run on a
+        cutout (``self.cutout`` is set).
+        """
+        from cnmfe.cutout import place_footprints_in_fov, place_traces_in_timeline
+
+        if self.cutout is None:
+            raise RuntimeError(
+                "place_in_full_fov requires a cutout; this model was not run on one."
+            )
+        if self.A is None or self.C is None:
+            raise RuntimeError("place_in_full_fov requires a fitted model.")
+        c = self.cutout
+        orig_dims = tuple(c["orig_dims"])
+        orig_T, bbox, t_range = c["orig_T"], c["bbox"], c["t_range"]
+
+        new = CNMFe(self.params)
+        new.dims = orig_dims
+        new.A = place_footprints_in_fov(self.A, bbox, orig_dims)
+        if place_time:
+            new.C = place_traces_in_timeline(self.C, t_range, orig_T)
+            new.YrA = place_traces_in_timeline(self.YrA, t_range, orig_T)
+            new.C_raw = place_traces_in_timeline(self.C_raw, t_range, orig_T)
+            new.S = place_traces_in_timeline(self.S, t_range, orig_T)
+        else:
+            new.C = self.C.copy()
+            new.YrA = None if self.YrA is None else self.YrA.copy()
+            new.C_raw = None if self.C_raw is None else self.C_raw.copy()
+            new.S = None if self.S is None else self.S.copy()
+        new.g = self.g
+        new.sn_per_k = self.sn_per_k
+        new.accepted_mask = self.accepted_mask
+        new.eval_info = self.eval_info
+        if self.sn is not None:
+            y0, y1, x0, x1 = bbox
+            full_sn = np.zeros(orig_dims, dtype=np.float32)
+            full_sn[y0:y1, x0:x1] = self.sn
+            new.sn = full_sn
         new.W = None
         new.b0 = None
         new.b_f = None

@@ -20,6 +20,7 @@ output) use the separate ``concat_avis_to_zarr`` + ``CNMFe.fit_mc`` flow.
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import shutil
@@ -174,18 +175,48 @@ def concat_avis_to_mc_zarr(
         if verbose:
             print(f"  {avi.name}: {n} frames  ({H}x{W})", flush=True)
     T_total = sum(counts)
-    # Output (post-bin) dims + per-file output counts. Temporal binning is
-    # per file, so T_out = sum(n_i // tsub); the trailing < tsub frames of
-    # each file are dropped.
-    downsampling = (ssub > 1 or tsub > 1)
-    out_H, out_W = ref_H // ssub, ref_W // ssub
-    out_counts = [c // tsub for c in counts] if tsub > 1 else list(counts)
+
+    # --- Resolve optional cutout (crop) from params (NATIVE coords) ---
+    from cnmfe.cutout import public_spec, resolve_cutout
+    spec = resolve_cutout(params, (ref_H, ref_W), T_total)
+    if spec is not None:
+        cy0, cy1, cx0, cx1 = spec["bbox"]
+        ct0, ct1 = spec["t_range"]
+        mask_local = spec.get("mask_local")
+        crop_bbox = (cy0, cy1, cx0, cx1)
+    else:
+        cy0, cy1, cx0, cx1 = 0, ref_H, 0, ref_W
+        ct0, ct1 = 0, T_total
+        mask_local = None
+        crop_bbox = None
+    crop_H, crop_W = cy1 - cy0, cx1 - cx0
+
+    # Per-file in-window frame ranges [lo_i, hi_i) for the temporal crop
+    # (computed from each file's global offset), then per-file OUTPUT counts
+    # after temporal binning. With no temporal crop this is the full file.
+    file_lohi: list[tuple[int, int]] = []
+    in_counts: list[int] = []
+    g = 0
+    for c in counts:
+        lo = min(max(ct0 - g, 0), c)
+        hi = min(max(ct1 - g, 0), c)
+        file_lohi.append((lo, hi))
+        in_counts.append(hi - lo)
+        g += c
+    out_counts = [ic // tsub for ic in in_counts] if tsub > 1 else list(in_counts)
     T_out = int(sum(out_counts))
+
+    # Output (post-crop, post-bin) dims + per-file output counts.
+    downsampling = (ssub > 1 or tsub > 1)
+    out_H, out_W = crop_H // ssub, crop_W // ssub
     if verbose:
         print(f"\nTotal: {T_total} frames  x  {ref_H}x{ref_W} px")
-        if downsampling:
-            print(f"Downsample ssub={ssub} tsub={tsub} -> "
-                  f"{T_out} frames  x  {out_H}x{out_W} px (binned before MC)")
+        if spec is not None:
+            print(f"Cutout: T[{ct0}:{ct1}] H[{cy0}:{cy1}] W[{cx0}:{cx1}]"
+                  f"{' +mask' if mask_local is not None else ''}")
+        if downsampling or spec is not None:
+            print(f"Output: {T_out} frames  x  {out_H}x{out_W} px "
+                  f"(crop+bin before MC)")
     probe_secs = time.time() - t0_probe
 
     n_jobs_eff = _resolve_n_jobs(n_jobs, params, len(avis))
@@ -204,6 +235,8 @@ def concat_avis_to_mc_zarr(
         bin_window=10,
         ssub=ssub,
         tsub=tsub,
+        crop_bbox=crop_bbox,
+        mask_local=mask_local,
         n_jobs=n_jobs_eff,
         verbose=verbose,
     )
@@ -257,12 +290,22 @@ def concat_avis_to_mc_zarr(
         chunk_t=params.mc_batch_size,
         ssub=ssub,
         tsub=tsub,
+        crop_bbox=crop_bbox,
+        mask_local=mask_local,
+        file_lohi=file_lohi,
         n_jobs=n_jobs_eff,
         n_jobs_inner=n_jobs_eff,
         queue_maxsize=2 * n_jobs_eff,
         verbose=verbose,
     )
     mc_secs = time.time() - t0_mc
+
+    # Record the cutout next to mc.zarr so fit_mc_from_avis can map results
+    # back to the full FOV / timeline later (parallels ds_meta.json).
+    if spec is not None:
+        meta = public_spec(spec)
+        meta["spatial_mask_path"] = params.spatial_mask_path
+        (out_path.parent / "cutout.json").write_text(json.dumps(meta, indent=2))
 
     if params.mc_n_iter == 1:
         if verbose:
@@ -356,6 +399,8 @@ def _build_template_from_strided_avis(
     bin_window: int,
     ssub: int,
     tsub: int,
+    crop_bbox=None,
+    mask_local=None,
     n_jobs: int,
     verbose: bool,
 ) -> np.ndarray:
@@ -364,9 +409,11 @@ def _build_template_from_strided_avis(
 
     Picks ``n_template_avis`` evenly-spaced AVIs across the file list.
     Frame counts come from the caller's pre-scan so no extra pyav opens
-    happen here. ``H`` / ``W`` are the OUTPUT (post-bin) dims; the sample
-    frames are binned by ``ssub`` / ``tsub`` so the template matches the
-    downsampled data MC operates on.
+    happen here. ``H`` / ``W`` are the OUTPUT (post-crop, post-bin) dims; the
+    sample frames are cropped (``crop_bbox`` + ``mask_local``) and binned by
+    ``ssub`` / ``tsub`` so the template matches the data MC operates on. The
+    template uses all frames of the chosen files (temporal crop does not apply
+    to the spatial reference).
     """
     if not avis:
         raise ValueError("no AVIs provided to template builder")
@@ -387,8 +434,9 @@ def _build_template_from_strided_avis(
     pool = _decode_avis_to_buffer(
         chosen_avis, chosen_counts, H, W,
         ssub=ssub, tsub=tsub,
+        crop_bbox=crop_bbox, mask_local=mask_local,
         n_jobs=min(n_jobs, k), verbose=verbose,
-    )  # (T_subset_out, H, W) — H, W already post-bin
+    )  # (T_subset_out, H, W) — H, W already post-crop+bin
 
     # Stride-sample the pool down to template_max_frames, high-pass filter,
     # and median-bin to get the template.
@@ -410,16 +458,19 @@ def _decode_avis_to_buffer(
     *,
     ssub: int = 1,
     tsub: int = 1,
+    crop_bbox=None,
+    mask_local=None,
     n_jobs: int,
     verbose: bool,
 ) -> np.ndarray:
     """Decode the given AVIs (with known per-file frame counts) into a single
     contiguous RAM buffer.
 
-    ``H`` / ``W`` are the OUTPUT (post-bin) dims; frames are binned by
-    ``ssub`` / ``tsub`` inline. The buffer is ``(sum(n_i // tsub), H, W)``,
-    float32 when binning (to keep the fractional means) else uint8. Uses the
-    same parallel decoder threads as the main MC pass, draining into RAM.
+    ``H`` / ``W`` are the OUTPUT (post-crop, post-bin) dims; frames are cropped
+    (``crop_bbox`` + ``mask_local``) and binned by ``ssub`` / ``tsub`` inline.
+    The buffer is ``(sum(n_i // tsub), H, W)``, float32 when binning (to keep
+    the fractional means) else uint8. All frames of each file are used (no
+    temporal crop for the template).
     """
     downsampling = (ssub > 1 or tsub > 1)
     out_counts = [c // tsub for c in counts] if tsub > 1 else list(counts)
@@ -444,7 +495,8 @@ def _decode_avis_to_buffer(
             args=(path, i, offset, 200,    # chunk_t in template phase
                   True, "luma", dec_dtype,
                   ssub, tsub,
-                  out_q, errors, stop_event),
+                  out_q, errors, stop_event,
+                  crop_bbox, mask_local),   # frame_lo/hi default = all frames
             name=f"tmpl-decoder-{i}-{path.name}",
             daemon=True,
         )
@@ -495,12 +547,15 @@ def _run_avi_mc_parallel(
     chunk_t: int,
     ssub: int,
     tsub: int,
+    crop_bbox=None,
+    mask_local=None,
+    file_lohi=None,
     n_jobs: int,
     n_jobs_inner: int,
     queue_maxsize: int,
     verbose: bool,
 ) -> None:
-    """The fused decode+(bin)+MC+write loop.
+    """The fused decode+(crop)+(bin)+MC+write loop.
 
     Mirrors ``concat_avis_to_zarr._run_parallel`` but swaps the
     "write batch to zarr" writer for a "MC the batch, write the corrected
@@ -527,12 +582,14 @@ def _run_avi_mc_parallel(
 
     decoders: list[threading.Thread] = []
     for i, (path, offset) in enumerate(zip(avis, offsets)):
+        lo, hi = (file_lohi[i] if file_lohi is not None else (0, None))
         t = threading.Thread(
             target=_decode_with_admission,
             args=(path, i, offset, chunk_t,
                   True, "luma", dec_dtype,
                   ssub, tsub,
-                  out_q, errors, stop_event),
+                  out_q, errors, stop_event,
+                  crop_bbox, mask_local, lo, hi),
             name=f"mc-decoder-{i}-{path.name}",
             daemon=True,
         )

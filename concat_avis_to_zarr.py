@@ -143,8 +143,18 @@ def _decode_avi_worker(
     out_q: "queue.Queue",
     errors: list,
     stop_event: threading.Event,
+    crop_bbox: "tuple[int, int, int, int] | None" = None,
+    mask_local: "np.ndarray | None" = None,
+    frame_lo: int = 0,
+    frame_hi: "int | None" = None,
 ) -> None:
     """Decode one AVI in a worker thread and push (start, batch) to out_q.
+
+    Cutout (optional): only local frames in ``[frame_lo, frame_hi)`` are
+    processed (temporal crop); each is sliced to ``crop_bbox`` ``(y0,y1,x0,x1)``
+    and multiplied by ``mask_local`` (bool, bbox-shaped) before binning
+    (spatial crop + ROI mask). All native-pixel coords; applied before
+    ``ssub``/``tsub`` binning. Grayscale only.
 
     Each batch is a `(<=chunk_t, H, W)` (or `(.., H, W, 3)` for colour)
     ndarray already cast to `dtype`. Frames within a file stay in order;
@@ -179,6 +189,7 @@ def _decode_avi_worker(
         # Temporal-bin accumulator (per file): sum of the current group.
         tacc = None
         tfill = 0
+        local_idx = 0    # 0-based index of the decoded frame within this file
 
         container = av.open(str(path))
         try:
@@ -191,6 +202,14 @@ def _decode_avi_worker(
                 if stop_event.is_set():
                     return
 
+                # Temporal cutout: skip frames before the window; stop once past it.
+                i_local = local_idx
+                local_idx += 1
+                if i_local < frame_lo:
+                    continue
+                if frame_hi is not None and i_local >= frame_hi:
+                    break
+
                 if grayscale and grayscale_method == "luma":
                     arr = frame.to_ndarray(format="gray8")  # (H, W) uint8
                 elif grayscale and grayscale_method == "mean":
@@ -198,6 +217,13 @@ def _decode_avi_worker(
                     arr = rgb.mean(axis=-1)                  # float64 (H, W)
                 else:
                     arr = frame.to_ndarray(format="rgb24")   # keep RGB
+
+                # Spatial cutout: crop to bbox, then zero outside the ROI mask.
+                if crop_bbox is not None:
+                    y0, y1, x0, x1 = crop_bbox
+                    arr = arr[y0:y1, x0:x1]
+                if mask_local is not None:
+                    arr = arr * mask_local
 
                 # Inline downsample (block-mean). `out_arr` is the frame to
                 # buffer, or we `continue` while a temporal group still fills.
