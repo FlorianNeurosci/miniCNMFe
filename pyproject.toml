@@ -25,11 +25,14 @@ tutorial = ["jupyter", "matplotlib >= 3.7", "ipywidgets"]
 # Faster OASIS deconvolution. Without it `cnmfe/temporal.py` falls back to
 # a pure-Python PAVA AR(1) solver (same algorithm, slower for long traces).
 oasis = ["oasis-deconvolution"]
+# Curation GUI (cnmfe.gui). cv2, matplotlib, scikit-image, imageio, av are
+# already in the base deps, so PyQt6 is all that's added here.
+gui = ["PyQt6 >= 6.5"]
 # Install cupy matching your CUDA version, e.g.:
 #   pip install cupy-cuda12x   (CUDA 12.x)
 #   pip install cupy-cuda11x   (CUDA 11.x)
 gpu = ["cupy-cuda12x >= 12.0"]
-dev = ["cnmfe[test,tutorial,oasis]", "ruff"]
+dev = ["cnmfe[test,tutorial,oasis,gui]", "ruff"]
 
 [build-system]
 requires = ["setuptools >= 61", "wheel"]
