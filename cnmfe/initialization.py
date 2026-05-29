@@ -13,13 +13,18 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import cv2
 import numpy as np
 import scipy.ndimage as ndi
 import scipy.sparse as sp
 from skimage.feature import peak_local_max
 
 from cnmfe._utils import ensure_float32, get_xp, to_numpy
-from cnmfe.preprocess import correlation_pnr, make_center_surround_psf
+from cnmfe.preprocess import (
+    estimate_noise,
+    local_correlations_fft,
+    make_center_surround_psf,
+)
 from cnmfe.temporal import deconvolve, estimate_ar_params
 
 if TYPE_CHECKING:
@@ -195,6 +200,45 @@ def extract_spatial_temporal(
 
 
 # ---------------------------------------------------------------------------
+# Local CN/PNR update against a cached noise map
+# ---------------------------------------------------------------------------
+
+def _local_cn_pnr_box(
+    data_filtered_box: np.ndarray,
+    noise_pixel_box: np.ndarray,
+    thresh_init: float = 3.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Refresh CN and PNR on a small residual patch using a cached noise map.
+
+    Mirrors CaImAn's per-seed local update (init.py:1791-1808). Does NOT
+    re-estimate noise (it's already cached globally) and does NOT re-filter the
+    patch through the center-surround PSF (we only re-filter `ai` before
+    subtracting it from data_filtered, so the residual is already correct).
+
+    Args:
+        data_filtered_box: (T, nr2, nc2) already-filtered residual patch.
+        noise_pixel_box: (nr2, nc2) slice of the cached global noise map.
+        thresh_init: PSD threshold multiplier used in `correlation_pnr`. 3.0 = CaImAn default.
+
+    Returns:
+        cn_box: (nr2, nc2) local correlation image.
+        pnr_box: (nr2, nc2) peak-to-noise ratio.
+    """
+    max_box = data_filtered_box.max(axis=0)
+    pnr_box = np.where(
+        noise_pixel_box > 0, max_box / noise_pixel_box, 0.0
+    ).astype(np.float32)
+    pnr_box[pnr_box < 0] = 0.0
+
+    thresholded = np.where(
+        data_filtered_box < thresh_init * noise_pixel_box, 0.0, data_filtered_box,
+    )
+    cn_box = local_correlations_fft(thresholded)
+    cn_box[np.isnan(cn_box) | (cn_box < 0)] = 0.0
+    return cn_box, pnr_box
+
+
+# ---------------------------------------------------------------------------
 # Greedy initialization
 # ---------------------------------------------------------------------------
 
@@ -219,15 +263,23 @@ def greedy_corr_pnr(
 ) -> tuple[sp.csc_matrix, np.ndarray, np.ndarray, np.ndarray]:
     """Find initial neurons using a greedy CORR-PNR strategy.
 
-    Algorithm:
-    1. Filter movie spatially with a center-surround PSF.
-    2. Compute CORR and PNR summary images.
-    3. For each seed (highest CORR×PNR first):
-       a. Extract spatial footprint (ai) and temporal trace (ci).
+    Algorithm (CaImAn `init_neurons_corr_pnr` parity, init.py:1381-1825):
+    1. Filter movie spatially with a center-surround PSF (cv2.filter2D).
+    2. Mean-center each pixel and estimate per-pixel noise ONCE globally.
+    3. Compute initial CN and PNR; build `ind_search` (persistent bitmask of
+       pixels already tried / inside an accepted neuron's support).
+    4. For each seed (highest CN*PNR first, skipping `ind_search` pixels):
+       a. Extract spatial footprint (ai) and temporal trace (ci) by OLS.
        b. Deconvolve ci with OASIS to get a clean calcium trace.
-       c. Subtract ai*ci from both raw and filtered data (in-place).
-       d. Update CORR and PNR locally around the subtracted component.
-    4. Stop when no seeds remain above threshold or max_neurons reached.
+       c. Subtract ai*ci from data_raw on the gSiz patch.
+       d. Re-filter ai through the PSF and subtract ai_filtered*ci from
+          data_filtered on the 2*gSiz halo (so the filtered residual stays
+          clean and no halo ghosts seed subsequent iterations).
+       e. Mark `ai > ai.max()/2` pixels in `ind_search`.
+       f. Refresh CN/PNR locally against the cached noise map — no FFT,
+          no PSF re-filter of the whole patch.
+    5. Rebuild the sorted seed list when the current pass is exhausted; stop
+       when no progress or max_neurons reached.
 
     Args:
         movie: (T, H, W) motion-corrected movie.
@@ -242,6 +294,10 @@ def greedy_corr_pnr(
                 (-1 = all CPUs, 1 = serial). Ignored when device='cuda'.
         device: 'cpu' or 'cuda'. GPU accelerates the initial PSF convolution
                 over all frames. The greedy extraction loop is always sequential.
+        seed_suppress_factor: DEPRECATED. The old circular-disk suppression has
+                been replaced by CaImAn-style `ai > ai.max()/2` support-mask
+                suppression via `ind_search`. The parameter is kept for API
+                stability and is no longer consulted.
 
     Returns:
         A: (H*W, K) sparse csc_matrix of spatial footprints.
@@ -253,7 +309,12 @@ def greedy_corr_pnr(
     T, H, W = movie.shape
     xp = get_xp(device)
 
-    # Spatial filtering across all frames
+    # ----- Initial filtering pass -----
+    # CaImAn (init.py:1473) uses cv2.filter2D for the per-frame center-surround
+    # filter. cv2 is 5-10x faster than scipy.ndimage.convolve here because the
+    # kernel is small (~6*sigma+1 on each side) and cv2's filter2D is heavily
+    # SIMD-optimised. The PSF is rotationally symmetric so convolution ==
+    # correlation, which is what cv2.filter2D applies by default.
     psf = make_center_surround_psf(sigma)
     if xp is not np:
         import cupyx.scipy.ndimage as cp_ndi
@@ -263,45 +324,71 @@ def greedy_corr_pnr(
             [cp_ndi.convolve(frame, psf_xp, mode="reflect") for frame in movie_xp]
         ))
     elif n_jobs == 1:
-        data_filtered = np.stack(
-            [ndi.convolve(frame, psf, mode="reflect") for frame in movie], axis=0
-        )
+        data_filtered = np.empty_like(movie)
+        for t in range(T):
+            data_filtered[t] = cv2.filter2D(
+                movie[t], -1, psf, borderType=cv2.BORDER_REFLECT,
+            )
     else:
         from joblib import Parallel, delayed
         from threadpoolctl import threadpool_limits
-        # Threads: ndi.convolve is pure C and releases the GIL. Each frame is
-        # ~1.4 MB; with T_init=5000 frames loky would pickle ~7 GB per call.
-        # Cap inner BLAS to 1 -- see spatial.py for the rationale.
         with threadpool_limits(limits=1, user_api="blas"):
-            data_filtered = np.stack(
-                Parallel(n_jobs=n_jobs, prefer="threads")(
-                    delayed(ndi.convolve)(frame, psf, mode="reflect") for frame in movie
-                ),
-                axis=0,
+            results = Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(cv2.filter2D)(
+                    frame, -1, psf, borderType=cv2.BORDER_REFLECT,
+                )
+                for frame in movie
             )
+        data_filtered = np.stack(results, axis=0).astype(np.float32)
     data_raw = movie.copy()
 
-    # Summary images. Subsample time when corrpnr_stride > 1 — CORR/PNR are
-    # per-pixel reductions, so a strided slice gives a near-identical seed
-    # map at a fraction of the cost. The greedy loop's local CORR/PNR
-    # updates (after each detection) still run on the full-T patch so
-    # extraction stays sharp.
-    cn, pnr = correlation_pnr(
-        data_filtered, sigma=None, center_psf=False, stride=corrpnr_stride,
-    )
+    # ----- One-shot global noise + CN/PNR (CaImAn init.py:1480-1489) -----
+    # Mean-center each pixel's time series; this is the global counterpart
+    # of `data_filtered -= data_filtered.mean(axis=0)` in CaImAn.
+    data_filtered -= data_filtered.mean(axis=0, keepdims=True)
+    noise_pixel = estimate_noise(data_filtered, noise_range=(0.25, 0.5))
 
-    # Border mask
-    if border_px > 0:
-        cn[:border_px] = 0
-        cn[-border_px:] = 0
-        cn[:, :border_px] = 0
-        cn[:, -border_px:] = 0
-        pnr[:border_px] = 0
-        pnr[-border_px:] = 0
-        pnr[:, :border_px] = 0
-        pnr[:, -border_px:] = 0
+    # Initial CN/PNR. corrpnr_stride > 1 subsamples time for the initial seed
+    # ranking only; `noise_pixel` stays full-T because the loop body's per-seed
+    # PNR updates index into it.
+    thresh_init = 3.0
+    if corrpnr_stride > 1:
+        df_stride = np.ascontiguousarray(data_filtered[::corrpnr_stride])
+        sn_stride = estimate_noise(df_stride, noise_range=(0.25, 0.5))
+        pnr = np.where(
+            sn_stride > 0, df_stride.max(axis=0) / sn_stride, 0.0
+        ).astype(np.float32)
+        tmp = np.where(df_stride < thresh_init * sn_stride, 0.0, df_stride)
+        cn = local_correlations_fft(tmp)
+        del tmp, df_stride
+    else:
+        pnr = np.where(
+            noise_pixel > 0, data_filtered.max(axis=0) / noise_pixel, 0.0
+        ).astype(np.float32)
+        tmp = np.where(data_filtered < thresh_init * noise_pixel, 0.0, data_filtered)
+        cn = local_correlations_fft(tmp)
+        del tmp
+    pnr[pnr < 0] = 0.0
+    cn[np.isnan(cn) | (cn < 0)] = 0.0
 
     patch_radius = max(int(3 * sigma), 5)
+    gSiz = patch_radius
+
+    # ----- CaImAn-style search state -----
+    v_search = (cn * pnr).astype(np.float32)
+    v_search[(cn < min_corr) | (pnr < min_pnr)] = 0.0
+    # ind_search: persistent (H, W) bitmask of pixels that won't be tried as
+    # seeds. Initialised from sub-threshold v_search and the border mask;
+    # accepted neurons add their `ai > ai.max()/2` support each iteration
+    # (CaImAn init.py:1763), and every tried seed is marked too (CaImAn :1660).
+    ind_search = (v_search <= 0)
+    if border_px > 0:
+        ind_search[:border_px] = True
+        ind_search[-border_px:] = True
+        ind_search[:, :border_px] = True
+        ind_search[:, -border_px:] = True
+
+    min_v_search = float(min_corr) * float(min_pnr)
 
     A_cols: list[sp.csc_matrix] = []
     C_list: list[np.ndarray] = []
@@ -312,107 +399,116 @@ def greedy_corr_pnr(
         if max_neurons is not None and len(A_cols) >= max_neurons:
             break
 
-        seeds = detect_seeds(cn, pnr, min_corr, min_pnr, min_distance=max(1, int(sigma)))
-        if len(seeds) == 0:
+        # Rebuild the sorted candidate list once per outer pass. With
+        # peak_local_max we want a fresh scan after multiple accepts have
+        # reshaped v_search; we don't break-and-rebuild per accept.
+        score = v_search.copy()
+        score[ind_search | (cn < min_corr) | (pnr < min_pnr)] = 0.0
+        peaks = peak_local_max(
+            score,
+            min_distance=max(1, int(sigma)),
+            threshold_abs=min_v_search,
+        )
+        if len(peaks) == 0:
             break
+        order = np.argsort(score[peaks[:, 0], peaks[:, 1]])[::-1]
+        seeds_sorted = peaks[order]
 
-        found = False
-        for seed in seeds:
+        progress = False
+        for seed in seeds_sorted:
             row, col = int(seed[0]), int(seed[1])
+            if ind_search[row, col] or v_search[row, col] < min_v_search:
+                continue
+            ind_search[row, col] = True  # mark this pixel as tried (CaImAn :1660)
+
+            # Diff-noise guard (CaImAn init.py:1670-73): reject pure-noise pixels
+            y0_diff = np.diff(data_filtered[:, row, col])
+            if y0_diff.size and y0_diff.max() < 3.0 * y0_diff.std():
+                v_search[row, col] = 0.0
+                continue
+
+            r0 = max(0, row - gSiz)
+            r1 = min(H, row + gSiz + 1)
+            c0 = max(0, col - gSiz)
+            c1 = min(W, col + gSiz + 1)
 
             ai, ci, success = extract_spatial_temporal(
-                data_filtered, data_raw, (row, col), patch_radius,
+                data_filtered, data_raw, (row, col), gSiz,
                 min_corr_neuron=min_corr_neuron,
                 max_corr_bg=max_corr_bg,
                 circular_max_dist_factor=circular_max_dist_factor,
             )
 
             if not success or (ai > 0).sum() < min_pixel:
-                # Mark this seed as used by zeroing score
-                cn[row, col] = 0
-                pnr[row, col] = 0
                 continue
 
-            # Deconvolve temporal trace
-            try:
-                g, sn = estimate_ar_params(
-                    ci, p=ar_order,
-                    g_prior=g_prior, g_prior_weight=g_prior_weight,
-                )
-                c_clean, s, bl = deconvolve(ci, g, sn)
-            except Exception:
-                c_clean = ci.copy()
-
-            # Store component
-            ai_full = np.zeros(H * W, dtype=np.float32)
-            r0 = max(0, row - patch_radius)
-            r1 = min(H, row + patch_radius + 1)
-            c0 = max(0, col - patch_radius)
-            c1 = min(W, col + patch_radius + 1)
             ph = r1 - r0
             pw = c1 - c0
             ai_patch = ai[:ph, :pw]
-            for rr in range(ph):
-                for cc in range(pw):
-                    ai_full[(r0 + rr) * W + (c0 + cc)] = ai_patch[rr, cc]
 
-            ai_sparse = sp.csc_matrix(ai_full.reshape(-1, 1))
-            A_cols.append(ai_sparse)
+            # Deconvolve temporal trace
+            try:
+                g, sn_ar = estimate_ar_params(
+                    ci, p=ar_order,
+                    g_prior=g_prior, g_prior_weight=g_prior_weight,
+                )
+                c_clean, s, bl = deconvolve(ci, g, sn_ar)
+            except Exception:
+                c_clean = ci.copy()
+
+            # Store component. Slice assignment instead of the old double for-loop.
+            ai_full_2d = np.zeros((H, W), dtype=np.float32)
+            ai_full_2d[r0:r1, c0:c1] = ai_patch
+            A_cols.append(sp.csc_matrix(ai_full_2d.reshape(-1, 1)))
             C_list.append(c_clean)
             C_raw_list.append(ci)
             centers_list.append((row, col))
 
-            # Subtract the OASIS-deconvolved trace `c_clean` (not the raw
-            # OLS trace `ci`). On the realistic-miniscope fixture, switching
-            # to `ci` (Phase D, commit 8a91b4e) dropped r(C+YrA, truth) from
-            # ~0.87 to ~0.18: the noisy raw trace contaminates the data when
-            # subtracted, so each subsequent seed's per-pixel OLS extracts a
-            # noisier footprint, and the final BCD inherits those degraded
-            # footprints. The original `c_clean` path keeps the residual
-            # clean enough that subsequent extractions stay faithful.
-            sub = ai_patch[np.newaxis] * c_clean[:, np.newaxis, np.newaxis]  # (T, ph, pw)
-            data_raw[:, r0:r1, c0:c1] -= sub
-            data_filtered[:, r0:r1, c0:c1] -= sub
-
-            # Update CORR/PNR locally around the subtracted region
-            update_r0 = max(0, r0 - patch_radius)
-            update_r1 = min(H, r1 + patch_radius)
-            update_c0 = max(0, c0 - patch_radius)
-            update_c1 = min(W, c1 + patch_radius)
-            local_cn, local_pnr = correlation_pnr(
-                data_filtered[:, update_r0:update_r1, update_c0:update_c1],
-                sigma=None,
-                center_psf=False,
+            # ----- Subtraction -----
+            # data_raw: subtract on the gSiz extraction box.
+            data_raw[:, r0:r1, c0:c1] -= (
+                ai_patch[np.newaxis] * c_clean[:, None, None]
             )
-            cn[update_r0:update_r1, update_c0:update_c1] = local_cn
-            pnr[update_r0:update_r1, update_c0:update_c1] = local_pnr
 
-            # After the update, suppress cn/pnr near every found centre so the
-            # same neuron cannot be re-detected from a neighbouring pixel.
-            # Must cover the neuron's actual support (FWHM ≈ 2*sigma) so the
-            # residual halo cannot seed a duplicate just outside the disk.
-            suppress_r = max(int(seed_suppress_factor * sigma), int(2 * sigma + 1))
-            rr_grid, cc_grid = np.ogrid[:H, :W]
-            for (fr, fc) in centers_list:
-                mask = (rr_grid - fr) ** 2 + (cc_grid - fc) ** 2 <= suppress_r ** 2
-                cn[mask] = 0.0
-                pnr[mask] = 0.0
+            # data_filtered: subtract ai_filtered (NOT ai) on the 2*gSiz halo
+            # so the spatially-filtered residual stays clean. The old code
+            # subtracted unfiltered ai here, which left a halo at the soma's
+            # PSF sidelobes -- ghost seeds in subsequent iterations.
+            r2_0 = max(0, row - 2 * gSiz)
+            r2_1 = min(H, row + 2 * gSiz + 1)
+            c2_0 = max(0, col - 2 * gSiz)
+            c2_1 = min(W, col + 2 * gSiz + 1)
+            ai_box_full = np.zeros((r2_1 - r2_0, c2_1 - c2_0), dtype=np.float32)
+            ai_box_full[r0 - r2_0:r1 - r2_0, c0 - c2_0:c1 - c2_0] = ai_patch
+            ai_filtered = cv2.filter2D(
+                ai_box_full, -1, psf, borderType=cv2.BORDER_REFLECT,
+            ).astype(np.float32)
+            data_filtered[:, r2_0:r2_1, c2_0:c2_1] -= (
+                ai_filtered[np.newaxis] * c_clean[:, None, None]
+            )
 
-            # Enforce border mask again after update
-            if border_px > 0:
-                cn[:border_px] = 0
-                cn[-border_px:] = 0
-                cn[:, :border_px] = 0
-                cn[:, -border_px:] = 0
-                pnr[:border_px] = 0
-                pnr[-border_px:] = 0
-                pnr[:, :border_px] = 0
-                pnr[:, -border_px:] = 0
+            # ----- Suppression: support mask only (pure CaImAn parity) -----
+            # `seed_suppress_factor` is no longer consulted; it remains on the
+            # signature for API stability.
+            if ai_patch.max() > 0:
+                support = ai_patch > (ai_patch.max() / 2.0)
+                ind_search[r0:r1, c0:c1] |= support
 
-            found = True
-            break  # Found one neuron; recompute seeds
+            # ----- Local CN/PNR update against the cached noise -----
+            box = data_filtered[:, r2_0:r2_1, c2_0:c2_1]
+            cn_box, pnr_box = _local_cn_pnr_box(
+                box, noise_pixel[r2_0:r2_1, c2_0:c2_1], thresh_init=thresh_init,
+            )
+            cn[r2_0:r2_1, c2_0:c2_1] = cn_box
+            pnr[r2_0:r2_1, c2_0:c2_1] = pnr_box
+            v_search[r2_0:r2_1, c2_0:c2_1] = cn_box * pnr_box
+            v_search[ind_search] = 0.0
 
-        if not found:
+            progress = True
+            if max_neurons is not None and len(A_cols) >= max_neurons:
+                break
+
+        if not progress:
             break
 
     if not A_cols:
