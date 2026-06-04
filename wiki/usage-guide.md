@@ -190,6 +190,22 @@ C_clean = model.C                  # denoised AR(1) — for spike detection, eve
 C_raw_after = model.C + model.YrA  # noisy but shape-faithful — for correlation, plotting
 ```
 
+> **Dense-FOV caveat.** "`C + YrA` is shape-faithful" only holds at **low footprint
+> overlap**. `YrA_k` is the data projected onto footprint `k` after subtracting the
+> other components; when footprints overlap, that subtraction leaks neighbours'
+> transients into `YrA_k` (cross-talk). So as the extracted **cell count rises**
+> (looser `min_corr`/`min_pnr` in a dense field), `corr(C, C+YrA)` falls — for the
+> strong cells too, not just the weak ones (measured: K=221 → mean 0.88 / strong
+> 0.77; K=722 → 0.74 / 0.45). In dense extractions prefer `C` (the demixed
+> estimate); the `C`-vs-`C+YrA` gap is `YrA` contamination, not `C` being wrong.
+> `corr(C, C+YrA)` itself is a good metric for choosing how aggressive to make your
+> detection thresholds.
+>
+> If you need both high cell count *and* clean traces, `n_iter_main=2` plus tighter
+> footprints (`spatial_max_thr=0.25`, `spatial_circular_max_dist_factor=1.2`)
+> sharpen the demixing: verified at K≈600 to recover strong-cell `corr(C, C+YrA)`
+> from **0.48 → 0.77** (footprint npix median 79→36), at ~30% more runtime.
+
 The per-component AR coefficient and noise std used by OASIS are also exposed:
 
 ```python
@@ -197,9 +213,59 @@ g_per_neuron = model.g          # list of length K, each (p,) np.array
 sn_per_neuron = model.sn_per_k  # (K,) np.array
 ```
 
+### Tuning long or dense recordings
+
+Behaviour observed on a real 37k-frame miniscope recording (not autotested):
+
+- **Long recordings sprawl the footprints.** Slow drift / photobleaching over tens
+  of thousands of frames makes the temporal traces collinear, and `update_spatial`
+  then smears each footprint over its neighbours into big merged blobs. The fix is
+  to remove the shared drift, *not* to change thresholds (thresholds only change
+  cell count, not footprint size):
+
+  ```python
+  params = CNMFeParams(
+      sigma=3.0, min_corr=0.8, min_pnr=12,
+      global_bg_rank=1,                      # absorb slow drift as a rank-1 temporal background
+      spatial_max_thr=0.25,                  # trim halo at 25% of peak
+      spatial_circular_max_dist_factor=1.2,  # tighter radial clip
+      merge_thr_corr=0.90,                   # do NOT over-merge dense neighbours...
+      merge_centre_dist_factor=1.0,          # ...(0.75/2.0 fuses distinct co-active cells)
+      init_stride=2,                         # auto = T//5000 can subsample transients away
+  )
+  ```
+  (The per-pixel temporal detrend in `cnmfe/detrend.py` is an equivalent
+  alternative to `global_bg_rank=1`.)
+
+- **Dense fields: keep the merge gentle.** With the drift handled by
+  `global_bg_rank=1`, aggressive merging (`merge_thr_corr=0.75`,
+  `merge_centre_dist_factor=2.0`) fuses genuinely distinct, co-active neighbours —
+  on the test recording that collapsed 214 detected cells to 109. The gentler
+  `0.90` / `1.0` kept 175 cells with *tighter* footprints.
+
+- **Judge footprint positions on a correlation image, not the mean projection.**
+  Over a long recording the mean projection is dominated by static
+  background/vasculature; the transient neurons are dim in it, so good footprints
+  look "off the bright spots." Overlay contours on a `correlation_pnr` `cn` image
+  instead (the `live_runs/cutout_*` notebooks do this).
+
 ---
 
 ## Real-data CLI Workflow
+
+### Automated parameter tuning (start here)
+
+Before hand-picking parameters, let the tuner suggest them and show you graphs:
+
+```bash
+python tune.py /path/to/recording/ -o tuning/ \
+    --frame-rate 20 --decay-time-ms 180 --mode both
+```
+
+It writes a `tune_*/` folder with `recommended_params.json` (+ `downsample.json`)
+and a `report.md` of figures. Feed the JSON straight into the steps below
+(`--params tuning/tune_*/recommended_params.json`). See [[parameter-tuning]] for
+the full guide.
 
 ### From a folder of numbered AVI files
 
@@ -293,6 +359,11 @@ on network mounts by skipping the intermediate.
 ---
 
 ## Parameter Tuning Guide
+
+> [!TIP]
+> To get a starting point automatically — recommended values plus graphs to
+> judge them — run the [[parameter-tuning]] workflow (`python tune.py <path>`)
+> before hand-tuning the knobs below.
 
 ### `sigma` — most important parameter
 

@@ -140,3 +140,50 @@ def to_numpy(arr: "Any") -> np.ndarray:
     except ImportError:
         pass
     return np.asarray(arr)
+
+
+# ---------------------------------------------------------------------------
+# Footprint centre
+# ---------------------------------------------------------------------------
+
+def footprint_center(
+    ai: np.ndarray,
+    dims: "tuple[int, int] | None" = None,
+    smooth_sigma: float = 1.0,
+) -> "tuple[int, int]":
+    """Locate a footprint's centre as the argmax of a lightly Gaussian-smoothed
+    intensity image. Robust to non-convex / multi-peak shapes, unlike the
+    intensity-weighted COM which lands between peaks (in the hole of a donut,
+    in the dim space between two cells of a multi-cell footprint).
+
+    Args:
+        ai: ``(H, W)`` or flat ``(H*W,)`` non-negative footprint.
+        dims: ``(H, W)``; required when ``ai`` is 1D.
+        smooth_sigma: σ of the pre-argmax Gaussian smooth (px). 1.0 prevents
+            a single noisy hot pixel from winning while leaving the actual
+            cell peak intact. Set to 0 to skip smoothing.
+
+    Returns:
+        ``(cy, cx)`` int pixel coordinates. Returns the image centre
+        ``(H // 2, W // 2)`` if the footprint is all-zero.
+    """
+    if ai.ndim == 1:
+        if dims is None:
+            raise ValueError("dims=(H, W) required when ai is 1-D")
+        H, W = dims
+        ai2d = ai.reshape(H, W)
+    else:
+        ai2d = ai
+        H, W = ai2d.shape
+
+    if not (ai2d > 0).any():
+        return H // 2, W // 2
+
+    if smooth_sigma > 0:
+        from scipy.ndimage import gaussian_filter
+        smoothed = gaussian_filter(ai2d.astype(np.float32, copy=False),
+                                   sigma=float(smooth_sigma))
+    else:
+        smoothed = ai2d
+    cy, cx = np.unravel_index(int(np.argmax(smoothed)), (H, W))
+    return int(cy), int(cx)

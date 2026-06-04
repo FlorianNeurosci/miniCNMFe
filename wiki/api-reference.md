@@ -95,7 +95,27 @@ class CNMFeParams:
     # Parallelism
     n_jobs: int = 1                            # Workers (-1 = all CPUs, 1 = serial)
     device: str = "cpu"                        # 'cpu' or 'cuda' (requires CuPy)
+
+    # Streaming-IO tuning (affects on-disk Y_flat IO speed only, never results)
+    yflat_dir: str | None = None               # where auto-derived Y_flat_pixel.zarr is written (None = under output_dir)
+    yflat_pixel_chunk: int = 512               # pixel-row chunk of the on-disk Y_flat store
+    yflat_time_chunk: int | None = None        # time chunk (None = full T)
+    yflat_compression: bool = True             # blosc lz4+bitshuffle on Y_flat (keep True on network mounts)
+
+    # Cutout (crop the movie before extraction; NATIVE coords; all None = no cutout)
+    temporal_crop: tuple[int, int] | None = None           # (t0, t1), t1 exclusive
+    spatial_crop: tuple[int, int, int, int] | None = None  # (y0, y1, x0, x1)
+    spatial_mask_path: str | None = None                   # path to a bool (H, W) .npy mask
 ```
+
+**Cutout.** When any of `temporal_crop` / `spatial_crop` / `spatial_mask_path` is
+set, the movie is cropped **once at ingestion, before motion correction**, in
+native coordinates (see `cnmfe.cutout`). The applied spec is recorded on
+`model.cutout`. A cutout **cannot be combined with a pre-built `Y_flat_zarr`**
+(bake the crop in upstream instead), and `.downscaled()` **clears** the cutout
+fields since the crop is applied at native resolution. Use
+`cnmfe.cutout.place_footprints_in_fov` / `place_traces_in_timeline` to map cropped
+results back onto the full FOV / timeline.
 
 **Downsample-once rescale.** `params.downscaled(ssub, tsub)` returns a **copy**
 with the unit-bearing fields rescaled for a movie binned by `ssub` (space) /
@@ -247,6 +267,7 @@ plus `accepted_mask.npy` and `eval_info.npz`; `load()` restores them.
 | `shifts` | `np.ndarray \| None` | `(T, 2)` | Per-frame (dy, dx) shifts, or `None` |
 | `accepted_mask` | `np.ndarray` | `(K,)` bool | Components passing both auto-eval checks (pixel-count floor AND mean-amplitude SNR). **Nothing is dropped** — slice `A`/`C`/`S`/`YrA` by this mask to use accepted components only. |
 | `eval_info` | `dict` | — | Per-component auto-eval stats: `pixel_count`, `snr_amp`, `pixel_pass`, `snr_pass`, plus the thresholds applied. |
+| `cutout` | `dict \| None` | — | Applied cutout spec (`bbox`, `t_range`, mask path) when a cutout was used; `None` otherwise. Footprints/traces are in cropped coordinates — use `cnmfe.cutout` helpers to place them back in the full FOV/timeline. |
 | `dims` | `tuple[int, int]` | — | `(H, W)` image dimensions |
 
 > [!TIP]
@@ -504,6 +525,87 @@ def upsample_traces(C, native_T: int, kind: str = "linear")
 
 Interpolate traces `C` `(K, T_ds)` to `native_T` columns via per-row `np.interp`.
 Used by `CNMFe.upsample_to_native` — **interpolation, not recovery**.
+
+---
+
+## `cnmfe.detrend` — Rolling-percentile baseline removal
+
+### `detrend_movie`
+
+```python
+def detrend_movie(
+    src: str | Path,
+    dest: str | Path,
+    *,
+    window_s: float = 30.0,
+    percentile: float = 10.0,
+    frame_rate_hz: float,
+    batch_t: int = 2000,
+    anchor_stride: int | None = None,
+    chunk_t: int | None = None,
+    n_jobs: int = 1,
+    skip_if_exists: bool = True,
+    verbose: bool = True,
+) -> zarr.Array
+```
+
+Standalone streaming zarr→zarr preprocessing. Per-pixel **rolling-percentile
+temporal detrend**: estimates a slow F0 baseline (the `percentile`-th percentile
+over a `window_s`-second sliding window) and subtracts it, removing slow drift
+(bleach, scope warm-up) before extraction. `anchor_stride` subsamples the
+baseline knots for speed. Returns the open detrended `zarr.Array`.
+
+---
+
+## `cnmfe.reject_frames` — Outlier-frame replacement
+
+### `reject_outlier_frames`
+
+```python
+def reject_outlier_frames(
+    src: str | Path,
+    dest: str | Path,
+    *,
+    k_mad: float = 5.0,
+    batch_t: int = 1000,
+    chunk_t: int | None = None,
+    skip_if_exists: bool = True,
+    verbose: bool = True,
+) -> tuple[zarr.Array, np.ndarray]
+```
+
+Standalone streaming zarr→zarr preprocessing. Flags frames whose per-frame mean
+deviates by more than `k_mad`·MAD from the running level and **replaces them with
+neighbour interpolation** (e.g. dropped/saturated frames). Returns
+`(dest_zarr, replaced_mask)` where `replaced_mask` is a `(T,)` bool array of
+which frames were replaced.
+
+---
+
+## `cnmfe.cutout` — Crop the movie before extraction
+
+The cutout is normally **param-driven**: set `CNMFeParams.temporal_crop` /
+`spatial_crop` / `spatial_mask_path` and `CNMFe.fit` / `fit_extract` apply it once
+at ingestion via `resolve_cutout` + `apply_cutout` (internal). These helpers map
+cropped results back onto the full FOV / timeline:
+
+### `place_footprints_in_fov`
+
+```python
+def place_footprints_in_fov(A_crop, bbox, orig_dims)
+```
+
+Pad cropped sparse footprints `(h·w, K)` back to the full `(H·W, K)` grid, placing
+them at `bbox = (y0, y1, x0, x1)` within `orig_dims = (H, W)`.
+
+### `place_traces_in_timeline`
+
+```python
+def place_traces_in_timeline(C_crop, t_range, orig_T)
+```
+
+Embed cropped traces `(K, T_win)` into a full `(K, orig_T)` timeline at
+`t_range = (t0, t1)` (zeros elsewhere).
 
 ---
 
@@ -786,6 +888,25 @@ Clean a spatial footprint: median filter → zero pixels below `max_thr × max` 
 ---
 
 ## `cnmfe.temporal`
+
+### `g_from_decay_time` / `decay_time_from_g`
+
+```python
+def g_from_decay_time(decay_time_ms: float, frame_rate_hz: float) -> float
+def decay_time_from_g(g: float, frame_rate_hz: float) -> float
+```
+
+Convert between an AR(1) decay coefficient `g` and a physical indicator decay
+time τ (ms): `g = exp(-1 / (fps · τ_ms / 1000))` and its inverse
+`τ_ms = -1000 / (fps · ln g)` (`g` clipped to `(0, 1)` for safety). The forward
+form is the same expression that builds the Bayesian `g` prior in
+`pipeline.fit_extract` — exposed so the simulator can generate traces with a
+settable decay, and so an estimated `g` can be reported in interpretable units.
+
+Approximate single-AP somatic τ (ms): GCaMP6f ~140, jGCaMP7f ~160, jGCaMP8f ~70,
+jGCaMP8m ~180, jGCaMP8s ~350, GCaMP6s/7s ~1000.
+
+---
 
 ### `update_temporal`
 

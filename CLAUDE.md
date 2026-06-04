@@ -58,6 +58,25 @@ change standard behaviour unless explicitly enabled.
    — the BLAS-cap and unique-`yflat_dir` requirements are reasoned from the code,
    not verified. The weakest-tested of the three; validate on a small batch
    first.
+4. **Parameter tuning** (`tuning/`, `tune.py`, `live_runs/tune.ipynb`,
+   `wiki/parameter-tuning.md`) — one-path-in workflow that suggests MC +
+   extraction params and writes a report folder (`recommended_params.json` +
+   `report.md` + figures). Heuristics are lifted verbatim from the maintainer's
+   `estimate_params.ipynb`; the graded extraction **sweep** + ground-truth-free
+   quality proxies (`tuning/metrics.py`: `cprojcorr_median`, accepted frac,
+   footprint npix, SNR) + report rendering are new. Autotested end-to-end
+   (`tests/test_tuning.py`, 8 tests on the simulator + a 2-file AVI fixture).
+   **Caveats:** the quality scores are *proxies, not validation* (the roadmap
+   C1/C2 harness would add real validation, and could reuse `tuning/metrics.py`);
+   the sweep's cutout values are a fast approximation to a full-recording run;
+   not yet exercised on a real recording end-to-end.
+   *Update (June 2026):* validated end-to-end on a real 60k-frame PICAST session
+   — see `live_runs/tuning_picast/LEARNINGS.md` (confirmed `global_bg_rank=1` is
+   the dominant long-recording win; surfaced the decay-time drift-inflation and
+   full-vs-cutout recall caveats). The methodology is now packaged as the
+   `/tune-session` skill + the reusable `validate_session.py` /
+   `tuning.validate.validate_session` (full MC + Y_flat built once, reused across
+   threshold sets). Autotested (`tests/test_validate.py`).
 
 ---
 
@@ -356,11 +375,69 @@ end-to-end. See `todo/oasis_oversmoothing.md` for the diagnostic this fixes.
   (on par with CaImAn). Use `C + YrA` for shape-faithful comparisons
   (cross-correlation with an external signal, regression, plotting raw fluorescence)
   and `C` for clean spike-event timing.
+- **Dense-FOV caveat (empirical, June 2026 — real recording).** "`C + YrA` is
+  shape-faithful" holds only at **low footprint overlap**. `YrA_k` is the data
+  projected onto footprint `k` after subtracting the *other* components; when
+  footprints overlap, that subtraction is imperfect and `YrA_k` soaks up
+  neighbours' residual transients (cross-talk). So as the **extracted cell count
+  rises** (e.g. loosening `min_corr`/`min_pnr` in a dense field), `corr(C, C+YrA)`
+  **falls — for the strong cells too**, not just the weak ones. Measured on one
+  180×180 cutout: K=221 → mean r 0.88 / top-30-amp r 0.77; K=722 → 0.74 / **0.45**.
+  Implications: (1) in dense extractions, `C` (the demixed estimate) is the
+  cleaner per-cell signal — the `C`-vs-`C+YrA` gap is `YrA` contamination, not `C`
+  being wrong; (2) don't chase cell count with thresholds — there is a
+  density↔purity sweet spot, and `corr(C, C+YrA)` is itself a good knob for
+  picking thresholds; (3) `n_iter_main` ≥ 2 and tighter footprints
+  (`spatial_max_thr` ↑, `spatial_circular_max_dist_factor` ↓) sharpen the demixing
+  if you need both high K and clean traces — **verified**: at K≈600, `n_iter_main=2`
+  + `spatial_max_thr=0.25` + `spatial_circular_max_dist_factor=1.2` recovered
+  strong-cell `corr(C, C+YrA)` from **0.48 → 0.77** (≈ the low-K value) and shrank
+  footprint npix median 79→36, at ~30% more runtime; each lever alone gives ~0.70.
 - **Historical caveat (fixed May 2026):** `C` alone used to correlate only ~0.6
   when the `oasis-deconvolution` package was **not installed** — a bug in the
   pure-Python PAVA fallback (see *Bugs already fixed*), not an inherent OASIS
   limitation. If you see `C` ≈ 0.6 while `C + YrA` ≈ 0.96, you are on old code or
   a regressed fallback.
+
+### Real-recording tuning: long & dense FOVs (empirical, June 2026)
+Findings from a real 37398×300×300 miniscope recording (cutout extraction). All
+validated by experiment; none are autotested.
+- **Length, not thresholds, drives footprint sprawl.** On a long recording slow
+  drift / photobleaching (~9% here) gives every trace a shared low-frequency
+  trend → traces go collinear → `update_spatial`'s per-pixel LASSO can't separate
+  neighbours and **smears each footprint over its neighbours into big merged
+  blobs**. At matched thresholds, footprint area roughly *doubles* going from a
+  4k-frame clip to the full 37k frames; thresholds only change the *count*, not
+  the size. **Fix:** `global_bg_rank=1` (absorb the drift as a rank-1 temporal
+  background `b_f·f(t)`) — or the temporal detrend (`detrend.py` / section-2b in
+  the cutout notebooks) — plus cleanup `spatial_max_thr=0.25`,
+  `spatial_circular_max_dist_factor=1.2`. Verified: footprint npix median
+  209→113 (rank-1 bg) →71 (+cleanup).
+- **`init_stride` under-detects on long movies (does NOT sprawl).** The auto value
+  `max(1, T//5000)` is 7 for a 37k-frame movie, so greedy init runs on every 7th
+  frame; this *subsamples calcium transients away* → lower CORR/PNR sensitivity →
+  fewer seeds. Greedy-init footprint *size* is unaffected (the sprawl is a BCD
+  effect, not an init one). Pin `init_stride` to 1–2 if a long movie is
+  under-seeding.
+- **Dense fields: don't over-merge.** `merge_thr_corr` / `merge_centre_dist_factor`
+  that are fine for fusing drift-duplicates (e.g. 0.75 / 2.0) **fuse genuinely
+  distinct, co-active neighbours** in a dense FOV: greedy found 214 cells, the
+  0.75 merge collapsed them to 109. Once `global_bg_rank=1` handles the drift
+  duplicates, use the gentler defaults (`merge_thr_corr≈0.90`,
+  `merge_centre_dist_factor≈1.0`) → recovered 109→**175** cells *with tighter*
+  footprints (npix median 92→62). The centre-distance fallback at 2σ merges any
+  co-active pair within ~6 px — catastrophic when somata sit ~6–10 px apart.
+- **Overlay footprints on a correlation image, not the mean projection.** Over
+  tens of thousands of frames the mean projection is dominated by static
+  background/vasculature, not the transient neurons (mean↔activity correlation
+  ~0.35 long vs ~0.48 short). Footprints that sit correctly on the real cells then
+  look "off the bright spots" of the mean. Judge positions on a `correlation_pnr`
+  `cn` image (footprint *centres* land 2–3 px from `detect_seeds` peaks even when
+  they look off the mean). `live_runs/cutout_extract.ipynb` and
+  `cutout_analysis.ipynb` overlay on the correlation image for this reason.
+- **Density ↔ per-trace purity is a hard tradeoff** — see the dense-FOV caveat in
+  *Two trace flavours* above (cross-talk degrades `C` vs `C + YrA` as cell count
+  rises).
 
 ### Merge rule: temporal AND (spatial overlap OR centre proximity)
 `merge_components` merges component pair (i, j) when:
@@ -722,6 +799,11 @@ run_preprocess.py              Staged CLI 1/4: downsample a zarr (ssub/tsub) -> 
 run_mc.py                      Staged CLI 2/4: motion-correct a zarr -> mc.zarr + shifts.npy + params.json
 run_extract.py                 Staged CLI 3/4: extract on mc.zarr -> results/ (--ds-meta auto-rescales params)
 run_evaluate.py                Staged CLI 4/4: re-run auto-eval on a results dir (retune thresholds, no re-extract)
+tune.py                        SINGLE front door: `tune.py <path>` = heuristics + sweep + full-recording validation + report.html (default output ./runs/, gitignored); `--sessions <list>` = batch; `--no-validate`/`--no-html`/`--no-lowthr`/`--dry-run` flags. Composes the stages below (calls tuning.validate.tune_then_validate).
+validate_session.py            Internal stage / standalone CLI: fused MC once -> Y_flat once -> fit_extract per threshold set (reuses Y_flat) -> diagnostics + comparison.md. Use directly only to re-validate or add threshold sets.
+batch_tune.py                  Batch stage: run_batch() runs one `tune.py --validate` subprocess per session in ONE background process (bounded concurrency, BLAS-capped) -> batch_summary.md. No sub-agents. `tune.py --sessions` delegates here.
+tuning/                        Tuning package: io_sample, heuristics, metrics (GT-free quality proxies), sweep (graded fit_extract grid), report (figures + report.md + packaged diagnostics: fig_footprint_grid/eccentricity/jaccard_merge/centroid_drift/mean_proj_and_activity + DIAGNOSTIC_FIGS + METRICS_BLURB/SYMPTOM_CAUSE_KNOB), report_html (self-contained report.html: base64 figs + sortable candidate table), tuner, validate (read_session_meta + validate_session + tune_then_validate + good_defaults)
+.claude/skills/tune-session/   User-invoked skill (/tune-session <path...>|<list.txt>): metadata -> tune.py (tune+validate+html) -> verdict + per-session LEARNINGS.md. Gotcha checklist lives in wiki/parameter-tuning.md (single source). Multiple paths / a .txt list run via batch_tune (one background process, NOT sub-agents). --figs/--no-figs gates end-of-run PNG viewing (the dominant token cost)
 tutorial.ipynb                 Original walkthrough (preserved)
 tutorial2.ipynb                Clean rewrite of the original tutorial
 tutorial_realistic.ipynb       Tutorial on the realistic simulator + mp4 export of the simulated movie

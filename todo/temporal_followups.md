@@ -29,46 +29,19 @@ pending a recalibration of the alternating-LS update with the
 cleaner C as input. Likely needs a different normalisation in the
 `bf` / `f` updates, or a fundamentally different initialisation.
 
-## 1. g estimation from the projected trace, not C_raw — TRIED, INSUFFICIENT
+## 1. g estimation from the projected trace — RESOLVED (kept as a lesson)
 
-**Attempted.** Reordered `CNMFe.fit` so `compute_W` runs before AR
-estimation and ran Yule-Walker on the ring-subtracted projection
-`(A · Y_bg) / ‖a‖²`. Reverted: did not change `g` on the
-realistic-miniscope fixture.
-
-**Diagnostic.** Even the **IDEAL projection** `(a_true · Y) / ‖a_true‖²`
-gives `g ≈ 0.957` for every component (true range 0.90–0.93). Running
-Yule-Walker on `C_true` *directly* gives `g ≈ 0.87–0.91` — the
-correct band. So the input trace IS what biases the estimator; the
-ring just doesn't subtract enough.
-
-**Why.** The simulator's slow background is a random-walk smoothed
-with `bg_temporal_sigma=30` frames (5 components, summed) plus
-vignette·bleach modulation. The ring removes *local* slow modes
-inside a ~10-pixel radius; the simulator's slow modes span tens of
-pixels and survive the subtraction. Polynomial detrend
-(`ar_detrend_order=0..3`) doesn't catch them either — random walks
-aren't polynomial-shaped. Same with detrend on the projection trace.
-
-**What would actually work** (any one of):
-- **Bayesian prior on g** — **implemented 2026-05-21.** Set
-  `CNMFeParams.decay_time_ms` + `frame_rate_hz` (and optionally
-  `g_prior_weight`); the Yule-Walker estimate is shrunk toward
-  `g_target = exp(-1 / (fps · τ_ms / 1000))` and `fudge_factor` is
-  bypassed. Plumbed through every `estimate_ar_params` call site
-  (pipeline init, greedy init, `update_temporal` fallback). This is
-  now the recommended fix for the upward-biased `g` problem.
-- **High-pass / rolling-window detrend** with window ≫ calcium tau
-  but ≪ drift correlation length (e.g. ~60 frames vs τ_cal ≈ 10).
-  Subtracts the large-scale slow drift while preserving transients.
-- **Decay-segment-only g estimator** — detect candidate transients,
-  fit g on inter-spike decay intervals (CaImAn's
-  `constrained_foopsi` path does this).
-- **Noise-constrained OASIS** — already done; the fallback now uses
-  L1 + λ bisection (commit `a8948d6`). With the correct sn budget,
-  OASIS still depends on a tight g, but the symptom is now over-smoothing
-  rather than collapse. See `todo/oasis_oversmoothing.md` for the
-  concrete A/B that lowers `fudge_factor` and detrends the OASIS input.
+Resolved by the **Bayesian prior on g** (`decay_time_ms` + `frame_rate_hz`,
+implemented 2026-05-21; see `todo/oasis_oversmoothing.md`). Kept only as an
+anti-re-attempt note: running Yule-Walker on the ring-subtracted projection does
+**not** fix the upward `g` bias. Even the *ideal* projection
+`(a_true · Y) / ‖a_true‖²` gives `g ≈ 0.957` (true 0.90–0.93) because the
+simulator's slow background (random walk, ~30-frame smoothing, spanning tens of
+pixels) survives the ~10-px ring; running Yule-Walker on `C_true` *directly*
+gives the correct `g ≈ 0.87–0.91`. Polynomial detrend can't catch a random walk.
+The two still-open alternatives both live elsewhere now: a **decay-segment-only g
+estimator** in `todo/future_improvements_roadmap.md` (A2), and the
+**rolling-window detrend** as `cnmfe/detrend.py`.
 
 ## 2. Robust (spike-aware) detrend → raise the detrend defaults
 
@@ -84,7 +57,9 @@ activity-rich data, enabling a defensible default ≥ 1.
 with an IRLS variant: fit polynomial → identify residuals above
 the median → re-weight those points → repeat 2–3 times. The lower
 envelope of the trace becomes the bleach trajectory; spikes don't
-participate in the fit.
+participate in the fit. (Note: `cnmfe/detrend.py` already provides a
+robust *movie-level* rolling-percentile detrend; this item is the
+remaining *trace-level* detrend that runs just before Yule-Walker / OASIS.)
 
 ## 3. Realistic-miniscope `r(IDEAL_proj, truth) ≈ 0.20` ceiling
 
