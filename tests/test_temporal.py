@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from cnmfe.temporal import _oasis_ar1_pava, deconvolve, estimate_ar_params, update_temporal
+from minicnmfe.temporal import _oasis_ar1_pava, deconvolve, estimate_ar_params, update_temporal
 
 
 def make_ar1_trace(T: int = 300, g: float = 0.9, sn: float = 0.3, seed: int = 0) -> dict:

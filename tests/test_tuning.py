@@ -22,7 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from cnmfe.pipeline import CNMFe, CNMFeParams  # noqa: E402
+from minicnmfe.pipeline import CNMFe, CNMFeParams  # noqa: E402
 from tests.miniscope_simulator import make_miniscope_movie  # noqa: E402
 from tuning import heuristics as H  # noqa: E402
 from tuning import io_sample as S  # noqa: E402
@@ -216,7 +216,7 @@ def test_recommended_params_roundtrip_into_pipeline(sim_movie, tmp_path):
 
 @pytest.fixture(scope="module")
 def corr_image(sim_movie):
-    from cnmfe.preprocess import correlation_pnr
+    from minicnmfe.preprocess import correlation_pnr
 
     cn, pnr = correlation_pnr(sim_movie, sigma=3.0)
     return cn, pnr

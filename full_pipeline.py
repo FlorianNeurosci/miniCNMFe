@@ -78,14 +78,14 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Load zarr lazily ---------------------------------------------------
-    from cnmfe.io import open_zarr
+    from minicnmfe.io import open_zarr
     z = open_zarr(zarr_path)
     T, H, W = z.shape
     print(f"Movie  : {z.shape}  chunks={z.chunks}  dtype={z.dtype}")
     print(f"Output : {out_dir}")
 
     # --- Build params -------------------------------------------------------
-    from cnmfe.pipeline import CNMFe, CNMFeParams
+    from minicnmfe.pipeline import CNMFe, CNMFeParams
     params = CNMFeParams(
         sigma=args.sigma,
         min_corr=args.min_corr,
@@ -140,7 +140,7 @@ def main() -> None:
         print(f"  shifts.npy  -- motion shifts  ({T} × 2)")
 
     print(f"\nLoad results:")
-    print(f"  from cnmfe.pipeline import CNMFe")
+    print(f"  from minicnmfe.pipeline import CNMFe")
     print(f"  model = CNMFe.load('{out_dir}')")
     print(f"  A, C, YrA = model.A, model.C, model.YrA")
     print(f"  C_proj = model.C_projected   # = C + YrA, shape-faithful")

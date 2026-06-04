@@ -41,7 +41,7 @@ pixels) survives the ~10-px ring; running Yule-Walker on `C_true` *directly*
 gives the correct `g ≈ 0.87–0.91`. Polynomial detrend can't catch a random walk.
 The two still-open alternatives both live elsewhere now: a **decay-segment-only g
 estimator** in `todo/future_improvements_roadmap.md` (A2), and the
-**rolling-window detrend** as `cnmfe/detrend.py`.
+**rolling-window detrend** as `minicnmfe/detrend.py`.
 
 ## 2. Robust (spike-aware) detrend → raise the detrend defaults
 
@@ -53,11 +53,11 @@ Reverted to default 0 in commit `e2ba67b`. A robust detrend (iterative
 reweight, lower-envelope fit) would handle both bleach-heavy and
 activity-rich data, enabling a defensible default ≥ 1.
 
-**What to change.** Replace `_detrend_poly` in `cnmfe/temporal.py`
+**What to change.** Replace `_detrend_poly` in `minicnmfe/temporal.py`
 with an IRLS variant: fit polynomial → identify residuals above
 the median → re-weight those points → repeat 2–3 times. The lower
 envelope of the trace becomes the bleach trajectory; spikes don't
-participate in the fit. (Note: `cnmfe/detrend.py` already provides a
+participate in the fit. (Note: `minicnmfe/detrend.py` already provides a
 robust *movie-level* rolling-percentile detrend; this item is the
 remaining *trace-level* detrend that runs just before Yule-Walker / OASIS.)
 

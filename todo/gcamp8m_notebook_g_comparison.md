@@ -1,7 +1,7 @@
 # Remaining work: GCaMP8m decay in notebooks + head-to-head `g` comparison
 
 ## Done (this change)
-- `cnmfe/temporal.py`: added `g_from_decay_time(decay_time_ms, fps)` and
+- `minicnmfe/temporal.py`: added `g_from_decay_time(decay_time_ms, fps)` and
   `decay_time_from_g(g, fps)` (single source of truth for `g = exp(-1/(fps·τ_s))`).
 - `tests/miniscope_simulator.py`: `make_miniscope_movie` now derives per-neuron `g`
   from `decay_time_ms` (default **180 ms = GCaMP8m**) at `fps`, with a `decay_time_jitter`
@@ -29,7 +29,7 @@ Variable names confirmed present: `cnm_r` (CaImAn realistic model), `ours_r2` (o
    This is the one extra full fit on the 6500-frame movie — adds runtime.
 6. **Add the g-comparison cell** (after the metrics cell ~line 671, before Section 9):
    ```python
-   from cnmfe.temporal import decay_time_from_g
+   from minicnmfe.temporal import decay_time_from_g
    FPS = 20.0
    def recovered_g(model_or_cnm, matches, is_caiman):
        out = []  # (true_g, est_g) per matched neuron

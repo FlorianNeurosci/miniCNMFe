@@ -11,9 +11,9 @@ import json
 import numpy as np
 import scipy.sparse as sp
 
-from cnmfe.downsample import downsample_movie, upsample_footprints, upsample_traces
-from cnmfe.io import open_zarr, save_zarr
-from cnmfe.pipeline import CNMFe, CNMFeParams
+from minicnmfe.downsample import downsample_movie, upsample_footprints, upsample_traces
+from minicnmfe.io import open_zarr, save_zarr
+from minicnmfe.pipeline import CNMFe, CNMFeParams
 
 
 def _block_mean(movie: np.ndarray, ssub: int, tsub: int) -> np.ndarray:

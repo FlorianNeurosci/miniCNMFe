@@ -24,8 +24,8 @@ from pathlib import Path
 
 import numpy as np
 
-from cnmfe.io import open_zarr
-from cnmfe.pipeline import CNMFe, CNMFeParams
+from minicnmfe.io import open_zarr
+from minicnmfe.pipeline import CNMFe, CNMFeParams
 from tuning.metrics import composite_score, model_quality
 
 # Swept fields, in display order. Each maps to a SweepSpec attribute.

@@ -7,8 +7,10 @@ It captures project state, decisions, and caveats that are not obvious from the 
 
 ## What this project is
 
-A **clean Python reimplementation of CNMFe** (Constrained NMF for Endoscopic data) for
-extracting neurons from 1-photon calcium imaging (miniscope) recordings.
+**minicnmfe** is a **clean Python reimplementation of CNMFe** (Constrained NMF for
+Endoscopic data) for extracting neurons from 1-photon calcium imaging (miniscope)
+recordings. The Python package is imported as `minicnmfe` (`from minicnmfe import
+CNMFe, CNMFeParams`).
 
 **No CaImAn code is imported.** The CaImAn repository (`CaImAn-main/`) is present as an
 algorithmic reference only. All math is reimplemented from scratch with numpy/scipy/sklearn.
@@ -43,13 +45,13 @@ and sanity-check before relying on them. Defaults are chosen so none of these
 change standard behaviour unless explicitly enabled.
 
 1. **Cutout analysis** — `CNMFeParams.temporal_crop` / `spatial_crop` /
-   `spatial_mask_path` (`cnmfe/cutout.py`), applied at ingestion before MC, plus
+   `spatial_mask_path` (`minicnmfe/cutout.py`), applied at ingestion before MC, plus
    `place_in_full_fov()` to map results back. Autotested (`tests/test_cutout.py`,
    incl. end-to-end fit + fused AVI→MC). **Caveat:** incompatible with the
    streaming `Y_flat_zarr` path (raises by design); not validated on real data.
 2. **Detrending** — the polynomial-detrend knobs `ar_detrend_order` (before
    Yule-Walker) and `temporal_detrend_order` (before OASIS), and the standalone
-   `cnmfe/detrend.py:detrend_movie` preprocessor. NON-STANDARD; defaults `0`
+   `minicnmfe/detrend.py:detrend_movie` preprocessor. NON-STANDARD; defaults `0`
    (off) = standard CNMF-E. Autotested (`tests/test_detrend.py`,
    `tests/test_temporal.py`, a pipeline run with orders=2) but not validated on
    real recordings — tune cautiously.
@@ -98,7 +100,7 @@ change standard behaviour unless explicitly enabled.
 ## Key design decisions
 
 ### Motion correction — canonical implementation
-`motion_correction_rigid` in `cnmfe/motion_correction.py` is the **only** motion
+`motion_correction_rigid` in `minicnmfe/motion_correction.py` is the **only** motion
 correction algorithm. It uses `cv2.filter2D` for high-pass filtering (matching
 CaImAn's `border_reflect`) and `cv2.warpAffine` for applying shifts. Both choices
 are critical for producing the same shifts as CaImAn on real data — using
@@ -187,7 +189,7 @@ never the extracted results** (guarded by `tests/test_pipeline.py::test_fit_*Y_f
   decompression, IO-bound only; costs ~`H·W·T·4` bytes of disk).
 - **`n_jobs=-1`** — parallelises the per-batch store reads + solves (default is
   `1`, serial). On a high-latency network this hides round-trip latency.
-- **`cnmfe.io.stage_zarr_to_local(src, local_dir)`** — copies any zarr store to
+- **`minicnmfe.io.stage_zarr_to_local(src, local_dir)`** — copies any zarr store to
   local disk and returns the open handle, for users who already have a
   network-resident `Y_flat` (pass the local handle as `Y_flat_zarr=`). Equivalent
   to setting `yflat_dir` on the auto-derive path.
@@ -195,7 +197,7 @@ never the extracted results** (guarded by `tests/test_pipeline.py::test_fit_*Y_f
   `--yflat-time-chunk`, `--yflat-no-compress`.
 
 `fit_extract` prints a **per-stage wall-clock summary** at the end (via
-`cnmfe._utils.StageTimer`): `transpose -> Y_flat`, `compute_W`, `update_spatial`,
+`minicnmfe._utils.StageTimer`): `transpose -> Y_flat`, `compute_W`, `update_spatial`,
 `update_temporal`, `final YrA projection`, etc. — use it to see where the IO
 time actually goes before/after tuning.
 
@@ -467,7 +469,7 @@ updated. **Do not regress to a 2-tuple.**
 footprints still overlap (before `threshold_footprint` separates them).
 
 ### Auto-evaluation step (post-BCD quality tagging — non-destructive)
-`pipeline.fit()` runs `cnmfe.evaluate.auto_evaluate_components` between the
+`pipeline.fit()` runs `minicnmfe.evaluate.auto_evaluate_components` between the
 BCD loop and the final `update_temporal`. Two per-component checks are
 recorded:
 1. **Pixel-count floor:** `npix >= CNMFeParams.min_pixel`.
@@ -530,7 +532,7 @@ on the smaller movie** — outputs stay at downsampled resolution (no footprint
 upsampling, no full-res finalization). There are **three ways to produce the
 downsampled movie**, in increasing preference for the AVI workflow:
 
-1. `cnmfe/downsample.py::downsample_movie(src, dest, *, ssub, tsub, ...)` —
+1. `minicnmfe/downsample.py::downsample_movie(src, dest, *, ssub, tsub, ...)` —
    streaming block-mean of an **existing `(T,H,W)` zarr** (template:
    `io.transpose_zarr_to_pixel_major`); writes a `ds_meta.json` sidecar. Use
    when you already have a raw zarr. `run_preprocess.py` wraps it.
@@ -565,7 +567,7 @@ a `tsub` group are averaged prior to registration. Fine for slow drift / small
 orig_T, ...)` returns a **new, non-destructive** model with `A` (bilinear) and
 `C`/`YrA`/`C_raw` (linear) interpolated to the native grid/rate — for overlaying
 footprints on a native reference image and plotting against native-rate signals.
-Helpers `upsample_footprints` / `upsample_traces` live in `cnmfe/downsample.py`
+Helpers `upsample_footprints` / `upsample_traces` live in `minicnmfe/downsample.py`
 (per-column `cv2.resize` to the exact native `(H,W)`; per-row `np.interp` to the
 exact native `T`, so trimming is handled). It is **interpolation, not recovery**
 — the native movie is gone in downsample-once, so no discarded detail is
@@ -575,7 +577,7 @@ the BCD on it). Native `(H,W)`/`T` must be supplied (only `downsample_movie`
 writes a `ds_meta.json`; the fused/concat paths don't), or passed via
 `ds_meta=`.
 
-### Cutout — crop the movie before extraction (`cnmfe/cutout.py`)
+### Cutout — crop the movie before extraction (`minicnmfe/cutout.py`)
 Optional `CNMFeParams` fields restrict CNMFe to a sub-region/window, applied
 **once at ingestion, before MC** (NATIVE coords):
 - `temporal_crop=(t0,t1)`, `spatial_crop=(y0,y1,x0,x1)`, `spatial_mask_path`
@@ -589,7 +591,7 @@ other changes. `fit()` and `fit_mc`/`fit_mc_from_avis` apply the crop and record
 so the staged `fit_mc_from_avis → fit_extract(mc.zarr)` flow crops exactly once.
 `downscaled()` **clears** the crop fields (applied upstream of binning).
 
-`cnmfe/cutout.py`: `resolve_cutout` (rect ∩ mask-bbox, clamp, load mask),
+`minicnmfe/cutout.py`: `resolve_cutout` (rect ∩ mask-bbox, clamp, load mask),
 `apply_cutout` (slice + zero-outside-mask; numpy or zarr), and the map-back
 helpers used by **`CNMFe.place_in_full_fov(*, place_time=True)`** — a new model
 (parallels `upsample_to_native`) with footprints padded to the original FOV at
@@ -606,7 +608,7 @@ global offset), crops the template too, and writes a `cutout.json` sidecar that
 outside the crop — minor edge artifacts within ~`max_shift` px of the border;
 leave a small margin around the ROI.
 
-### Fused AVI → MC (`cnmfe/avi_mc.py`)
+### Fused AVI → MC (`minicnmfe/avi_mc.py`)
 `concat_avis_to_mc_zarr` (and the convenience wrapper
 `CNMFe.fit_mc_from_avis`) decode an AVI folder and apply rigid motion
 correction in a **single pipeline**, writing only `mc.zarr` to disk. No
@@ -625,7 +627,7 @@ Pipeline shape:
    `_decode_avi_worker` (reused from `concat_avis_to_zarr`). A
    queue-consuming writer pulls `(start, batch)` tuples, runs
    `_process_batch` (parallelised per-frame MC from
-   `cnmfe/motion_correction.py`), and writes the float32 corrected
+   `minicnmfe/motion_correction.py`), and writes the float32 corrected
    batch + shifts into `mc.zarr` / a `(T, 2)` shifts buffer.
 
 **Inline downsampling** (`ssub` / `tsub` on `concat_avis_to_mc_zarr` /
@@ -671,7 +673,7 @@ Output zarr defaults: `clevel=3` + `shuffle="shuffle"` (byte shuffle) instead
 of the project-wide `clevel=5` + `bitshuffle`. ~3× faster compress with
 ~10 % larger files on uint8 imaging data. The writer is single-threaded so
 freeing it up is the only way to keep decoders un-stalled on
-network-mounted output. `_open_array` in `cnmfe/io.py` accepts `clevel` and
+network-mounted output. `_open_array` in `minicnmfe/io.py` accepts `clevel` and
 `shuffle` parameters to expose this — defaults remain the heavyweight
 combination for callers (MC, temp stores) that prioritise ratio.
 
@@ -761,7 +763,7 @@ directly, so it tests the fallback regardless of whether the package is present)
 `iio.improps(src).shape` in imageio v3 returns `(T, H, W)` (full video shape), not `(H, W)`.
 Using `props.shape[:2]` silently extracted `(T, H)` as the spatial dimensions, creating a zarr
 with shape `(T, T, H)` and failing with a broadcast error when the first chunk was written.
-**Fix** (in `cnmfe/io.py`): check whether `_s[0] == T` and extract H, W from `_s[1:]` if so,
+**Fix** (in `minicnmfe/io.py`): check whether `_s[0] == T` and extract H, W from `_s[1:]` if so,
 otherwise fall back to `_s[0:2]`. The same fix applies to `concat_avis_to_zarr.py`.
 
 ---
@@ -769,7 +771,7 @@ otherwise fall back to `_s[0:2]`. The same fix applies to `concat_avis_to_zarr.p
 ## File structure
 
 ```
-cnmfe/                         Main package
+minicnmfe/                         Main package
   _utils.py                    make_2d, make_3d, get_xp, to_numpy, iter_frames, ensure_float32
   io.py                        avi_to_zarr, open_zarr, save_zarr
   motion_correction.py         motion_correction_rigid, apply_shift, estimate_shifts
@@ -835,7 +837,7 @@ CaImAn-main/                   Reference source only — never import from here 
 - `motion_max_shift: float = 0.0` — peak drift amplitude in pixels; 0 = no motion (backward-compatible)
 - `motion_seed: int | None = None` — RNG seed for drift (defaults to `seed + 1`); `make_synthetic_movie` always uses `seed + 1`
 - Drift is a smoothed correlated random walk (cumsum of small Gaussian steps, uniform_filter1d, rescaled to peak = `motion_max_shift`)
-- Applied frame-by-frame via `cnmfe.motion_correction.apply_shift`; stored as `result["motion_shifts"]` (T, 2) float32
+- Applied frame-by-frame via `minicnmfe.motion_correction.apply_shift`; stored as `result["motion_shifts"]` (T, 2) float32
 - Sign convention: `motion_shifts[t]` is the `(dy, dx)` shift applied to generate frame t; motion correction's `model.shifts` is approximately the negative (the correction that undoes the drift)
 
 `CNMFe` result attributes added:
@@ -890,7 +892,7 @@ jupyter notebook tutorial_demo.ipynb          # realistic lazy-load AVI workflow
 - Building CaImAn from `CaImAn-main/` requires MSVC Build Tools (VS 2022 BuildTools edition is
   installed under `C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/`); use the
   Developer Command Prompt or run `vcvars64.bat` to get `cl` on PATH before
-  `python setup.py build_ext --inplace`. CaImAn is not actually imported by `cnmfe/`.
+  `python setup.py build_ext --inplace`. CaImAn is not actually imported by `minicnmfe/`.
 - When using `n_jobs=-1` followed by CaImAn's `cm.cluster.setup_cluster()` (e.g. in
   `tutorial_caiman_compare.ipynb`), the loky worker pool from joblib persists after `CNMFe.fit()`.
   CaImAn's `setup_cluster` raises "A cluster is already running" when it detects live processes.

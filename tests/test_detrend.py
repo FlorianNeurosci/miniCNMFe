@@ -16,8 +16,8 @@ roughly intact while the baseline drift is removed.
 
 import numpy as np
 
-from cnmfe.detrend import detrend_movie
-from cnmfe.io import open_zarr, save_zarr
+from minicnmfe.detrend import detrend_movie
+from minicnmfe.io import open_zarr, save_zarr
 
 
 def _make_zarr(tmp_path, movie):

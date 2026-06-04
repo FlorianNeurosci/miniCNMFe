@@ -145,7 +145,7 @@ def quick_fused_mc(
     there — a fast approximation to the full-session shifts. ``mc.zarr`` lands
     in ``out_dir``.
     """
-    from cnmfe.pipeline import CNMFe
+    from minicnmfe.pipeline import CNMFe
 
     avi_folder = Path(avi_folder)
     out_dir = Path(out_dir)

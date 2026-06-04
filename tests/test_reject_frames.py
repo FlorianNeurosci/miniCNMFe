@@ -2,8 +2,8 @@
 
 import numpy as np
 
-from cnmfe.io import save_zarr
-from cnmfe.reject_frames import reject_outlier_frames
+from minicnmfe.io import save_zarr
+from minicnmfe.reject_frames import reject_outlier_frames
 
 
 def _make_zarr(tmp_path, movie):

@@ -54,7 +54,7 @@ CaImAn look worse than it is until corrected:
    package is absent, we fell back to a pure-Python PAVA whose pool-merge test
    used bare `g` instead of `g**pool_length` — collapsing smooth decays. This
    dropped our **deconvolved `C`** vs truth to ~0.58 while CaImAn's was ~0.98,
-   hidden behind the robust `C+YrA` (~0.96). *Fixed* in `cnmfe/temporal.py`
+   hidden behind the robust `C+YrA` (~0.96). *Fixed* in `minicnmfe/temporal.py`
    (commit `b90f032`); guarded by
    `tests/test_temporal.py::test_pava_fallback_reconstructs_clean_ar1`. After the
    fix our `C` is ~0.96, on par with CaImAn.

@@ -21,8 +21,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from cnmfe.io import open_zarr
-from cnmfe.pipeline import CNMFe, CNMFeParams
+from minicnmfe.io import open_zarr
+from minicnmfe.pipeline import CNMFe, CNMFeParams
 
 PROJECT_ROOT = Path("/home/fs539/code/simpler_cnmfe")
 MC_ZARR = PROJECT_ROOT / "demo_movies" / "demo_session" / "mc_output" / "mc.zarr"

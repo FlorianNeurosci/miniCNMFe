@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import zarr
 
-from cnmfe.io import (
+from minicnmfe.io import (
     open_zarr,
     open_zarr_pixel_major,
     save_zarr,
@@ -78,7 +78,7 @@ class TestTransposeToPixelMajor:
 
     def test_round_trip_matches_make_2d(self, tmp_path):
         """Pixel-major dest must equal ``make_2d(src)`` element-wise."""
-        from cnmfe._utils import make_2d
+        from minicnmfe._utils import make_2d
 
         src_movie, src_path = self._save_source(tmp_path)
         dest_path = tmp_path / "dest.zarr"
@@ -163,7 +163,7 @@ class TestTransposeToPixelMajor:
         T = src_movie.shape[0]
         assert dest.chunks[1] == T
         # Values still correct regardless of chunking.
-        from cnmfe._utils import make_2d
+        from minicnmfe._utils import make_2d
         np.testing.assert_array_equal(np.asarray(dest), make_2d(src_movie))
 
 
@@ -178,7 +178,7 @@ class TestStageZarrToLocal:
         return movie, src
 
     def test_copies_values_exactly(self, tmp_path):
-        from cnmfe.io import stage_zarr_to_local
+        from minicnmfe.io import stage_zarr_to_local
 
         movie, src = self._save_source(tmp_path)
         local = tmp_path / "local"
@@ -187,7 +187,7 @@ class TestStageZarrToLocal:
         np.testing.assert_array_equal(np.asarray(staged), movie)
 
     def test_idempotent(self, tmp_path):
-        from cnmfe.io import stage_zarr_to_local
+        from minicnmfe.io import stage_zarr_to_local
 
         _, src = self._save_source(tmp_path)
         local = tmp_path / "local"
@@ -198,7 +198,7 @@ class TestStageZarrToLocal:
         np.testing.assert_array_equal(np.asarray(first), np.asarray(second))
 
     def test_missing_source_raises(self, tmp_path):
-        from cnmfe.io import stage_zarr_to_local
+        from minicnmfe.io import stage_zarr_to_local
 
         with pytest.raises(FileNotFoundError):
             stage_zarr_to_local(tmp_path / "nope.zarr", tmp_path / "local",

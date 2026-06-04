@@ -31,9 +31,9 @@ import pytest
 
 cv2 = pytest.importorskip("cv2")
 
-from cnmfe.avi_mc import concat_avis_to_mc_zarr  # noqa: E402
-from cnmfe.motion_correction import motion_correction_rigid  # noqa: E402
-from cnmfe.pipeline import CNMFeParams, CNMFe  # noqa: E402
+from minicnmfe.avi_mc import concat_avis_to_mc_zarr  # noqa: E402
+from minicnmfe.motion_correction import motion_correction_rigid  # noqa: E402
+from minicnmfe.pipeline import CNMFeParams, CNMFe  # noqa: E402
 from concat_avis_to_zarr import concat_avis_to_zarr  # noqa: E402
 
 
@@ -197,7 +197,7 @@ class TestFusedAviMc:
         is enough to prove the registration actually works on real
         structure).
         """
-        from cnmfe.motion_correction import apply_shift_caiman
+        from minicnmfe.motion_correction import apply_shift_caiman
 
         src = tmp_path / "session"
         src.mkdir()

@@ -4,7 +4,7 @@ These guard the calibration that brings ``make_miniscope_movie`` into the
 detectability regime of a real clean 1p recording (demo_movies/demo_session):
 median local-correlation CORR ≈ 0.92 and median PNR ≈ 10 (vs the old
 noise-dominated 0.53 / 3.5), using the same metric the pipeline keys on
-(``cnmfe.preprocess.correlation_pnr``). They also pin the F0+ΔF baseline
+(``minicnmfe.preprocess.correlation_pnr``). They also pin the F0+ΔF baseline
 invariants and the ``realism=False`` escape hatch.
 """
 
@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 
 from miniscope_simulator import make_miniscope_movie
-from cnmfe.preprocess import correlation_pnr
+from minicnmfe.preprocess import correlation_pnr
 
 
 def test_realism_corr_pnr_in_real_like_band():

@@ -8,7 +8,7 @@ disk-handoff CLI workflow (run_mc / run_extract / run_evaluate) is faithful.
 
 import numpy as np
 
-from cnmfe.pipeline import CNMFe, CNMFeParams
+from minicnmfe.pipeline import CNMFe, CNMFeParams
 
 
 def _params() -> CNMFeParams:

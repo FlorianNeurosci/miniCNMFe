@@ -1,10 +1,10 @@
 ---
-tags: [cnmfe, index, home]
+tags: [minicnmfe, index, home]
 ---
 
-# CNMFe — Map of Content
+# minicnmfe — Map of Content
 
-> Constrained Non-negative Matrix Factorization for Endoscopic data.
+> **minicnmfe** — CNMF-E (Constrained Non-negative Matrix Factorization for Endoscopic data) for 1-photon miniscope calcium imaging.
 > A clean Python implementation for extracting neurons from 1-photon calcium imaging movies.
 
 ## Navigation

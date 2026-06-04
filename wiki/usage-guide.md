@@ -1,5 +1,5 @@
 ---
-tags: [cnmfe, usage, tutorial, quickstart]
+tags: [minicnmfe, usage, tutorial, quickstart]
 ---
 
 # CNMFe — Usage Guide
@@ -25,8 +25,8 @@ Optional but recommended: `oasis-deconvolution` (faster AR deconvolution). Witho
 ### From an AVI/MP4 file
 
 ```python
-from cnmfe import CNMFe, CNMFeParams
-from cnmfe.io import avi_to_zarr
+from minicnmfe import CNMFe, CNMFeParams
+from minicnmfe.io import avi_to_zarr
 
 # Convert video to zarr (streams frame by frame — never loads full movie)
 movie = avi_to_zarr("recording.avi", "/tmp/movie.zarr")
@@ -49,7 +49,7 @@ S = model.S       # (K, T)   — spike trains
 
 ```python
 import numpy as np
-from cnmfe import CNMFe, CNMFeParams
+from minicnmfe import CNMFe, CNMFeParams
 
 movie = np.load("movie.npy")           # (T, H, W) float32
 model = CNMFe(CNMFeParams(sigma=3.0)).fit(movie, do_motion_correction=False)
@@ -89,8 +89,8 @@ The extraction path is streaming-aware after the Phase 1 refactors (May 2026):
   are recovered by projection after init.
 
 ```python
-from cnmfe.io import open_zarr
-from cnmfe import CNMFe, CNMFeParams
+from minicnmfe.io import open_zarr
+from minicnmfe import CNMFe, CNMFeParams
 
 z = open_zarr("session/mc.zarr")            # already motion-corrected
 params = CNMFeParams(
@@ -114,12 +114,12 @@ as `Y_flat_zarr`. Extraction then never materialises the full
 `(H·W, T)` array — the on-disk store IS `Y_flat`.
 
 ```python
-from cnmfe.io import (
+from minicnmfe.io import (
     open_zarr,
     open_zarr_pixel_major,
     transpose_zarr_to_pixel_major,
 )
-from cnmfe import CNMFe, CNMFeParams
+from minicnmfe import CNMFe, CNMFeParams
 
 # One-time preprocessing: rewrite mc.zarr with chunks (4096, 2000)
 # so pixel-row reads are O(B·T) IO instead of O(H·W·T).
@@ -234,7 +234,7 @@ Behaviour observed on a real 37k-frame miniscope recording (not autotested):
       init_stride=2,                         # auto = T//5000 can subsample transients away
   )
   ```
-  (The per-pixel temporal detrend in `cnmfe/detrend.py` is an equivalent
+  (The per-pixel temporal detrend in `minicnmfe/detrend.py` is an equivalent
   alternative to `global_bg_rank=1`.)
 
 - **Dense fields: keep the merge gentle.** With the drift handled by
@@ -335,7 +335,7 @@ For a typical 100k-frame miniscope session (100 AVIs × 1000 frames × 600×600 
 - **Network mount** for both source AVIs and output zarr: 5–7 min.
 
 If you don't need to inspect the raw (pre-MC) zarr separately, use the
-fused AVI→MC entrypoint (`cnmfe.avi_mc.concat_avis_to_mc_zarr`) instead —
+fused AVI→MC entrypoint (`minicnmfe.avi_mc.concat_avis_to_mc_zarr`) instead —
 it writes only the motion-corrected zarr in a single pass and saves ~5 min
 on network mounts by skipping the intermediate.
 
@@ -479,8 +479,8 @@ You can call individual steps manually to inspect intermediate outputs:
 
 ```python
 import numpy as np
-from cnmfe.preprocess import correlation_pnr, estimate_noise
-from cnmfe._utils import make_2d
+from minicnmfe.preprocess import correlation_pnr, estimate_noise
+from minicnmfe._utils import make_2d
 
 movie = np.load("movie.npy").astype(np.float32)
 
@@ -501,7 +501,7 @@ plt.show()
 
 ```python
 # Check initialization seeds
-from cnmfe.initialization import detect_seeds
+from minicnmfe.initialization import detect_seeds
 seeds = detect_seeds(cn, pnr, min_corr=0.8, min_pnr=10.0)
 print(f"Found {len(seeds)} seed candidates")
 # Plot seeds on CORR image
@@ -525,7 +525,7 @@ pytest tests/test_pipeline.py -v
 pytest tests/test_multiprocessing.py -v
 
 # With coverage
-pytest tests/ --cov=cnmfe --cov-report=html
+pytest tests/ --cov=minicnmfe --cov-report=html
 ```
 
 > [!NOTE]

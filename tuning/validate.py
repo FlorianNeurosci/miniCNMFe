@@ -24,9 +24,9 @@ from pathlib import Path
 
 import numpy as np
 
-from cnmfe.io import open_zarr, open_zarr_pixel_major, transpose_zarr_to_pixel_major
-from cnmfe.pipeline import CNMFe, CNMFeParams
-from cnmfe.preprocess import correlation_pnr
+from minicnmfe.io import open_zarr, open_zarr_pixel_major, transpose_zarr_to_pixel_major
+from minicnmfe.pipeline import CNMFe, CNMFeParams
+from minicnmfe.preprocess import correlation_pnr
 from tuning import report as R
 from tuning.metrics import model_quality
 

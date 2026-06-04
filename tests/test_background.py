@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from cnmfe.background import (
+from minicnmfe.background import (
     BackgroundSubtractor,
     build_ring_indices,
     compute_W,
@@ -483,7 +483,7 @@ class TestRingConstrainSum:
         difference in residuals at the pulse frame isolates the pulse leakage
         from everything else (noise, b0 effects).
         """
-        from cnmfe.background import subtract_background
+        from minicnmfe.background import subtract_background
 
         H_dim = W_dim = 24
         T = 200

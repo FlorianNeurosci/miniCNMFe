@@ -1,5 +1,5 @@
 ---
-tags: [cnmfe, explainer, eli5]
+tags: [minicnmfe, explainer, eli5]
 ---
 
 # CNMFe — Explained Like You're Five

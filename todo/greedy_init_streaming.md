@@ -5,7 +5,7 @@
 
 ## What
 
-`cnmfe/initialization.py:greedy_corr_pnr` materialises both of the following at
+`minicnmfe/initialization.py:greedy_corr_pnr` materialises both of the following at
 the start (line 250 onwards):
 
 ```python
@@ -53,8 +53,8 @@ is typical), so the user judged this not worth doing right now.
 
 ## Related code
 
-- `cnmfe/initialization.py:250` — the asarray + filter pass.
-- `cnmfe/pipeline.py:fit` — `init_stride` already strides the input; this
+- `minicnmfe/initialization.py:250` — the asarray + filter pass.
+- `minicnmfe/pipeline.py:fit` — `init_stride` already strides the input; this
   only reduces the constant, not the order.
-- `cnmfe/preprocess.py:make_center_surround_psf` — the PSF kernel used by
+- `minicnmfe/preprocess.py:make_center_surround_psf` — the PSF kernel used by
   the filter pass. Small (~`(2 * 4 * sigma + 1)^2`) and cheap to apply.

@@ -1,7 +1,7 @@
 # Future-improvement roadmap
 
 A prioritized list of algorithmic/scale/validation improvements, distilled from the
-other `todo/*.md` notes plus a fresh read of the `cnmfe/` modules. Three axes the
+other `todo/*.md` notes plus a fresh read of the `minicnmfe/` modules. Three axes the
 maintainer cares about: **accuracy on real data**, **scale & online**, **validation
 infra**. (CaImAn feature-parity items — non-rigid MC, AR(2), multiday registration —
 are deliberately *not* prioritized here.)
@@ -45,14 +45,14 @@ fixed real movie, tabulate C1 metrics, accept a knob only if it *measurably* hel
 
 ### A1 — Robust spike-aware *trace-level* detrend (IRLS) [T1]
 (`todo/temporal_followups.md` #2, `todo/oasis_oversmoothing.md`.) **Already in place at
-the movie level:** `cnmfe/detrend.py` (`detrend_movie`) subtracts a rolling
+the movie level:** `minicnmfe/detrend.py` (`detrend_movie`) subtracts a rolling
 lower-percentile baseline per pixel — spike-robust by construction — as a preprocessing
 step. What remains is the *trace-level* detrend: `temporal.py` `_detrend_poly` (run just
 before Yule-Walker / OASIS) is still plain least-squares (`np.polyfit`), so sparse spikes
 pull the fit up — which is why `temporal_detrend_order` must default to 0 and slow drift
 leaks into the AR fit (upward `g` bias, "shark-fin" transients). Fix: IRLS — fit →
 down-weight residuals above median (spikes) → refit ×2–3 → tracks baseline not spikes.
-Enables a defensible nonzero default. Files: `cnmfe/temporal.py`; new test in
+Enables a defensible nonzero default. Files: `minicnmfe/temporal.py`; new test in
 `tests/test_temporal.py` (recover baseline from drift+spikes without clipping spikes).
 
 ### A2 — Decay-segment-only `g` estimator [T1]
@@ -60,17 +60,17 @@ Enables a defensible nonzero default. Files: `cnmfe/temporal.py`; new test in
 0.90–0.93 because slow background survives ring subtraction; the Bayesian prior masks but
 doesn't fix the estimator. Fix: estimate `g` only on detected inter-spike *decay*
 segments (genuinely AR), pool across components, keep the prior as a sanity bound. Files:
-`cnmfe/temporal.py` `estimate_ar_params` (new path, Yule-Walker+prior as fallback); thread
+`minicnmfe/temporal.py` `estimate_ar_params` (new path, Yule-Walker+prior as fallback); thread
 through the same call sites the prior uses. Verify via C1 paired-ephys + recovered-τ
 scatter (the diagnostic `todo/gcamp8m_notebook_g_comparison.md` wants).
 
 ### A3 — Stronger component evaluation [T2]
-`cnmfe/evaluate.py` has only pixel-count + mean-amplitude SNR. Add two non-destructive
+`minicnmfe/evaluate.py` has only pixel-count + mean-amplitude SNR. Add two non-destructive
 metrics (keep "never drop, tag `accepted_mask`" + multi-threshold pass-high-AND-low logic):
 - **spatial r-value** — footprint vs. peak/mean activity-image patch correlation.
 - **temporal exceptionality** — prob. that trace peaks exceed the noise distribution.
 Deliberately **not** porting CaImAn's CNN (needs trained weights + labels). Files:
-`cnmfe/evaluate.py` (extend `auto_evaluate_components`/`eval_info`, persist in save/load),
+`minicnmfe/evaluate.py` (extend `auto_evaluate_components`/`eval_info`, persist in save/load),
 new `CNMFeParams` thresholds, extend `test_auto_evaluation_rejects_ghosts`.
 
 ### A4 — Fix the regressed rank-1 global background [T2]
@@ -78,13 +78,13 @@ new `CNMFeParams` thresholds, extend `test_auto_evaluation_rejects_ghosts`.
 revert. A working low-rank term captures slow global drift that per-pixel `b0` + single
 ring miss — attacking the *root cause* of the `g` bias (A1/A2), not the symptom.
 Recalibrate the alternating-LS `bf·f(t)` update (`pipeline.py` ~107–183) with cleaner `C`,
-warm-start across BCD; keep opt-in (default 0 = byte-identical). Files: `cnmfe/pipeline.py`,
-`cnmfe/background.py`; un-`xfail` `test_bf_and_f_capture_real_rank1_structure`.
+warm-start across BCD; keep opt-in (default 0 = byte-identical). Files: `minicnmfe/pipeline.py`,
+`minicnmfe/background.py`; un-`xfail` `test_bf_and_f_capture_real_rank1_structure`.
 
 ### A5 — float64 accumulator for `b0` [T3]
 (`todo/b0_float64_accumulator.md`.) Streaming `b0` sums in float32; per-pixel error ~1e-4
 grows with T (risk on T>100k). ~1-line fix: accumulate reductions in float64, store
-float32. Files: `cnmfe/background.py` `compute_W`.
+float32. Files: `minicnmfe/background.py` `compute_W`.
 
 ---
 
@@ -95,8 +95,8 @@ float32. Files: `cnmfe/background.py` `compute_W`.
 (~21 GB transient for 60k×600×600) — the **last** hard RAM ceiling (everything else is
 streamed) and what caps concurrent-session count. Fix: persist `data_filtered` to a temp
 zarr + lazy reads in the greedy loop (preferred, matches `Y_flat` pattern), or re-filter
-per seed (CPU-for-RAM). Init sample is already strided. Files: `cnmfe/initialization.py`
-(~line 250, `greedy_corr_pnr`), `cnmfe/pipeline.py` `fit_extract` init; keep in-RAM path
+per seed (CPU-for-RAM). Init sample is already strided. Files: `minicnmfe/initialization.py`
+(~line 250, `greedy_corr_pnr`), `minicnmfe/pipeline.py` `fit_extract` init; keep in-RAM path
 for small movies (dual-path like MC). Test: identical seeds vs in-RAM path (bit-for-bit at
 `n_jobs=1`) + peak-RAM assertion.
 
@@ -104,7 +104,7 @@ for small movies (dual-path like MC). Test: identical seeds vs in-RAM path (bit-
 Extraction is fully batch. Full OnACID-E is a big rewrite, but streaming MC + streaming
 BCD already exist, so a pragmatic middle ground: *block-incremental* — fit on an initial
 time block, then per subsequent block warm-start spatial/temporal from current `A`/`C`,
-run greedy init on the *residual* to add new components, merge. Files: new `cnmfe/online.py`
+run greedy init on the *residual* to add new components, merge. Files: new `minicnmfe/online.py`
 composing existing `fit_extract` building blocks. Test: incremental ≈ batch (IoU + trace
 corr) on a synthetic movie. (Stage 2 [T3]: true frame-by-frame OnACID-E with online
 deconv + online MC.)

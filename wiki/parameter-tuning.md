@@ -1,5 +1,5 @@
 ---
-tags: [cnmfe, tuning, workflow, parameters]
+tags: [minicnmfe, tuning, workflow, parameters]
 ---
 
 # CNMFe — Automated Parameter-Tuning Workflow

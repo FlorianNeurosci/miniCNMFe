@@ -1,5 +1,5 @@
 ---
-tags: [cnmfe, math, algorithm]
+tags: [minicnmfe, math, algorithm]
 ---
 
 # CNMFe — Mathematical Description

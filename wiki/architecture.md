@@ -1,5 +1,5 @@
 ---
-tags: [cnmfe, architecture, modules]
+tags: [minicnmfe, architecture, modules]
 ---
 
 # CNMFe — Architecture & File Map
@@ -12,7 +12,7 @@ tags: [cnmfe, architecture, modules]
 
 ```
 D:\code\claude_cnmfe\
-├── cnmfe/                        # Main package
+├── minicnmfe/                        # Main package
 │   ├── __init__.py               # Public re-exports: CNMFe, CNMFeParams, load_movie
 │   ├── _utils.py                 # Shared low-level helpers (no algorithm logic)
 │   ├── io.py                     # File I/O: AVI/MP4 -> zarr, open/save zarr
@@ -176,7 +176,7 @@ Parallelism is **axis-aligned** — partitioning along frames, flattened pixels,
 
 CaImAn's `rf` parallelism splits the FOV into overlapping spatial tiles, runs full CNMF per tile in parallel, then stitches. That scales to FOVs that don't fit in RAM, at the cost of edge artefacts and a stitching/merge step across patch boundaries.
 
-`cnmfe/` parallelises along T / pixels / K instead. Every step sees the whole FOV, so there is no boundary stitching and no patch-boundary duplicate components — but the in-memory `(T, H, W)` movie is the hard ceiling. Motion correction already streams from zarr; the BCD stages (`update_spatial`, `update_temporal`, `compute_W`) currently require the full movie in RAM. For very large recordings, adding patch-based parallelism or zarr-streamed BCD would be the natural extensions.
+`minicnmfe/` parallelises along T / pixels / K instead. Every step sees the whole FOV, so there is no boundary stitching and no patch-boundary duplicate components — but the in-memory `(T, H, W)` movie is the hard ceiling. Motion correction already streams from zarr; the BCD stages (`update_spatial`, `update_temporal`, `compute_W`) currently require the full movie in RAM. For very large recordings, adding patch-based parallelism or zarr-streamed BCD would be the natural extensions.
 
 ---
 

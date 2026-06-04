@@ -15,10 +15,10 @@ from __future__ import annotations
 
 import numpy as np
 
-from cnmfe.initialization import detect_seeds, greedy_corr_pnr
-from cnmfe.motion_correction import estimate_shifts
-from cnmfe.preprocess import correlation_pnr
-from cnmfe.temporal import estimate_ar_params
+from minicnmfe.initialization import detect_seeds, greedy_corr_pnr
+from minicnmfe.motion_correction import estimate_shifts
+from minicnmfe.preprocess import correlation_pnr
+from minicnmfe.temporal import estimate_ar_params
 
 # ---------------------------------------------------------------------------
 # Stage 1 — motion correction

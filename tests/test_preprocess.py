@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from cnmfe.preprocess import (
+from minicnmfe.preprocess import (
     correlation_pnr,
     estimate_noise,
     local_correlations_fft,

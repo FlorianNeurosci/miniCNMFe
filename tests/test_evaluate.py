@@ -1,9 +1,9 @@
-"""Unit tests for cnmfe.evaluate."""
+"""Unit tests for minicnmfe.evaluate."""
 
 import numpy as np
 import scipy.sparse as sp
 
-from cnmfe.evaluate import auto_evaluate_components
+from minicnmfe.evaluate import auto_evaluate_components
 
 
 def _disk_footprint(H: int, W: int, cy: int, cx: int,

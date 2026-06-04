@@ -25,7 +25,7 @@ def synth_data():
 
 class TestCorrelationPNRParallel:
     def test_matches_serial(self, synth_data):
-        from cnmfe.preprocess import correlation_pnr
+        from minicnmfe.preprocess import correlation_pnr
         movie = synth_data["movie"]
         cn1, pnr1 = correlation_pnr(movie, sigma=3.0, n_jobs=1)
         cn2, pnr2 = correlation_pnr(movie, sigma=3.0, n_jobs=2)
@@ -33,7 +33,7 @@ class TestCorrelationPNRParallel:
         np.testing.assert_allclose(pnr1, pnr2, rtol=1e-5, atol=1e-5)
 
     def test_output_shape_parallel(self, synth_data):
-        from cnmfe.preprocess import correlation_pnr
+        from minicnmfe.preprocess import correlation_pnr
         movie = synth_data["movie"]
         _, H, W = movie.shape
         cn, pnr = correlation_pnr(movie, sigma=3.0, n_jobs=2)
@@ -47,8 +47,8 @@ class TestCorrelationPNRParallel:
 
 class TestComputeWParallel:
     def test_matches_serial(self, synth_data):
-        from cnmfe.background import compute_W
-        from cnmfe._utils import make_2d
+        from minicnmfe.background import compute_W
+        from minicnmfe._utils import make_2d
         d = synth_data
         Y_flat = make_2d(d["movie"])
         A = sp.csc_matrix(d["A_true"].astype(np.float32))
@@ -69,8 +69,8 @@ class TestComputeWParallel:
 
 class TestUpdateSpatialParallel:
     def test_matches_serial(self, synth_data):
-        from cnmfe.spatial import update_spatial
-        from cnmfe._utils import make_2d
+        from minicnmfe.spatial import update_spatial
+        from minicnmfe._utils import make_2d
         d = synth_data
         Y_flat = make_2d(d["movie"])
         A = sp.csc_matrix(d["A_true"].astype(np.float32))
@@ -85,8 +85,8 @@ class TestUpdateSpatialParallel:
         assert abs(diff).max() < 1e-5
 
     def test_non_negative_parallel(self, synth_data):
-        from cnmfe.spatial import update_spatial
-        from cnmfe._utils import make_2d
+        from minicnmfe.spatial import update_spatial
+        from minicnmfe._utils import make_2d
         d = synth_data
         Y_flat = make_2d(d["movie"])
         A = sp.csc_matrix(d["A_true"].astype(np.float32))
@@ -103,8 +103,8 @@ class TestUpdateSpatialParallel:
 
 class TestUpdateTemporalParallel:
     def test_matches_serial(self, synth_data):
-        from cnmfe.temporal import update_temporal
-        from cnmfe._utils import make_2d
+        from minicnmfe.temporal import update_temporal
+        from minicnmfe._utils import make_2d
         d = synth_data
         Y_flat = make_2d(d["movie"])
         A = sp.csc_matrix(d["A_true"].astype(np.float32))
@@ -121,8 +121,8 @@ class TestUpdateTemporalParallel:
         assert (S2 >= -1e-6).all()
 
     def test_non_negative_spikes_parallel(self, synth_data):
-        from cnmfe.temporal import update_temporal
-        from cnmfe._utils import make_2d
+        from minicnmfe.temporal import update_temporal
+        from minicnmfe._utils import make_2d
         d = synth_data
         Y_flat = make_2d(d["movie"])
         A = sp.csc_matrix(d["A_true"].astype(np.float32))
@@ -138,7 +138,7 @@ class TestUpdateTemporalParallel:
 class TestPipelineParallel:
     def test_pipeline_n_jobs_2(self, synth_data):
         """Full pipeline with n_jobs=2 should complete and return valid results."""
-        from cnmfe.pipeline import CNMFe, CNMFeParams
+        from minicnmfe.pipeline import CNMFe, CNMFeParams
         movie = synth_data["movie"]
         params = CNMFeParams(
             sigma=3.0,
@@ -159,7 +159,7 @@ class TestPipelineParallel:
 
     def test_pipeline_n_jobs_minus1(self, synth_data):
         """n_jobs=-1 (all CPUs) should complete without error."""
-        from cnmfe.pipeline import CNMFe, CNMFeParams
+        from minicnmfe.pipeline import CNMFe, CNMFeParams
         movie = synth_data["movie"]
         params = CNMFeParams(
             sigma=3.0,

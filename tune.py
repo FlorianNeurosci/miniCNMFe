@@ -167,7 +167,7 @@ def main() -> None:
     # Lazy imports so --help / --dry-run stay instant and matplotlib is headless.
     import matplotlib
     matplotlib.use("Agg")
-    from cnmfe.pipeline import CNMFeParams
+    from minicnmfe.pipeline import CNMFeParams
     from tuning.sweep import SweepSpec
     from tuning.tuner import TunerConfig
     from tuning.validate import tune_then_validate

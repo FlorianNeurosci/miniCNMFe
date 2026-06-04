@@ -1,5 +1,5 @@
 ---
-tags: [cnmfe, math, algorithm, background, extension]
+tags: [minicnmfe, math, algorithm, background, extension]
 ---
 
 # Sum-to-1 Constrained Ring Background
@@ -75,12 +75,12 @@ Cost: one extra RHS in a per-pixel solve that was already happening — negligib
 
 | File | What |
 |---|---|
-| `cnmfe/background.py:30-65`   | `_ring_pixel_batch` — CPU serial/joblib path |
-| `cnmfe/background.py:67-122`  | `_ring_pixel_batch_slab` — zarr-streaming path |
-| `cnmfe/background.py:154-242` | `_compute_W_gpu` — batched CuPy path |
-| `cnmfe/background.py:341-491` | `compute_W` — entry point + dispatcher |
-| `cnmfe/pipeline.py:50-130`    | `CNMFeParams.ring_constrain_sum` (new field) |
-| `cnmfe/pipeline.py:656, 760`  | Two `compute_W` call sites in `CNMFe.fit()` |
+| `minicnmfe/background.py:30-65`   | `_ring_pixel_batch` — CPU serial/joblib path |
+| `minicnmfe/background.py:67-122`  | `_ring_pixel_batch_slab` — zarr-streaming path |
+| `minicnmfe/background.py:154-242` | `_compute_W_gpu` — batched CuPy path |
+| `minicnmfe/background.py:341-491` | `compute_W` — entry point + dispatcher |
+| `minicnmfe/pipeline.py:50-130`    | `CNMFeParams.ring_constrain_sum` (new field) |
+| `minicnmfe/pipeline.py:656, 760`  | Two `compute_W` call sites in `CNMFe.fit()` |
 | `tests/test_background.py`    | `TestRingConstrainSum` — 4 tests |
 
 ## Verification

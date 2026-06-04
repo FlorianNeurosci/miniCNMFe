@@ -13,7 +13,7 @@ targets visual fidelity to a real session (`demo_movies/demo_session`):
   background that they show up as discrete bright dots in a std projection.
 - **Calcium dynamics from a real indicator** (GCaMP8m by default) via
   ``decay_time_ms``; physically meaningful AR(1) ``g`` from
-  ``cnmfe.temporal.g_from_decay_time``.
+  ``minicnmfe.temporal.g_from_decay_time``.
 - **Modest active neuropil** at fine spatial scale — adds the slow textured
   background of real data without swamping the cells.
 - Multi-component slow drift + ghost cells (out-of-focus blurry distractors,
@@ -306,7 +306,7 @@ def make_miniscope_movie(
 
     # -------------------- calcium traces (AR(1)) -------------------------------
     if decay_time_ms is not None:
-        from cnmfe.temporal import g_from_decay_time
+        from minicnmfe.temporal import g_from_decay_time
         tau_k = decay_time_ms * (1.0 + decay_time_jitter * rng.uniform(-1.0, 1.0, size=K))
         tau_k = np.clip(tau_k, 1.0, None)
         g_true = np.array(
@@ -340,7 +340,7 @@ def make_miniscope_movie(
     # (a) Subtle active neuropil — fine texture, not a dominant cloud.
     if npil_active and npil_n_components > 0:
         from scipy.signal import lfilter
-        from cnmfe.temporal import g_from_decay_time as _g_from_tau
+        from minicnmfe.temporal import g_from_decay_time as _g_from_tau
         g_npil = (_g_from_tau(decay_time_ms, fps) if decay_time_ms is not None
                   else float(np.mean(g_true)))
         for _ in range(npil_n_components):
@@ -484,7 +484,7 @@ def make_miniscope_movie(
     # -------------------- inter-frame motion (optional) -----------------------
     if motion_max_shift > 0:
         from scipy.ndimage import uniform_filter1d
-        from cnmfe.motion_correction import apply_shift as _apply_shift
+        from minicnmfe.motion_correction import apply_shift as _apply_shift
         rng_m = np.random.default_rng(seed + 1 if motion_seed is None else motion_seed)
         steps = rng_m.normal(0, motion_max_shift / 10, size=(T, 2)).astype(np.float64)
         drift = np.cumsum(steps, axis=0)

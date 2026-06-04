@@ -66,8 +66,8 @@ def main() -> None:
                         help="Write Y_flat uncompressed (try on local SSD)")
     args = parser.parse_args()
 
-    from cnmfe.io import open_zarr
-    from cnmfe.pipeline import CNMFe, CNMFeParams
+    from minicnmfe.io import open_zarr
+    from minicnmfe.pipeline import CNMFe, CNMFeParams
 
     zarr_path: Path = args.zarr.resolve()
     if not zarr_path.exists():

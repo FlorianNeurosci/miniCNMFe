@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from cnmfe.motion_correction import (
+from minicnmfe.motion_correction import (
     apply_shift,
     estimate_shifts,
     motion_correction_rigid,

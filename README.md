@@ -1,6 +1,6 @@
-# CNMFe
+# minicnmfe
 
-A clean Python implementation of **Constrained Non-negative Matrix Factorization for Endoscopic data** (CNMFe) — the standard algorithm for extracting neurons from 1-photon calcium imaging recordings.
+A clean Python implementation of **CNMF-E** (Constrained Non-negative Matrix Factorization for Endoscopic data) for 1-photon **miniscope** calcium imaging — the standard algorithm for extracting neurons from miniscope recordings.
 
 No CaImAn code imported. The CaImAn source is used as an algorithmic reference only; all math is reimplemented from scratch using numpy / scipy / scikit-image / scikit-learn.
 
@@ -51,8 +51,8 @@ AVI / zarr movie  (T × H × W)
 Requires Python ≥ 3.10.
 
 ```bash
-git clone https://github.com/yourname/cnmfe.git
-cd cnmfe
+git clone https://github.com/yourname/minicnmfe.git
+cd minicnmfe
 pip install -e .
 ```
 
@@ -85,8 +85,8 @@ pip install -e ".[dev]"          # test + tutorial + oasis + ruff
 ## Quick start
 
 ```python
-from cnmfe import CNMFe, CNMFeParams
-from cnmfe.io import avi_to_zarr
+from minicnmfe import CNMFe, CNMFeParams
+from minicnmfe.io import avi_to_zarr
 
 # Convert video to zarr (streams frame-by-frame, never loads full movie)
 movie = avi_to_zarr("recording.avi", "/tmp/movie.zarr")
@@ -108,7 +108,7 @@ From a numpy array (no video file):
 
 ```python
 import numpy as np
-from cnmfe import CNMFe, CNMFeParams
+from minicnmfe import CNMFe, CNMFeParams
 
 movie = np.load("movie.npy")   # (T, H, W) float32
 model = CNMFe(CNMFeParams(sigma=3.0)).fit(movie, do_motion_correction=False)
@@ -198,7 +198,7 @@ A comprehensive pytest suite (127 tests at the time of writing) covers every mod
 ## Project structure
 
 ```
-cnmfe/
+minicnmfe/
 ├── __init__.py            # Public API: CNMFe, CNMFeParams, auto_evaluate_components, ...
 ├── _utils.py              # Shared helpers (make_2d, get_xp, to_numpy, ...)
 ├── io.py                  # AVI/MP4 -> zarr converter, open/save zarr

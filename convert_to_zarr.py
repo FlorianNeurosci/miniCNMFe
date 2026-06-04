@@ -5,7 +5,7 @@ Usage (from project root):
 
 Skips AVIs whose zarr already exists (idempotent).
 The zarr stores are time-chunked (100 frames per chunk) and can be opened
-lazily with cnmfe.io.open_zarr() without loading the full movie into RAM.
+lazily with minicnmfe.io.open_zarr() without loading the full movie into RAM.
 """
 
 from __future__ import annotations
@@ -14,9 +14,10 @@ from pathlib import Path
 
 
 def main() -> None:
-    from cnmfe.io import avi_to_zarr
+    from minicnmfe.io import avi_to_zarr
 
     demo_dir = Path("demo_movies")
+    demo_dir = Path('real_vids')
     if not demo_dir.exists():
         print("demo_movies/ not found. Run generate_demo_movies.py first.")
         return
@@ -35,7 +36,7 @@ def main() -> None:
         z = avi_to_zarr(avi_path, zarr_path, chunk_t=100, grayscale=True)
         print(f"shape={z.shape}  chunks={z.chunks}")
 
-    print("\nDone. Open zarrs lazily with  cnmfe.io.open_zarr('demo_movies/<name>.zarr')")
+    print("\nDone. Open zarrs lazily with  minicnmfe.io.open_zarr('demo_movies/<name>.zarr')")
 
 
 if __name__ == "__main__":

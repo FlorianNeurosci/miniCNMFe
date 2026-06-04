@@ -15,7 +15,7 @@ Two depth modes:
   SNR). Slower, but lets you judge real output quality.
 
 The heuristics are lifted from ``live_runs/estimate_params.ipynb``; the sweep +
-quality metrics + report rendering are new. Nothing here changes ``cnmfe``
+quality metrics + report rendering are new. Nothing here changes ``minicnmfe``
 defaults — the tuner only reads/runs the pipeline.
 
 Public API::

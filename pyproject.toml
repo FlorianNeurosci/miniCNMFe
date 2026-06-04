@@ -1,7 +1,7 @@
 [project]
-name = "cnmfe"
+name = "minicnmfe"
 version = "0.1.0"
-description = "Clean CNMFe implementation for 1-photon calcium imaging"
+description = "minicnmfe — clean CNMF-E for 1-photon miniscope calcium imaging"
 requires-python = ">=3.10"
 dependencies = [
     "numpy >= 1.24",
@@ -22,14 +22,14 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest >= 7.0", "pytest-cov"]
 tutorial = ["jupyter", "matplotlib >= 3.7", "ipywidgets"]
-# Faster OASIS deconvolution. Without it `cnmfe/temporal.py` falls back to
+# Faster OASIS deconvolution. Without it `minicnmfe/temporal.py` falls back to
 # a pure-Python PAVA AR(1) solver (same algorithm, slower for long traces).
 oasis = ["oasis-deconvolution"]
 # Install cupy matching your CUDA version, e.g.:
 #   pip install cupy-cuda12x   (CUDA 12.x)
 #   pip install cupy-cuda11x   (CUDA 11.x)
 gpu = ["cupy-cuda12x >= 12.0"]
-dev = ["cnmfe[test,tutorial,oasis]", "ruff"]
+dev = ["minicnmfe[test,tutorial,oasis]", "ruff"]
 
 [build-system]
 requires = ["setuptools >= 61", "wheel"]
@@ -37,7 +37,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["cnmfe*"]
+include = ["minicnmfe*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

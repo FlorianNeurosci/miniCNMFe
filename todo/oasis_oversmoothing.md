@@ -29,9 +29,9 @@ green `C` collapses most of the data into one event + smooth AR tail.
 OASIS in this codebase has two implementations behind a common API:
 
 - `oasis-deconvolution` package, called with `penalty=1, g=(g_k,), sn=sn_k`
-  (`cnmfe/temporal.py:248-265`). Penalty=1 ⇒ L1-spike + noise-budget;
+  (`minicnmfe/temporal.py:248-265`). Penalty=1 ⇒ L1-spike + noise-budget;
   `g` and baseline are **fixed** (no `optimize_g`, no `optimize_b`).
-- Pure-Python fallback `_oasis_ar1_pava` (`cnmfe/temporal.py:159-221`),
+- Pure-Python fallback `_oasis_ar1_pava` (`minicnmfe/temporal.py:159-221`),
   which solves `min ‖y − c‖² + λ·Σ s[t]` s.t. AR(1) monotonicity, with
   **λ chosen by bisection so `‖y−c‖² ≈ T·sn²`**.
 
@@ -39,9 +39,9 @@ Three knobs control the smoothing:
 
 | Knob | Where it's set | Failure mode (over-smoothing) |
 |---|---|---|
-| `g` (AR coefficient) | `estimate_ar_params` on pooled `C_raw.ravel()` (`cnmfe/pipeline.py:906-916`), capped at `fudge_factor=0.96` | Too high → each spike's AR tail swallows the next spike → "shark fin" |
-| `sn_per_k` | `_sn_from_footprint(A[:,k], sn_flat)` (`cnmfe/pipeline.py:46-71, 919, 932`) | Too high → noise-budget target `T·sn²` is loose → λ pushed up → only the biggest spikes survive |
-| What's in `y` | Projected trace `(YrA[:,k]/nA[k] + C[k])` (`cnmfe/temporal.py:415`) | Slow drift in `y` → OASIS spends its noise budget on the drift residual → no budget left for small-spike resolution |
+| `g` (AR coefficient) | `estimate_ar_params` on pooled `C_raw.ravel()` (`minicnmfe/pipeline.py:906-916`), capped at `fudge_factor=0.96` | Too high → each spike's AR tail swallows the next spike → "shark fin" |
+| `sn_per_k` | `_sn_from_footprint(A[:,k], sn_flat)` (`minicnmfe/pipeline.py:46-71, 919, 932`) | Too high → noise-budget target `T·sn²` is loose → λ pushed up → only the biggest spikes survive |
+| What's in `y` | Projected trace `(YrA[:,k]/nA[k] + C[k])` (`minicnmfe/temporal.py:415`) | Slow drift in `y` → OASIS spends its noise budget on the drift residual → no budget left for small-spike resolution |
 
 ## What this run does specifically
 
@@ -77,7 +77,7 @@ Both knobs are already on `CNMFeParams`. In notebook 02 cell
 | Param | From | To | Rationale |
 |---|---|---|---|
 | `fudge_factor` | 0.96 (default) | 0.85 | Cuts `g` from ~0.959 → ~0.85, τ from 24f → 6f. Less sticky AR ⇒ small spikes don't get swallowed by the prior decay. |
-| `temporal_detrend_order` | 0 (default) | 1 | Subtracts a linear trend from each projected trace *just before* OASIS (`cnmfe/temporal.py:417-420`). Removes the slow drift component that's eating the noise budget. Does **not** change `C + YrA` — the drift naturally flows into `YrA`. |
+| `temporal_detrend_order` | 0 (default) | 1 | Subtracts a linear trend from each projected trace *just before* OASIS (`minicnmfe/temporal.py:417-420`). Removes the slow drift component that's eating the noise budget. Does **not** change `C + YrA` — the drift naturally flows into `YrA`. |
 
 Run cells 11→17. Inspect:
 
@@ -129,9 +129,9 @@ path; `fudge_factor` only matters when the prior is disabled.
 
 ## Critical files (read-only references)
 
-- `cnmfe/temporal.py:159-221` — `_oasis_ar1_pava` (the actual smoother).
-- `cnmfe/temporal.py:308-464` — `update_temporal` (cache plumbing + call site).
-- `cnmfe/pipeline.py:46-71` — `_sn_from_footprint`.
-- `cnmfe/pipeline.py:906-932` — global vs per-component `g` + `sn` init.
+- `minicnmfe/temporal.py:159-221` — `_oasis_ar1_pava` (the actual smoother).
+- `minicnmfe/temporal.py:308-464` — `update_temporal` (cache plumbing + call site).
+- `minicnmfe/pipeline.py:46-71` — `_sn_from_footprint`.
+- `minicnmfe/pipeline.py:906-932` — global vs per-component `g` + `sn` init.
 - `todo/temporal_followups.md` — companion notes; section #1 documents
   the upstream g-bias the A/B is trying to compensate for.

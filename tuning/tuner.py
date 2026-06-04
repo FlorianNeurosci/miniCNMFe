@@ -15,8 +15,8 @@ from pathlib import Path
 
 import numpy as np
 
-from cnmfe.io import open_zarr
-from cnmfe.pipeline import CNMFe, CNMFeParams
+from minicnmfe.io import open_zarr
+from minicnmfe.pipeline import CNMFe, CNMFeParams
 from tuning import heuristics as H
 from tuning import io_sample as S
 from tuning.metrics import mc_quality

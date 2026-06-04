@@ -66,7 +66,7 @@ the new MC method branch:
   to the per-session preprocessed dir. Then add a matching
   `extraction_method = "simpler_cnmfe"` branch on
   `ComponentExtraction.make()` that loads the zarr via
-  `cnmfe.io.open_zarr(...)` and calls
+  `minicnmfe.io.open_zarr(...)` and calls
   `CNMFe(params).fit(zarr, do_motion_correction=False)`. **Zarr only
   crosses the simpler_cnmfe boundary**; the rest of the DB schema stays
   untouched. The `MotionCorrectionTask.mc_output_dir` field stores the
@@ -80,7 +80,7 @@ the new MC method branch:
 
 DB stores extraction params as a CaImAn-flavoured dict (line 2238).
 `simpler_cnmfe.CNMFeParams` uses different field names and one different
-unit. Translation the adapter needs to do (CaImAn → cnmfe):
+unit. Translation the adapter needs to do (CaImAn → minicnmfe):
 
 | CaImAn key | simpler_cnmfe field | Notes |
 |---|---|---|
@@ -134,7 +134,7 @@ simpler_cnmfe's `model.save(out_dir)` writes a **directory** with
 DB stores `x_shifts`, `y_shifts`, `x_std`, `y_std`,
 `mc_total_template` after caiman MC. simpler_cnmfe gives us
 `model.shifts` `(T, 2) float32` already; template is currently internal
-to `_build_template_from_strided_avis` in `cnmfe/avi_mc.py`. Decide:
+to `_build_template_from_strided_avis` in `minicnmfe/avi_mc.py`. Decide:
 
 - Reuse `RigidMotionCorrectionCaiman` (slightly confusing name but
   zero schema change), OR
@@ -191,7 +191,7 @@ standalone, keep it.
 1. Widen `_numeric_key` regex in `concat_avis_to_zarr.py:73-76` to
    accept `\d+(_ds)?`.
 2. *(Optional)* Save `mc_template.npy` alongside `mc.zarr` +
-   `shifts.npy` in `concat_avis_to_mc_zarr` (cnmfe/avi_mc.py) so the
+   `shifts.npy` in `concat_avis_to_mc_zarr` (minicnmfe/avi_mc.py) so the
    DB can populate the rigid-MC results table without an extra pass.
 
 **Everything else inside `CalciumImagingPipelineDB`:**
@@ -203,7 +203,7 @@ standalone, keep it.
   rigid-MC results table.
 - Add `"simpler_cnmfe"` row to `ComponentExtractionMethod`; add a
   `make()` branch on `ComponentExtraction` that opens the zarr via
-  `cnmfe.io.open_zarr(...)`, builds `CNMFeParams` via a
+  `minicnmfe.io.open_zarr(...)`, builds `CNMFeParams` via a
   `caiman_params_to_cnmfe_params(...)` helper (handles the rename +
   the `decay_time` s→ms conversion + the temporal-ds frame-rate
   adjustment), calls `CNMFe(params).fit(z, do_motion_correction=False,

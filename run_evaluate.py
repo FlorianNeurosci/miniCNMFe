@@ -29,7 +29,7 @@ def main() -> None:
                         help="Override mean-amplitude SNR acceptance threshold")
     args = parser.parse_args()
 
-    from cnmfe.pipeline import CNMFe
+    from minicnmfe.pipeline import CNMFe
 
     results_dir: Path = args.results.resolve()
     if not results_dir.is_dir():

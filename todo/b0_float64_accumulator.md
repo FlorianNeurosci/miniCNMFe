@@ -5,7 +5,7 @@
 
 ## What
 
-In `cnmfe/background.py:compute_W`, the streaming baseline reduction sums `Y_flat[s:e]` along the time axis in float32:
+In `minicnmfe/background.py:compute_W`, the streaming baseline reduction sums `Y_flat[s:e]` along the time axis in float32:
 
 ```python
 C_sum = np.asarray(C.sum(axis=1), dtype=np.float32)

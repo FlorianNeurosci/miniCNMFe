@@ -1,6 +1,6 @@
 """Tests for the spatial/temporal cutout (crop) feature.
 
-Covers the resolution/apply helpers (``cnmfe/cutout.py``), the
+Covers the resolution/apply helpers (``minicnmfe/cutout.py``), the
 ``CNMFeParams`` fields + serialisation, the ``fit`` wiring + ``self.cutout``
 recording, the ``place_in_full_fov`` map-back, and the fused AVI->MC crop.
 """
@@ -11,14 +11,14 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from cnmfe.cutout import (
+from minicnmfe.cutout import (
     apply_cutout,
     place_footprints_in_fov,
     place_traces_in_timeline,
     resolve_cutout,
 )
-from cnmfe.io import open_zarr, save_zarr
-from cnmfe.pipeline import CNMFe, CNMFeParams
+from minicnmfe.io import open_zarr, save_zarr
+from minicnmfe.pipeline import CNMFe, CNMFeParams
 
 
 # --------------------------------------------------------------------------
@@ -196,7 +196,7 @@ def test_fit_on_cutout_and_place_back(synth):
 def test_cutout_incompatible_with_y_flat_zarr(synth_small, tmp_path):
     movie = synth_small["movie"]
     save_zarr(movie, tmp_path / "m.zarr")
-    from cnmfe.io import transpose_zarr_to_pixel_major
+    from minicnmfe.io import transpose_zarr_to_pixel_major
     yf = transpose_zarr_to_pixel_major(tmp_path / "m.zarr", tmp_path / "yf.zarr",
                                        verbose=False)
     p = CNMFeParams(spatial_crop=(2, 20, 2, 20), n_jobs=1)

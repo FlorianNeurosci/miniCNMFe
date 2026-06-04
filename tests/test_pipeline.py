@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from cnmfe.pipeline import CNMFe, CNMFeParams
+from minicnmfe.pipeline import CNMFe, CNMFeParams
 
 
 def match_components(A_est: sp.csc_matrix, A_true: np.ndarray) -> list[tuple[int, int, float]]:
@@ -333,7 +333,7 @@ class TestCNMFePipeline:
         materialisation (no streaming yet — that requires disk transpose).
         This test pins the API and the round-trip equivalence.
         """
-        from cnmfe.io import save_zarr
+        from minicnmfe.io import save_zarr
 
         movie_np = synth_small["movie"].astype(np.float32)
         zarr_path = tmp_path / "movie.zarr"
@@ -441,7 +441,7 @@ class TestCNMFePipeline:
 
         Phase F4 regression — pins the streaming-extraction API end-to-end.
         """
-        from cnmfe.io import save_zarr, transpose_zarr_to_pixel_major
+        from minicnmfe.io import save_zarr, transpose_zarr_to_pixel_major
         import zarr as _zarr
 
         movie_np = synth_small["movie"].astype(np.float32)
@@ -482,7 +482,7 @@ class TestCNMFePipeline:
         trivial n_iter_main=1 case. Also pins that ``model.C_raw`` ends up
         aligned with ``model.A`` (Fix 1) on the streaming path.
         """
-        from cnmfe.io import save_zarr, transpose_zarr_to_pixel_major
+        from minicnmfe.io import save_zarr, transpose_zarr_to_pixel_major
         import zarr as _zarr
 
         movie_np = synth["movie"].astype(np.float32)
@@ -540,7 +540,7 @@ class TestCNMFePipeline:
         # YrA (and hence the projected trace C+YrA) is the quantity built most
         # directly from BackgroundSubtractor.project_onto -- the ONE place the
         # numpy and zarr paths use different formulas (algebraic identity vs
-        # per-batch accumulation; cnmfe/background.py project_onto). Pin it so
+        # per-batch accumulation; minicnmfe/background.py project_onto). Pin it so
         # that float-level divergence there can never grow unnoticed.
         np.testing.assert_allclose(m_str.YrA, m_mem.YrA, atol=1e-3, rtol=1e-3)
         np.testing.assert_allclose(
@@ -556,7 +556,7 @@ class TestCNMFePipeline:
         parallelism and assert the same components, footprints, traces, spikes,
         and projected trace.
         """
-        from cnmfe.io import save_zarr, transpose_zarr_to_pixel_major
+        from minicnmfe.io import save_zarr, transpose_zarr_to_pixel_major
         import zarr as _zarr
 
         movie_np = synth["movie"].astype(np.float32)
@@ -608,7 +608,7 @@ class TestCNMFePipeline:
 
         Pins the auto-streaming convenience layer and its idempotency.
         """
-        from cnmfe.io import save_zarr
+        from minicnmfe.io import save_zarr
         import zarr as _zarr
 
         movie_np = synth_small["movie"].astype(np.float32)
@@ -666,7 +666,7 @@ class TestCNMFePipeline:
         (c) leave the extracted results identical to the in-memory path — these
         knobs only affect on-disk IO, never the numerics.
         """
-        from cnmfe.io import save_zarr
+        from minicnmfe.io import save_zarr
         import zarr as _zarr
 
         movie_np = synth_small["movie"].astype(np.float32)
@@ -712,7 +712,7 @@ class TestCNMFePipeline:
 
     def test_fit_Y_flat_zarr_rejects_bad_shape(self, synth_small, tmp_path):
         """Shape mismatch between Y_flat_zarr and the movie must raise."""
-        from cnmfe.io import save_zarr
+        from minicnmfe.io import save_zarr
         import zarr as _zarr
 
         movie_np = synth_small["movie"].astype(np.float32)
@@ -734,7 +734,7 @@ class TestCNMFePipeline:
 
     def test_fit_Y_flat_zarr_requires_zarr_movie(self, synth_small, tmp_path):
         """Passing Y_flat_zarr with a numpy movie should error loudly."""
-        from cnmfe.io import save_zarr, transpose_zarr_to_pixel_major
+        from minicnmfe.io import save_zarr, transpose_zarr_to_pixel_major
 
         movie_np = synth_small["movie"].astype(np.float32)
         src_path = tmp_path / "src.zarr"
@@ -814,7 +814,7 @@ class TestCNMFePipeline:
         compared to real sigma=3 Gaussians (~130 px after threshold_footprint
         at max_thr=0.1).
 
-        Auto-eval (cnmfe.evaluate.auto_evaluate_components, called from
+        Auto-eval (minicnmfe.evaluate.auto_evaluate_components, called from
         CNMFe.fit after the BCD loop) flags such components on
         ``model.accepted_mask`` so they can be filtered post-hoc. All
         components remain on the model so the user can also inspect the
@@ -896,7 +896,7 @@ class TestGlobalBgRank1:
         what's left is the *deviation* of vignette·baseline from a
         ring-smoothed version, which need not look like vignette pointwise.
         """
-        from cnmfe.background import BackgroundSubtractor
+        from minicnmfe.background import BackgroundSubtractor
 
         data = self._make_drifty_movie()
         # Bleach scenario: opt in to the polynomial detrend so OASIS gets

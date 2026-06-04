@@ -8,7 +8,7 @@ frames of ``tests/data/real_0.avi`` (600×600 px) with the following parameters:
 The saved array (shape (1000, 2)) contains CaImAn's ``shifts_rig`` — the
 (dy, dx) correction applied to each frame (i.e. negative of motion).
 
-``motion_correction_rigid`` (cnmfe/motion_correction.py) is the validated
+``motion_correction_rigid`` (minicnmfe/motion_correction.py) is the validated
 implementation that reproduces CaImAn's results.
 
 On first run the AVI is converted to ``tests/data/real_0.zarr`` automatically;
@@ -44,13 +44,13 @@ requires_real_data = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def mc_result():
     """Load zarr (converting from AVI on first run), run motion_correction_rigid."""
-    from cnmfe.motion_correction import motion_correction_rigid
+    from minicnmfe.motion_correction import motion_correction_rigid
 
     if ZARR_PATH.exists():
-        from cnmfe.io import open_zarr
+        from minicnmfe.io import open_zarr
         zarr_movie = open_zarr(ZARR_PATH)
     elif VIDEO_PATH.exists():
-        from cnmfe.io import avi_to_zarr
+        from minicnmfe.io import avi_to_zarr
         zarr_movie = avi_to_zarr(VIDEO_PATH, ZARR_PATH)
     else:
         pytest.skip("neither zarr nor AVI source available")

@@ -1,5 +1,5 @@
 ---
-tags: [cnmfe, api, reference]
+tags: [minicnmfe, api, reference]
 ---
 
 # CNMFe — API Reference
@@ -8,7 +8,7 @@ tags: [cnmfe, api, reference]
 
 ---
 
-## `cnmfe.pipeline` — Top-level orchestrator
+## `minicnmfe.pipeline` — Top-level orchestrator
 
 ### `CNMFeParams`
 
@@ -110,11 +110,11 @@ class CNMFeParams:
 
 **Cutout.** When any of `temporal_crop` / `spatial_crop` / `spatial_mask_path` is
 set, the movie is cropped **once at ingestion, before motion correction**, in
-native coordinates (see `cnmfe.cutout`). The applied spec is recorded on
+native coordinates (see `minicnmfe.cutout`). The applied spec is recorded on
 `model.cutout`. A cutout **cannot be combined with a pre-built `Y_flat_zarr`**
 (bake the crop in upstream instead), and `.downscaled()` **clears** the cutout
 fields since the crop is applied at native resolution. Use
-`cnmfe.cutout.place_footprints_in_fov` / `place_traces_in_timeline` to map cropped
+`minicnmfe.cutout.place_footprints_in_fov` / `place_traces_in_timeline` to map cropped
 results back onto the full FOV / timeline.
 
 **Downsample-once rescale.** `params.downscaled(ssub, tsub)` returns a **copy**
@@ -194,7 +194,7 @@ def evaluate(self) -> "CNMFe": ...
 - `fit_extract` — noise estimation through the BCD loop, final temporal pass, and `YrA`. **Resolution-agnostic**: runs on whatever movie it is handed (full or downsampled). Contains the streaming `Y_flat_zarr` auto-derive logic.
 - `evaluate` — the non-destructive auto-eval. Reads **only** `self.A` + `self.sn`, so it can be re-run on a freshly `load()`-ed model to retune `min_pixel` / `auto_eval_snr_amp_thr` without re-extracting.
 
-**Fused AVI → motion-corrected zarr** (wraps `cnmfe.avi_mc.concat_avis_to_mc_zarr`, documented below):
+**Fused AVI → motion-corrected zarr** (wraps `minicnmfe.avi_mc.concat_avis_to_mc_zarr`, documented below):
 
 ```python
 def fit_mc_from_avis(
@@ -267,7 +267,7 @@ plus `accepted_mask.npy` and `eval_info.npz`; `load()` restores them.
 | `shifts` | `np.ndarray \| None` | `(T, 2)` | Per-frame (dy, dx) shifts, or `None` |
 | `accepted_mask` | `np.ndarray` | `(K,)` bool | Components passing both auto-eval checks (pixel-count floor AND mean-amplitude SNR). **Nothing is dropped** — slice `A`/`C`/`S`/`YrA` by this mask to use accepted components only. |
 | `eval_info` | `dict` | — | Per-component auto-eval stats: `pixel_count`, `snr_amp`, `pixel_pass`, `snr_pass`, plus the thresholds applied. |
-| `cutout` | `dict \| None` | — | Applied cutout spec (`bbox`, `t_range`, mask path) when a cutout was used; `None` otherwise. Footprints/traces are in cropped coordinates — use `cnmfe.cutout` helpers to place them back in the full FOV/timeline. |
+| `cutout` | `dict \| None` | — | Applied cutout spec (`bbox`, `t_range`, mask path) when a cutout was used; `None` otherwise. Footprints/traces are in cropped coordinates — use `minicnmfe.cutout` helpers to place them back in the full FOV/timeline. |
 | `dims` | `tuple[int, int]` | — | `(H, W)` image dimensions |
 
 > [!TIP]
@@ -275,7 +275,7 @@ plus `accepted_mask.npy` and `eval_info.npz`; `load()` restores them.
 
 ---
 
-## `cnmfe.io` — File I/O
+## `minicnmfe.io` — File I/O
 
 ### `avi_to_zarr`
 
@@ -357,7 +357,7 @@ Open a pixel-major `(H·W, T)` store produced by `transpose_zarr_to_pixel_major`
 
 ---
 
-## `cnmfe.motion_correction`
+## `minicnmfe.motion_correction`
 
 ### `motion_correction_rigid`
 
@@ -435,7 +435,7 @@ Apply a `(dy, dx)` shift to `img` (alias for `apply_shift_caiman`, which uses
 
 ---
 
-## `cnmfe.avi_mc` — Fused AVI → motion-corrected zarr
+## `minicnmfe.avi_mc` — Fused AVI → motion-corrected zarr
 
 ### `concat_avis_to_mc_zarr`
 
@@ -476,7 +476,7 @@ to `motion_correction_rigid` for the remaining passes.
 
 ---
 
-## `cnmfe.downsample` — Spatial/temporal binning + re-upsampling
+## `minicnmfe.downsample` — Spatial/temporal binning + re-upsampling
 
 ### `downsample_movie`
 
@@ -528,7 +528,7 @@ Used by `CNMFe.upsample_to_native` — **interpolation, not recovery**.
 
 ---
 
-## `cnmfe.detrend` — Rolling-percentile baseline removal
+## `minicnmfe.detrend` — Rolling-percentile baseline removal
 
 ### `detrend_movie`
 
@@ -557,7 +557,7 @@ baseline knots for speed. Returns the open detrended `zarr.Array`.
 
 ---
 
-## `cnmfe.reject_frames` — Outlier-frame replacement
+## `minicnmfe.reject_frames` — Outlier-frame replacement
 
 ### `reject_outlier_frames`
 
@@ -582,7 +582,7 @@ which frames were replaced.
 
 ---
 
-## `cnmfe.cutout` — Crop the movie before extraction
+## `minicnmfe.cutout` — Crop the movie before extraction
 
 The cutout is normally **param-driven**: set `CNMFeParams.temporal_crop` /
 `spatial_crop` / `spatial_mask_path` and `CNMFe.fit` / `fit_extract` apply it once
@@ -609,7 +609,7 @@ Embed cropped traces `(K, T_win)` into a full `(K, orig_T)` timeline at
 
 ---
 
-## `cnmfe.preprocess`
+## `minicnmfe.preprocess`
 
 ### `correlation_pnr`
 
@@ -669,7 +669,7 @@ def local_correlations_fft(movie: np.ndarray) -> np.ndarray
 
 ---
 
-## `cnmfe.background`
+## `minicnmfe.background`
 
 ### `compute_W`
 
@@ -724,7 +724,7 @@ For each pixel (flat index), return flat indices of pixels in its ring neighbour
 
 ---
 
-## `cnmfe.initialization`
+## `minicnmfe.initialization`
 
 ### `greedy_corr_pnr`
 
@@ -830,7 +830,7 @@ Extract `(ai, ci, success)` for a single candidate neuron. Returns footprint pat
 
 ---
 
-## `cnmfe.spatial`
+## `minicnmfe.spatial`
 
 ### `update_spatial`
 
@@ -887,7 +887,7 @@ Clean a spatial footprint: median filter → zero pixels below `max_thr × max` 
 
 ---
 
-## `cnmfe.temporal`
+## `minicnmfe.temporal`
 
 ### `g_from_decay_time` / `decay_time_from_g`
 
@@ -973,7 +973,7 @@ Estimate AR(p) decay constants `g` (shape `(p,)`) and noise std `sn` from a trac
 
 ---
 
-## `cnmfe.merging`
+## `minicnmfe.merging`
 
 ### `merge_components`
 
@@ -1008,7 +1008,7 @@ The centre-distance fallback catches duplicate detections of the same neuron who
 
 ---
 
-## `cnmfe.evaluate`
+## `minicnmfe.evaluate`
 
 ### `auto_evaluate_components`
 
@@ -1036,13 +1036,13 @@ Two checks must both pass:
 
    Real σ=3 Gaussian footprints typically score 10–70 here; ghost components born from background-noise seeds (e.g. under loose `min_corr` / `min_pnr` thresholds) sit at or below 2 even when their pixel count is large. At `snr_amp_thr=3.0` the test cleanly separates real and ghost components.
 
-`sn_flat` is the same per-pixel noise std produced by `cnmfe.preprocess.estimate_noise(...).ravel()` — the pipeline reuses its own `self.sn` for this call.
+`sn_flat` is the same per-pixel noise std produced by `minicnmfe.preprocess.estimate_noise(...).ravel()` — the pipeline reuses its own `self.sn` for this call.
 
 Pipeline-level knob: `CNMFeParams.auto_eval_snr_amp_thr` (default `3.0`). Setting it to `0.0` disables the SNR check; `min_pixel` continues to apply.
 
 ---
 
-## `cnmfe._utils`
+## `minicnmfe._utils`
 
 ### `make_2d`
 

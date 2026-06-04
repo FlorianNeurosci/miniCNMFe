@@ -35,7 +35,7 @@ def main() -> None:
                         help="Rewrite the output even if it already exists")
     args = parser.parse_args()
 
-    from cnmfe.downsample import downsample_movie
+    from minicnmfe.downsample import downsample_movie
 
     zarr_path: Path = args.zarr.resolve()
     if not zarr_path.exists():

@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from cnmfe.spatial import compute_support, threshold_footprint, update_spatial
+from minicnmfe.spatial import compute_support, threshold_footprint, update_spatial
 
 
 class TestComputeSupport:

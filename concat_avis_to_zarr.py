@@ -14,7 +14,7 @@ unless you pass --pattern to change the glob.
 Output zarr is time-chunked (100 frames/chunk), uint8, shape (T_total, H, W),
 with lossless blosc lz4+bitshuffle compression. Use --dtype float32 for
 float-valued intermediates.
-It can be opened lazily with  cnmfe.io.open_zarr(output_path).
+It can be opened lazily with  minicnmfe.io.open_zarr(output_path).
 
 Optional inline downsampling (``--ssub`` / ``--tsub``) bins the frames as they
 are decoded, so the *only* zarr written is the (downsampled) output — no
@@ -410,7 +410,7 @@ def concat_avis_to_zarr(
         if skip_if_exists:
             if verbose:
                 print(f"Output already exists, reusing: {out_path}")
-            from cnmfe.io import open_zarr
+            from minicnmfe.io import open_zarr
             return open_zarr(out_path)
         raise FileExistsError(
             f"Output already exists: {out_path}. "
@@ -470,7 +470,7 @@ def concat_avis_to_zarr(
 
     # --- Create zarr --------------------------------------------------------
     _t0_create = _time.time()
-    from cnmfe.io import _open_array
+    from minicnmfe.io import _open_array
     store = _open_array(out_path, "w",
                         shape=(T_out, out_H, out_W),
                         chunks=(min(chunk_t, T_out), out_H, out_W),
@@ -717,7 +717,7 @@ def main() -> None:
 
     out_path = args.output if args.output else args.folder.resolve() / "movie.zarr"
     print(f"\nLoad lazily with:")
-    print(f"  from cnmfe.io import open_zarr")
+    print(f"  from minicnmfe.io import open_zarr")
     print(f"  z = open_zarr('{out_path}')")
     _ = store  # silence linters
 

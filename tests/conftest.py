@@ -82,7 +82,7 @@ def make_synthetic_movie(
 
     if motion_max_shift > 0:
         from scipy.ndimage import uniform_filter1d
-        from cnmfe.motion_correction import apply_shift as _apply_shift
+        from minicnmfe.motion_correction import apply_shift as _apply_shift
         rng_m = np.random.default_rng(seed + 1)
         steps = rng_m.normal(0, motion_max_shift / 10, size=(T, 2)).astype(np.float64)
         drift = np.cumsum(steps, axis=0)

@@ -84,7 +84,7 @@ def main() -> None:
     ap.add_argument("--legacy", action="store_true",
                     help="also render a realism=False clip for contrast")
     ap.add_argument("--stats", action="store_true",
-                    help="also print CORR/PNR per clip (slower; needs cnmfe)")
+                    help="also print CORR/PNR per clip (slower; needs minicnmfe)")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -111,7 +111,7 @@ def main() -> None:
                 f"median={float(np.median(mov)):.0f}  range=[{float(mov.min()):.0f},"
                 f"{float(mov.max()):.0f}]")
         if args.stats:
-            from cnmfe.preprocess import correlation_pnr
+            from minicnmfe.preprocess import correlation_pnr
             cn, pnr = correlation_pnr(mov, sigma=5.0, center_psf=True)
             line += (f"  CORR_p50={np.nanpercentile(cn, 50):.2f}  "
                      f"PNR_p50={np.nanpercentile(pnr, 50):.1f}")

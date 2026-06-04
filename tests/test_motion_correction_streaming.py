@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 import zarr
 
-from cnmfe.motion_correction import apply_shift, motion_correction_rigid
+from minicnmfe.motion_correction import apply_shift, motion_correction_rigid
 
 
 def _make_movie(T=40, H=48, W=48, seed=0):

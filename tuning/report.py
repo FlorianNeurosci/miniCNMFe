@@ -447,8 +447,8 @@ def fig_projections(sample, cn, out_path=None):
 # --------------------------------------------------------------------------
 # These were previously notebook-only cells (``live_runs/diagnostics.ipynb`` +
 # ``cutout_analysis.ipynb``). Each follows the same ``out_path`` contract as the
-# figures above and reuses ``cnmfe._utils.footprint_center`` /
-# ``cnmfe.preprocess.correlation_pnr``, so they are callable from both the HTML
+# figures above and reuses ``minicnmfe._utils.footprint_center`` /
+# ``minicnmfe.preprocess.correlation_pnr``, so they are callable from both the HTML
 # report and the notebooks (``from tuning.report import fig_eccentricity``).
 
 
@@ -604,7 +604,7 @@ def fig_centroid_drift(model, cn, pnr=None, out_path=None):
     import matplotlib.pyplot as plt
     from scipy.ndimage import center_of_mass
 
-    from cnmfe._utils import footprint_center
+    from minicnmfe._utils import footprint_center
 
     A_dense, dims, K = _dense_components(model)
     panels = [("CORR", cn)]
@@ -651,7 +651,7 @@ def fig_footprint_grid(model, *, n: int = 24, ncols: int = 8, out_path=None):
     ``diagnostics.ipynb`` section A."""
     import matplotlib.pyplot as plt
 
-    from cnmfe._utils import footprint_center
+    from minicnmfe._utils import footprint_center
 
     A_dense, dims, K = _dense_components(model)
     if K == 0:
@@ -726,7 +726,7 @@ _FIG_FOR_STAGE = {
 
 
 def _params_json(recommended: dict):
-    from cnmfe.pipeline import CNMFeParams
+    from minicnmfe.pipeline import CNMFeParams
 
     valid = {f.name for f in _fields(CNMFeParams)}
     filtered = {k: v for k, v in recommended.items() if k in valid}
