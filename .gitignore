@@ -95,3 +95,17 @@ tests/data/
 
 # ── CaImAn reference source (algorithmic reference only, not part of this pkg) ─
 CaImAn-main/
+
+# ── Tuning / validation run outputs (never commit) ───────────────────────────
+# tune.py / validate_session.py / batch_tune.py write timestamped run folders
+# (report.md, report.html, *.png, recommended_params.json, comparison.md, +
+# multi-GB mc.zarr / Y_flat scratch). The *.zarr/*.npy rules above already drop
+# the big binaries; these drop the trackable text/figure leftovers so a stray
+# `git add -A` can never pull a run tree into the repo. Directory rules (not
+# by-name) so a deliberate reference example under examples/ stays trackable.
+runs/
+tuning/tune_*/
+live_runs/tuning_*/
+live_runs/diagnostics_figs/
+**/full/
+**/batch_summary.md
