@@ -18,6 +18,7 @@ def auto_evaluate_components(
     sn_flat: np.ndarray,
     min_pixel: int = 1,
     snr_amp_thr: float = 3.0,
+    a_norm: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict]:
     """Return ``(keep_mask, info)`` for the components in ``A``.
 
@@ -42,6 +43,14 @@ def auto_evaluate_components(
         sn_flat: (H*W,) per-pixel noise std (e.g. minicnmfe.preprocess.estimate_noise(...).ravel()).
         min_pixel: Hard floor on the per-component pixel count.
         snr_amp_thr: Threshold on the mean-amplitude SNR (dimensionless).
+        a_norm: Optional (K,) original per-component footprint L2 norms. The
+            pipeline relabels ``A`` to CaImAn scale (unit-L2-norm footprints,
+            amplitude moved into the traces), which would otherwise flatten
+            ``||a_k||^2`` to 1 and destroy this discriminator. When supplied,
+            ``||a_k||^2`` is taken as ``a_norm[k]**2`` (exact for unit-norm
+            footprints) so ``snr_amp`` reproduces the un-normalized value.
+            When ``None``, ``||a_k||^2`` is read directly from ``A`` (the
+            historical path, correct for un-normalized footprints).
 
     Returns:
         keep: (K,) bool, ``True`` for components that pass both checks.
@@ -60,14 +69,21 @@ def auto_evaluate_components(
     snr_amp = np.zeros(K, dtype=np.float32)
 
     sn_sq = np.asarray(sn_flat, dtype=np.float64) ** 2
+    a_norm = None if a_norm is None else np.asarray(a_norm, dtype=np.float64)
 
     for k in range(K):
         start, end = A_csc.indptr[k], A_csc.indptr[k + 1]
         if start == end:
             continue
         rows = A_csc.indices[start:end]
-        vals = A_csc.data[start:end].astype(np.float64)
-        mean_a_sq = float(np.dot(vals, vals)) / len(rows)
+        # ||a_k||^2: from the stored (CaImAn-scale unit-norm) footprint via the
+        # cached original norm when available, else directly from the values.
+        if a_norm is not None:
+            a_sq = float(a_norm[k]) ** 2
+        else:
+            vals = A_csc.data[start:end].astype(np.float64)
+            a_sq = float(np.dot(vals, vals))
+        mean_a_sq = a_sq / len(rows)
         mean_sn_sq = float(np.mean(sn_sq[rows]))
         snr_amp[k] = mean_a_sq / max(mean_sn_sq, 1e-12)
 

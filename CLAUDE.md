@@ -369,6 +369,30 @@ The prior threads through every `estimate_ar_params` call site (pipeline
 init, greedy init, `update_temporal` fallback) so `g` is consistent
 end-to-end. See `todo/oasis_oversmoothing.md` for the diagnostic this fixes.
 
+### Scale convention: CaImAn-style amplitude in the traces (unit-norm footprints)
+CNMF-E factorizes `Y ≈ A·C`, invariant under `A[:,k] *= s` / `C[k] /= s`. The
+extracted outputs are relabeled into **CaImAn's convention** as the final
+canonicalization step of `fit_extract` (`pipeline.py:_normalize_to_trace_amplitude`,
+applied unconditionally before the auto-eval gate): footprints are **unit-L2-norm**
+(`‖A[:,k]‖₂ = 1`) and the per-component gain lives in the **traces**
+(`C`/`S`/`YrA`/`C_raw`/`sn_per_k` all scaled by `s_k = ‖A[:,k]‖₂`). So `model.C`
+peaks land in the tens–hundreds (like `caiman.estimates.C`), not ~0.1. `A·C` and
+every scale-invariant quantity (correlations, SNR, spike timing) are **unchanged** —
+this is a labeling choice, not a change to the extracted signal.
+- The original per-component norms are kept on **`model.A_norm` (K,)** and persisted
+  as `A_norm.npy`. This is **load-bearing for the auto-eval**: `evaluate.py`'s
+  `snr_amp` discriminator is `∝ ‖a_k‖²`, which unit-norming would flatten to 1, so
+  `auto_evaluate_components(..., a_norm=model.A_norm)` reconstructs the un-normalized
+  SNR (`‖a_k‖² = A_norm[k]²`). `a_norm=None` keeps the historical direct-from-`A`
+  path (old saved models with un-normalized `A`; the direct unit tests in
+  `tests/test_evaluate.py`). **Do not** unit-norm `A` without threading `A_norm` into
+  evaluate — it destroys the ghost filter and its tuned `auto_eval_snr_amp_thr=3.0`.
+- `upsample_to_native` / `place_in_full_fov` carry `A_norm` over (exact for the
+  zero-padding map-back; approximate after bilinear upsampling — inspection-only views).
+- Regression: `tests/test_stage_split.py` (bit-for-bit `fit()` == staged, and
+  reproducible `accepted_mask` after `save`/`load`) pins both the unconditional-
+  normalization ordering and the `A_norm` round-trip.
+
 ### Two trace flavours: `C` vs `C + YrA`
 - `model.C` — OASIS-deconvolved (clean AR(1) shape). Use for spike-event detection.
 - `model.YrA` — residual at each footprint after the final BCD pass.
@@ -844,6 +868,7 @@ CaImAn-main/                   Reference source only — never import from here 
 - `model.YrA: (K, T)` — residual at each footprint; `C + YrA` = noisy projected trace
 - `model.g: list[np.ndarray]` — per-component AR coefficients used for OASIS
 - `model.sn_per_k: (K,)` — per-component noise std
+- `model.A_norm: (K,)` — original `‖a_k‖₂` before the CaImAn-scale unit-norm relabeling (see *Scale convention* above)
 
 ---
 

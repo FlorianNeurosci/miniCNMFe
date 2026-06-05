@@ -72,6 +72,46 @@ def _sn_from_footprint(a_k, sn_flat: np.ndarray) -> float:
     return float(np.sqrt(np.sum(weighted ** 2)) / aa)
 
 
+def _normalize_to_trace_amplitude(A, C, S, YrA, C_raw, sn_per_k):
+    """Relabel the ``A·C`` factorization into CaImAn's scale convention.
+
+    CNMF-E factorizes ``Y ≈ A·C``, which is invariant under
+    ``A[:,k] *= s_k`` / ``C[k] /= s_k``. minicnmfe's init parks the
+    per-component gain in the footprints (large ``A``, unit-L2-norm traces);
+    CaImAn parks it in the traces (unit-L2-norm footprints, amplitude in
+    ``C``). This moves the gain into the traces:
+
+        s_k = ‖A[:,k]‖₂
+        A[:,k] /= s_k ;  C[k] *= s_k ;  S[k] *= s_k ;
+        YrA[k] *= s_k ;  C_raw[k] *= s_k ;  sn_per_k[k] *= s_k
+
+    ``A·C`` (and every scale-invariant quantity — correlations, SNR, spike
+    timing) is unchanged. Returns ``(A, C, S, YrA, C_raw, sn_per_k, s)``
+    where ``s`` is the per-component original L2 norm — keep it so the
+    auto-eval SNR (which depends on ‖a_k‖²) can be reconstructed from the
+    now-unit-norm footprints (see ``CNMFe.evaluate``).
+    """
+    K = A.shape[1]
+    if K == 0:
+        return A, C, S, YrA, C_raw, sn_per_k, np.zeros(0, dtype=np.float32)
+
+    s = np.sqrt(np.asarray(A.power(2).sum(axis=0)).ravel()).astype(np.float32)
+    s_safe = np.where(s > 0, s, 1.0).astype(np.float32)
+
+    A = (A.tocsc() @ sp.diags(1.0 / s_safe)).tocsc()
+    if C is not None:
+        C = C * s_safe[:, None]
+    if S is not None:
+        S = S * s_safe[:, None]
+    if YrA is not None:
+        YrA = YrA * s_safe[:, None]
+    if C_raw is not None and C_raw.shape[0] == K:
+        C_raw = C_raw * s_safe[:, None]
+    if sn_per_k is not None:
+        sn_per_k = np.asarray(sn_per_k) * s_safe
+    return A, C, S, YrA, C_raw, sn_per_k, s
+
+
 def _Y_times_vec(Y_flat, v, axis: int) -> np.ndarray:
     """Compute ``Y_flat @ v`` (axis=1, output shape (H*W,)) or ``Y_flat.T @ v``
     (axis=0, output shape (T,)) without materialising a zarr ``Y_flat`` in full.
@@ -523,6 +563,7 @@ class CNMFe:
         self.dims: tuple[int, int] | None = None
         self.g: list[np.ndarray] | None = None    # per-component AR coefs
         self.sn_per_k: np.ndarray | None = None   # per-component noise std
+        self.A_norm: np.ndarray | None = None     # (K,) original ‖a_k‖₂ before unit-norm (CaImAn scale)
         self.mc_roi: "tuple[slice, slice] | None" = None  # ROI used for shift estimation
         self.accepted_mask: np.ndarray | None = None    # (K,) bool — passed auto-eval
         self.eval_info: dict | None = None              # full dict from auto_evaluate_components
@@ -573,6 +614,8 @@ class CNMFe:
         - ``W.npz``        sparse CSR ring weights (when available)
         - ``g.npy``        ``(K, ar_order)`` stacked AR coefs (when available)
         - ``sn_per_k.npy`` ``(K,)`` per-component noise std (when available)
+        - ``A_norm.npy``   ``(K,)`` original ``||a_k||_2`` before the CaImAn-scale
+          unit-norm relabeling (when available)
         - ``accepted_mask.npy`` ``(K,)`` bool from auto-eval (when available)
         - ``eval_info.npz`` per-component auto-eval stats (when available)
         - ``params.json``  the ``CNMFeParams`` dataclass
@@ -609,6 +652,8 @@ class CNMFe:
             np.save(output_dir / "g.npy", np.stack(self.g))
         if self.sn_per_k is not None:
             np.save(output_dir / "sn_per_k.npy", self.sn_per_k)
+        if self.A_norm is not None:
+            np.save(output_dir / "A_norm.npy", self.A_norm)
         if self.accepted_mask is not None:
             np.save(output_dir / "accepted_mask.npy", self.accepted_mask)
         if self.eval_info is not None:
@@ -672,6 +717,8 @@ class CNMFe:
             model.g = [g_arr[k] for k in range(g_arr.shape[0])]
         if (output_dir / "sn_per_k.npy").exists():
             model.sn_per_k = np.load(output_dir / "sn_per_k.npy")
+        if (output_dir / "A_norm.npy").exists():
+            model.A_norm = np.load(output_dir / "A_norm.npy")
         if (output_dir / "accepted_mask.npy").exists():
             model.accepted_mask = np.load(output_dir / "accepted_mask.npy")
         if (output_dir / "eval_info.npz").exists():
@@ -929,7 +976,9 @@ class CNMFe:
         init thresholds — their footprints can be wide but sit at the
         pixel-noise floor.
 
-        Reads only ``self.A`` and ``self.sn``, so it can be called on a freshly
+        Reads only ``self.A``, ``self.sn`` and ``self.A_norm`` (the cached
+        original footprint norms, used to recover the un-normalized SNR after
+        the CaImAn-scale relabeling), so it can be called on a freshly
         ``load()``-ed model to retune thresholds without re-extracting. **No
         components are dropped**; filter post-hoc via ``model.accepted_mask``.
 
@@ -953,6 +1002,7 @@ class CNMFe:
             sn_flat=self.sn.ravel(),
             min_pixel=p.min_pixel,
             snr_amp_thr=p.auto_eval_snr_amp_thr,
+            a_norm=self.A_norm,
         )
         self.accepted_mask = keep
         self.eval_info = eval_info
@@ -1048,6 +1098,10 @@ class CNMFe:
         # Per-component metadata is resolution-independent.
         new.g = self.g
         new.sn_per_k = self.sn_per_k
+        # A_norm carried best-effort: bilinear footprint interpolation perturbs
+        # the column norms slightly, so it is approximate on this
+        # inspection-only view (don't re-run the BCD / evaluate() here).
+        new.A_norm = self.A_norm
         new.accepted_mask = self.accepted_mask
         new.eval_info = self.eval_info
         if self.sn is not None:
@@ -1108,6 +1162,8 @@ class CNMFe:
             new.S = None if self.S is None else self.S.copy()
         new.g = self.g
         new.sn_per_k = self.sn_per_k
+        # Zero-padding into the full FOV preserves each column's L2 norm exactly.
+        new.A_norm = self.A_norm
         new.accepted_mask = self.accepted_mask
         new.eval_info = self.eval_info
         if self.sn is not None:
@@ -1382,6 +1438,7 @@ class CNMFe:
             self.C = np.empty((0, T), dtype=np.float32)
             self.S = np.empty((0, T), dtype=np.float32)
             self.C_raw = np.empty((0, T), dtype=np.float32)
+            self.A_norm = np.zeros(0, dtype=np.float32)
             return self
 
         # Flatten movie to (H*W, T) for all subsequent steps. In streaming
@@ -1665,6 +1722,7 @@ class CNMFe:
             self.f = f_bg
             self.g = g_per_k
             self.sn_per_k = sn_per_k
+            self.A_norm = np.zeros(0, dtype=np.float32)
             return self
 
         # Final deconvolution pass to get spike trains
@@ -1710,9 +1768,21 @@ class CNMFe:
         self.g = g_per_k
         self.sn_per_k = sn_per_k
 
+        # --- Relabel to CaImAn's scale convention (unit-L2-norm footprints,
+        # amplitude in the traces) as the final canonicalization step. A·C is
+        # unchanged; the original ‖a_k‖₂ is kept on self.A_norm so the auto-eval
+        # SNR (∝ ‖a_k‖²) survives the normalization. Run unconditionally —
+        # before the evaluate gate — so fit() and the staged
+        # fit_extract(evaluate=False)+evaluate() paths are bit-for-bit identical.
+        (self.A, self.C, self.S, self.YrA, self.C_raw,
+         self.sn_per_k, self.A_norm) = _normalize_to_trace_amplitude(
+            self.A, self.C, self.S, self.YrA, self.C_raw, self.sn_per_k,
+        )
+
         # --- Step 7: Auto-evaluation (informational, non-destructive) ---
-        # Reads only self.A + self.sn, so order relative to the final temporal
-        # pass is irrelevant; runs here so a standalone fit_extract is complete.
+        # Reads only self.A + self.sn (+ self.A_norm to recover the original
+        # footprint scale), so order relative to the final temporal pass is
+        # irrelevant; runs here so a standalone fit_extract is complete.
         if evaluate:
             self.evaluate()
 
