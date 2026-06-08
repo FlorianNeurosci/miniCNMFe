@@ -363,45 +363,8 @@ def fig_sweep_footprints(model, cn, out_path=None, region_crop=None):
     return _finish(fig, out_path)
 
 
-def fig_sweep_traces(model, out_path=None, n: int = 10):
-    import matplotlib.pyplot as plt
-
-    C = np.asarray(model.C)
-    Cproj = C + np.asarray(model.YrA)
-    K = C.shape[0]
-    n = min(n, K)
-
-    # Cap the correlation work on very dense models (full-FOV path).
-    if K > 400:
-        keep = np.argsort(-C.max(axis=1))[:400]
-    else:
-        keep = np.arange(K)
-    corr = np.corrcoef(C[keep]) if len(keep) > 1 else np.array([[1.0]])
-    corr = np.nan_to_num(corr)
-
-    # Greedy DIVERSE pick: seed with the highest-amplitude cell, then repeatedly
-    # add the component LEAST correlated with those already chosen. The old
-    # top-N-by-amplitude picked exactly the cells riding a shared signal, making
-    # synchronized data look like a bug; this shows the most distinct signals
-    # available, and the title quantifies how distinct they actually are.
-    seed = int(np.argmax(C[keep].max(axis=1)))
-    chosen = [seed]
-    while len(chosen) < min(n, len(keep)):
-        maxc = np.abs(corr[chosen]).max(axis=0)
-        maxc[chosen] = np.inf  # don't reselect
-        chosen.append(int(np.argmin(maxc)))
-    order = [int(keep[c]) for c in chosen]
-
-    # redundancy annotation: median |pairwise corr| among components
-    if corr.shape[0] > 1:
-        iu = np.triu_indices(corr.shape[0], k=1)
-        pair = np.abs(corr[iu])
-        pair = pair[np.isfinite(pair)]
-        med = float(np.median(pair)) if pair.size else float("nan")
-    else:
-        med = float("nan")
-
-    fig, ax = plt.subplots(1, 1, figsize=(11, 1.0 * n + 1))
+def _plot_trace_stack(ax, C, Cproj, order, title):
+    """Stack of normalized C (blue) vs C+YrA (grey) traces for the given cells."""
     for row, k in enumerate(order):
         off = row * 1.2
         tr = Cproj[k]
@@ -413,10 +376,76 @@ def fig_sweep_traces(model, out_path=None, n: int = 10):
         ax.text(-0.01 * C.shape[1], off + 0.5, f"k={k}", fontsize=7, ha="right", va="center")
     ax.set_yticks([])
     ax.set_xlabel("frame")
+    ax.set_title(title)
+
+
+def fig_sweep_traces(model, out_path=None, n: int = 10):
+    import matplotlib.pyplot as plt
+
+    C = np.asarray(model.C)
+    Cproj = C + np.asarray(model.YrA)
+    K = C.shape[0]
+    n = min(n, K)
+
+    # Restrict to auto-eval-ACCEPTED cells. Noise/ghost components are
+    # uncorrelated with everything (and have poor C vs C+YrA agreement), so
+    # showing them is misleading; both panels below sample only accepted cells.
+    mask = getattr(model, "accepted_mask", None)
+    if mask is not None and len(mask) == K and int(np.sum(mask)) >= 2:
+        pool = np.flatnonzero(np.asarray(mask, dtype=bool))
+    else:
+        pool = np.arange(K)
+    # Cap the correlation work on very dense models (full-FOV path).
+    if len(pool) > 400:
+        pool = pool[np.argsort(-C[pool].max(axis=1))[:400]]
+    corr = np.corrcoef(C[pool]) if len(pool) > 1 else np.array([[1.0]])
+    corr = np.nan_to_num(corr)
+    nshow = min(n, len(pool))
+
+    # LEFT: an unbiased RANDOM sample of accepted cells (fixed seed for
+    # reproducibility) — the honest "what do typical cells look like" view.
+    rng = np.random.RandomState(0)
+    rand_local = np.sort(rng.choice(len(pool), size=nshow, replace=False))
+    rand_order = [int(pool[c]) for c in rand_local]
+
+    # RIGHT: greedy DIVERSE pick — seed with the highest-amplitude accepted cell,
+    # then add the component LEAST correlated with those already chosen. Shows the
+    # most distinct signals available (best-case diversity).
+    seed = int(np.argmax(C[pool].max(axis=1)))
+    chosen = [seed]
+    while len(chosen) < nshow:
+        maxc = np.abs(corr[chosen]).max(axis=0)
+        maxc[chosen] = np.inf  # don't reselect
+        chosen.append(int(np.argmin(maxc)))
+    div_order = [int(pool[c]) for c in chosen]
+
+    # THIRD: highest per-cell corr(C, C+YrA) — the best-fit / cleanest accepted
+    # cells (the demixed trace explains the raw footprint projection well).
+    a = C[pool] - C[pool].mean(axis=1, keepdims=True)
+    b = Cproj[pool] - Cproj[pool].mean(axis=1, keepdims=True)
+    cell_corr = (a * b).sum(axis=1) / (
+        np.sqrt((a ** 2).sum(axis=1) * (b ** 2).sum(axis=1)) + 1e-12
+    )
+    corr_order = [int(pool[c]) for c in np.argsort(-cell_corr)[:nshow]]
+
+    # redundancy annotation: median |pairwise corr| among accepted cells
+    if corr.shape[0] > 1:
+        iu = np.triu_indices(corr.shape[0], k=1)
+        pair = np.abs(corr[iu])
+        pair = pair[np.isfinite(pair)]
+        med = float(np.median(pair)) if pair.size else float("nan")
+    else:
+        med = float("nan")
+
+    fig, axes = plt.subplots(1, 3, figsize=(28, 1.0 * nshow + 1.5), sharex=True)
+    _plot_trace_stack(axes[0], C, Cproj, rand_order, "random accepted sample")
+    _plot_trace_stack(axes[1], C, Cproj, div_order, "most-decorrelated accepted")
+    _plot_trace_stack(axes[2], C, Cproj, corr_order,
+                      "highest C vs C+YrA corr (best-fit)")
     verdict = "high → synchronized / shared signal" if (med == med and med > 0.5) \
         else "low → distinct signals"
-    ax.set_title(
-        "most-decorrelated candidates: C (blue) vs C+YrA (grey)\n"
+    fig.suptitle(
+        "accepted-cell traces: C (blue) vs C+YrA (grey)  —  "
         f"median pairwise trace corr = {med:.2f} ({verdict})"
     )
     fig.tight_layout()

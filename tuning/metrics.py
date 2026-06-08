@@ -69,9 +69,13 @@ def model_quality(model) -> dict:
 
     # Cross-component trace redundancy: median |pairwise Pearson r| among the
     # component traces. High => components share temporal activity — real
-    # synchrony OR an over-split shared signal. (Capped to 200 cells for cost.)
+    # synchrony OR an over-split shared signal. Restricted to accepted cells
+    # (noise/ghosts are uncorrelated and would dilute the number) and capped to
+    # 200 cells for cost.
     if model.C is not None and K >= 2:
         C = np.asarray(model.C, dtype=np.float64)
+        if mask is not None and len(mask) == K and int(np.sum(mask)) >= 2:
+            C = C[np.asarray(mask, dtype=bool)]
         if C.shape[0] > 200:
             C = C[np.linspace(0, C.shape[0] - 1, 200).astype(int)]
         cc = np.corrcoef(C)
