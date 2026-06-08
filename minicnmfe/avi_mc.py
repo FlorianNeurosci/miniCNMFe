@@ -41,7 +41,7 @@ from minicnmfe.motion_correction import (
     caiman_bin_median,
     high_pass_filter_space,
 )
-from concat_avis_to_zarr import (
+from minicnmfe.concat_avis_to_zarr import (
     _DECODER_DONE,
     _count_and_shape,
     _decode_avi_worker,

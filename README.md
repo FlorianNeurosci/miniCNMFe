@@ -218,7 +218,6 @@ demo_movies/               # Generated demo AVIs + zarr stores (created by scrip
 demo_notebooks/            # Tutorial notebooks (see below)
 generate_demo_movies.py    # Generate demo_movies/*.avi with ground-truth sidecars
 convert_to_zarr.py         # Batch-convert demo_movies/*.avi -> *.zarr
-concat_avis_to_zarr.py     # CLI: concatenate 0.avi...N.avi into one zarr store
 full_pipeline.py           # CLI: load zarr, run full pipeline, save results to disk
 ```
 
@@ -236,7 +235,7 @@ Miniscope recordings are typically a folder of sequentially numbered AVI files. 
 
 ```bash
 # 1. Concatenate 0.avi ... 65.avi into one lazy zarr store
-python concat_avis_to_zarr.py /path/to/recording/
+python -m minicnmfe.concat_avis_to_zarr /path/to/recording/
 
 # 2. Run the full pipeline and save all results
 python full_pipeline.py /path/to/recording/movie.zarr --sigma 3.0 --n-jobs -1

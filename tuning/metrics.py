@@ -46,7 +46,8 @@ def model_quality(model) -> dict:
         q.update(K_accepted=0, accepted_frac=0.0,
                  cprojcorr_mean=float("nan"), cprojcorr_median=float("nan"),
                  npix_median=0.0, npix_iqr=0.0,
-                 snr_mean=float("nan"), snr_median=float("nan"))
+                 snr_mean=float("nan"), snr_median=float("nan"),
+                 trace_corr_median=float("nan"))
         return q
 
     # Accepted fraction (auto-eval; may be unset).
@@ -65,6 +66,21 @@ def model_quality(model) -> dict:
         q["cprojcorr_median"] = float(np.median(r))
     else:
         q["cprojcorr_mean"] = q["cprojcorr_median"] = float("nan")
+
+    # Cross-component trace redundancy: median |pairwise Pearson r| among the
+    # component traces. High => components share temporal activity — real
+    # synchrony OR an over-split shared signal. (Capped to 200 cells for cost.)
+    if model.C is not None and K >= 2:
+        C = np.asarray(model.C, dtype=np.float64)
+        if C.shape[0] > 200:
+            C = C[np.linspace(0, C.shape[0] - 1, 200).astype(int)]
+        cc = np.corrcoef(C)
+        iu = np.triu_indices(cc.shape[0], k=1)
+        pair = np.abs(cc[iu])
+        pair = pair[np.isfinite(pair)]
+        q["trace_corr_median"] = float(np.median(pair)) if pair.size else float("nan")
+    else:
+        q["trace_corr_median"] = float("nan")
 
     # Footprint pixel-count distribution (nonzero pixels per column).
     A_csc = A.tocsc() if sp.issparse(A) else sp.csc_matrix(A)

@@ -22,7 +22,7 @@ def list_avis(folder: "str | Path", pattern: str = "*.avi") -> list[Path]:
     Reuses ``concat_avis_to_zarr._numeric_key`` so the ordering matches the
     rest of the pipeline (and drops non-numerically-named files).
     """
-    from concat_avis_to_zarr import _numeric_key
+    from minicnmfe.concat_avis_to_zarr import _numeric_key
 
     folder = Path(folder)
     avis = sorted(folder.glob(pattern), key=_numeric_key)
@@ -141,10 +141,18 @@ def quick_fused_mc(
 
     Thin wrapper over ``CNMFe(params.downscaled(ssub, tsub)).fit_mc_from_avis``.
     When ``max_avis`` is set, an evenly-spaced subset of the AVIs is symlinked
-    into ``out_dir/_mc_subset`` (named ``0.avi, 1.avi, ...``) and fused from
-    there — a fast approximation to the full-session shifts. ``mc.zarr`` lands
-    in ``out_dir``.
+    into a temporary ``_mc_subset`` dir (named ``0.avi, 1.avi, ...``) and fused
+    from there — a fast approximation to the full-session shifts. ``mc.zarr``
+    lands in ``out_dir``.
+
+    The subset links are placed on **local temp storage**, not under ``out_dir``:
+    ``out_dir`` is often a network share (CIFS/NFS) that rejects symlinks with
+    ``OSError(EOPNOTSUPP)`` (errno 95). The links target the absolute AVI paths,
+    so they resolve back to the share regardless of where the dir lives.
     """
+    import shutil
+    import tempfile
+
     from minicnmfe.pipeline import CNMFe
 
     avi_folder = Path(avi_folder)
@@ -152,21 +160,28 @@ def quick_fused_mc(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     folder = avi_folder
+    subset_dir = None
     if max_avis is not None:
         avis = list_avis(avi_folder, pattern)
         if max_avis < len(avis):
             picks = np.linspace(0, len(avis) - 1, max_avis).astype(int)
-            subset_dir = out_dir / "_mc_subset"
-            subset_dir.mkdir(parents=True, exist_ok=True)
+            subset_dir = Path(tempfile.mkdtemp(prefix="minicnmfe_mc_subset_"))
             for new_i, src_i in enumerate(picks):
+                src = avis[int(src_i)].resolve()
                 link = subset_dir / f"{new_i}.avi"
-                if link.exists() or link.is_symlink():
-                    link.unlink()
-                link.symlink_to(avis[int(src_i)].resolve())
+                try:
+                    link.symlink_to(src)
+                except OSError:
+                    # even local temp can't symlink -> copy as a last resort
+                    shutil.copy2(src, link)
             folder = subset_dir
 
     model = CNMFe(params.downscaled(ssub, tsub))
-    mc_zarr = model.fit_mc_from_avis(
-        folder, out_dir, pattern=pattern, ssub=ssub, tsub=tsub,
-    )
+    try:
+        mc_zarr = model.fit_mc_from_avis(
+            folder, out_dir, pattern=pattern, ssub=ssub, tsub=tsub,
+        )
+    finally:
+        if subset_dir is not None:
+            shutil.rmtree(subset_dir, ignore_errors=True)
     return mc_zarr, model.shifts

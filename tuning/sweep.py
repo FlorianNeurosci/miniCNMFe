@@ -106,13 +106,38 @@ def _fit_candidate(params, mc_zarr_path, region_crop, workdir):
     return model
 
 
+def _render_candidate_figs(model, cn, fp_out, tr_out):
+    """Render this candidate's footprints + traces PNGs (best-effort).
+
+    Reuses the same renderers as the best-candidate report figures. The model and
+    the (already cutout-sliced) ``cn`` are both in crop-local coords, so no offset
+    (``region_crop=None``). A plotting failure must NOT fail the candidate, so all
+    errors are swallowed and simply leave the fig fields unset.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    from tuning.report import fig_sweep_footprints, fig_sweep_traces
+
+    out = {}
+    try:
+        if model.A is not None and model.A.shape[1] > 0:
+            Path(fp_out).parent.mkdir(parents=True, exist_ok=True)
+            fig_sweep_footprints(model, cn, out_path=fp_out, region_crop=None)
+            out["footprints_fig"] = Path(fp_out).name
+            fig_sweep_traces(model, out_path=tr_out)
+            out["traces_fig"] = Path(tr_out).name
+    except Exception:  # noqa: BLE001 — figures are optional, never abort
+        pass
+    return out
+
+
 def _run_one_candidate(args) -> dict:
     """Module-level sweep worker (spawn-pickling). Returns a metrics row.
 
     A failed candidate returns a row with ``error`` set and a ``-inf`` score
     rather than aborting the whole sweep.
     """
-    idx, params, mc_zarr_path, region_crop, workdir, swept = args
+    idx, params, mc_zarr_path, region_crop, workdir, swept, cn_fig, fp_out, tr_out = args
     try:
         from threadpoolctl import threadpool_limits
     except ImportError:
@@ -130,6 +155,7 @@ def _run_one_candidate(args) -> dict:
         row.update(swept)
         row.update(q)
         row["score"] = composite_score(q)
+        row.update(_render_candidate_figs(model, cn_fig, fp_out, tr_out))
         return row
     except Exception as exc:  # noqa: BLE001 — surface, don't abort the batch
         row = {"idx": idx, "error": repr(exc), "wall_s": time.time() - t0,
@@ -141,13 +167,18 @@ def _run_one_candidate(args) -> dict:
 def run_sweep(
     mc_zarr_path: "str | Path", base_params: CNMFeParams, spec: SweepSpec,
     *, region_crop=None, n_jobs: int = 1, workdir: "str | Path",
-    max_candidates: int = 24,
+    max_candidates: int = 24, cn=None,
 ) -> "tuple[list[dict], CNMFeParams, CNMFe]":
     """Run the sweep and return ``(rows, best_params, best_model)``.
 
     ``rows`` are sorted by ``composite_score`` (best first). ``best_model`` is
     the best candidate **re-fit once in the parent** on the same region (so the
     stage-4 heuristics have a live model to read).
+
+    ``cn`` is the FOV correlation image; when given, each candidate also gets a
+    footprints + traces PNG written to the tuner output dir (``workdir.parent``)
+    as ``fig_cand_<i>_footprints.png`` / ``fig_cand_<i>_traces.png``, and the
+    basenames are recorded in the candidate row.
     """
     from joblib import Parallel, delayed
 
@@ -155,8 +186,21 @@ def run_sweep(
     workdir.mkdir(parents=True, exist_ok=True)
     candidates = build_candidates(base_params, spec, max_candidates)
 
+    # candidate figures use a crop-local correlation image; slice the FOV cn to
+    # the cutout so contours land on the right pixels (region_crop=None at render).
+    if cn is not None and region_crop is not None:
+        (y0, y1, x0, x1), _t = region_crop
+        cn_fig = cn[y0:y1, x0:x1]
+    else:
+        cn_fig = cn
+    # figs go at the top level of the tuner output dir so the DB durable-copy
+    # mirrors them into 2_processed alongside the other report figures.
+    fig_dir = workdir.parent
+
     tasks = [
-        (i, params, str(mc_zarr_path), region_crop, str(workdir / f"cand_{i}"), swept)
+        (i, params, str(mc_zarr_path), region_crop, str(workdir / f"cand_{i}"),
+         swept, cn_fig, str(fig_dir / f"fig_cand_{i}_footprints.png"),
+         str(fig_dir / f"fig_cand_{i}_traces.png"))
         for i, (params, swept) in enumerate(candidates)
     ]
     rows = Parallel(n_jobs=n_jobs)(delayed(_run_one_candidate)(t) for t in tasks)

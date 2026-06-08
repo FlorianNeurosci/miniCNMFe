@@ -428,6 +428,23 @@ this is a labeling choice, not a change to the extracted signal.
 ### Real-recording tuning: long & dense FOVs (empirical, June 2026)
 Findings from a real 37398×300×300 miniscope recording (cutout extraction). All
 validated by experiment; none are autotested.
+- **Hazy / out-of-focus FOV inflates the neuron-radius estimate → sprawl
+  (fixed June 2026).** On a hazy or out-of-focus recording, `blob_log` on the
+  temporal-std projection latches onto broad background structure instead of the
+  cells and the median radius blows up (measured **6.3 px** on one session vs
+  **3.4 px** on an in-focus session of the same mouse). That cascades through
+  `suggest_downsample` / `suggest_sigma_extraction` into a too-large `sigma`
+  (15 vs 8), over-aggressive `ssub` (3 vs 2) and a huge `min_pixel` (810 vs 296)
+  → giant sprawling footprints — **independent of recording length or thresholds**
+  (a distinct cause from the length-driven sprawl below). **Fix:**
+  `tuning/heuristics.py:suggest_mc_gsig_and_sigma` now subtracts a wide Gaussian
+  blur (`highpass_sigma=8` px, default on; `0`/`None` disables) before `blob_log`,
+  removing the haze so the radius reflects neurons. Verified: the hazy session
+  dropped to `sigma=4`/`ssub=2`/`min_pixel≈396` with tight discrete footprints and
+  *more* real neurons detected (the haze had masked them), while the in-focus
+  session was unchanged. **Tell-tale:** `sigma`/`ssub`/`min_pixel` ~2× a
+  comparable session — check `fig_mc_gsig.png`. Regression test:
+  `tests/test_tuning.py::test_sigma_heuristic_robust_to_background_haze`.
 - **Length, not thresholds, drives footprint sprawl.** On a long recording slow
   drift / photobleaching (~9% here) gives every trace a shared low-frequency
   trend → traces go collinear → `update_spatial`'s per-pixel LASSO can't separate
@@ -806,6 +823,7 @@ minicnmfe/                         Main package
   temporal.py                  estimate_ar_params, deconvolve, update_temporal, _deconvolve_with
   merging.py                   merge_components  (4-tuple return)
   avi_mc.py                    Fused AVI -> mc.zarr in one pass (skips session.zarr)
+  concat_avis_to_zarr.py       Concatenate a folder of 0.avi ... N.avi into one zarr store (importable + CLI: python -m minicnmfe.concat_avis_to_zarr)
   downsample.py                downsample_movie() — streaming spatial+temporal block-mean (+ ds_meta.json)
   pipeline.py                  CNMFeParams (+ .downscaled()), CNMFe.fit()/fit_mc/fit_extract/evaluate
 tests/
@@ -819,7 +837,6 @@ wiki/                          Obsidian docs (math, eli5, architecture, api-refe
 demo_movies/                   Generated AVI files + _meta.npz sidecars + .zarr stores (created by scripts below)
 generate_demo_movies.py        Generate demo_movies/*.avi with ground-truth NPZ sidecars (idempotent)
 convert_to_zarr.py             Batch-convert demo_movies/*.avi -> *.zarr (idempotent)
-concat_avis_to_zarr.py         Concatenate a folder of 0.avi ... N.avi into one zarr store (CLI)
 full_pipeline.py               CLI: load any zarr lazily, run full CNMFe pipeline, save A/C/S/YrA/shifts/sn/params to disk
 run_preprocess.py              Staged CLI 1/4: downsample a zarr (ssub/tsub) -> ds.zarr + ds_meta.json
 run_mc.py                      Staged CLI 2/4: motion-correct a zarr -> mc.zarr + shifts.npy + params.json
@@ -828,7 +845,7 @@ run_evaluate.py                Staged CLI 4/4: re-run auto-eval on a results dir
 tune.py                        SINGLE front door: `tune.py <path>` = heuristics + sweep + full-recording validation + report.html (default output ./runs/, gitignored); `--sessions <list>` = batch; `--no-validate`/`--no-html`/`--no-lowthr`/`--dry-run` flags. Composes the stages below (calls tuning.validate.tune_then_validate).
 validate_session.py            Internal stage / standalone CLI: fused MC once -> Y_flat once -> fit_extract per threshold set (reuses Y_flat) -> diagnostics + comparison.md. Use directly only to re-validate or add threshold sets.
 batch_tune.py                  Batch stage: run_batch() runs one `tune.py --validate` subprocess per session in ONE background process (bounded concurrency, BLAS-capped) -> batch_summary.md. No sub-agents. `tune.py --sessions` delegates here.
-tuning/                        Tuning package: io_sample, heuristics, metrics (GT-free quality proxies), sweep (graded fit_extract grid), report (figures + report.md + packaged diagnostics: fig_footprint_grid/eccentricity/jaccard_merge/centroid_drift/mean_proj_and_activity + DIAGNOSTIC_FIGS + METRICS_BLURB/SYMPTOM_CAUSE_KNOB), report_html (self-contained report.html: base64 figs + sortable candidate table), tuner, validate (read_session_meta + validate_session + tune_then_validate + good_defaults)
+tuning/                        Tuning package: io_sample, heuristics (per-knob suggest_*; neuron-radius estimate spatial-high-pass-filtered, highpass_sigma=8, for hazy/out-of-focus FOV robustness), metrics (GT-free quality proxies), sweep (graded fit_extract grid), report (figures + report.md + packaged diagnostics: fig_footprint_grid/eccentricity/jaccard_merge/centroid_drift/mean_proj_and_activity + DIAGNOSTIC_FIGS + METRICS_BLURB/SYMPTOM_CAUSE_KNOB), report_html (self-contained report.html: base64 figs + sortable candidate table), tuner, validate (read_session_meta + validate_session + tune_then_validate + good_defaults)
 .claude/skills/tune-session/   User-invoked skill (/tune-session <path...>|<list.txt>): metadata -> tune.py (tune+validate+html) -> verdict + per-session LEARNINGS.md. Gotcha checklist lives in wiki/parameter-tuning.md (single source). Multiple paths / a .txt list run via batch_tune (one background process, NOT sub-agents). --figs/--no-figs gates end-of-run PNG viewing (the dominant token cost)
 tutorial.ipynb                 Original walkthrough (preserved)
 tutorial2.ipynb                Clean rewrite of the original tutorial
@@ -892,7 +909,7 @@ python generate_demo_movies.py           # creates demo_movies/*.avi + *_meta.np
 python convert_to_zarr.py                # creates demo_movies/*.zarr
 
 # CLI pipeline
-python concat_avis_to_zarr.py /path/to/folder/   # concatenate 0.avi...N.avi -> movie.zarr
+python -m minicnmfe.concat_avis_to_zarr /path/to/folder/   # concatenate 0.avi...N.avi -> movie.zarr
 python full_pipeline.py /path/to/movie.zarr       # run full pipeline, save results/
 
 # Tutorials

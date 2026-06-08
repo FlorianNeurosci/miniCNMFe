@@ -203,6 +203,17 @@ re-stating it). Apply every item when reading a `comparison.md` / `report.html`:
 - **Density ↔ purity is a real tradeoff.** Report it in numbers (K / accepted vs
   `cprojcorr_median`) and recommend an operating point rather than "more is
   better"; `cprojcorr_median` *falls* as K rises in a dense FOV (YrA cross-talk).
+- **Hazy / out-of-focus FOV → over-estimated neuron radius.** On a hazy or
+  out-of-focus recording `blob_log` on the temporal-std latches onto broad
+  background structure and reports a too-large radius (e.g. 6.3 px when the
+  neurons are ~4 px), which cascades into a too-large `sigma`, an over-aggressive
+  `ssub`, a huge `min_pixel`, and **sprawling footprints**. `suggest_mc_gsig_and_sigma`
+  now applies a spatial high-pass (`highpass_sigma=8` px, default on) before
+  `blob_log` to strip the haze, so this is handled automatically. **Tell-tale:**
+  `sigma` / `ssub` / `min_pixel` come out ~2× a comparable in-focus session — check
+  `fig_mc_gsig.png`; the detected-radius histogram should sit at the neuron scale,
+  not be dragged up by a tail of large blobs. Bump `highpass_sigma` further only if
+  a very hazy session still over-estimates.
 - **Motion correction.** From `mc_shifts.png`: small shifts (≲ a few px) → one MC
   pass is fine; large/erratic shifts warrant a bigger `max_shift` or `mc_n_iter=2`.
 
@@ -218,6 +229,7 @@ most common few:
 | Too many ghost components | raise `min_pnr` / `auto_eval_snr_amp_thr` |
 | Too few neurons | lower `min_corr` / `min_pnr`; pin `init_stride` to 1–2 on long movies |
 | Footprints sprawl / merge into blobs (long recording) | `global_bg_rank=1`, `spatial_max_thr↑`, `spatial_circular_max_dist_factor↓` |
+| Footprints sprawl + `sigma`·`ssub`·`min_pixel` ~2× a comparable session (hazy/out-of-focus FOV) | radius over-estimated by `blob_log` on haze — auto-fixed by the `highpass_sigma` pre-filter; check `fig_mc_gsig.png`, raise `highpass_sigma` if it persists |
 | Distinct neighbours fused | raise `merge_thr_corr`, lower `merge_centre_dist_factor` |
 | "Shark-fin" / over-smoothed traces | set `decay_time_ms` + `frame_rate_hz` (Bayesian `g` prior) |
 

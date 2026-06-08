@@ -23,6 +23,7 @@ D:\code\claude_cnmfe\
 │   ├── spatial.py                # Spatial footprint update (LassoLars per pixel)
 │   ├── temporal.py               # Temporal update + OASIS AR deconvolution
 │   ├── merging.py                # Component merging (overlap + correlation)
+│   ├── concat_avis_to_zarr.py    # Concatenate 0.avi...N.avi into one zarr (importable + `python -m`)
 │   └── pipeline.py               # CNMFeParams + CNMFe.fit() orchestrator
 ├── tests/
 │   ├── conftest.py               # make_synthetic_movie() fixture; supports motion_max_shift
@@ -40,7 +41,6 @@ D:\code\claude_cnmfe\
 ├── demo_movies/                  # Generated AVI + zarr + meta files (created by scripts)
 ├── generate_demo_movies.py       # Generate demo_movies/*.avi with ground-truth NPZ sidecars
 ├── convert_to_zarr.py            # Batch-convert demo_movies/*.avi -> *.zarr
-├── concat_avis_to_zarr.py        # CLI: concatenate 0.avi...N.avi into one zarr store
 ├── full_pipeline.py              # CLI: load zarr, run full pipeline, save results to disk
 ├── tutorial.ipynb                # End-to-end walkthrough notebook
 ├── tutorial_demo.ipynb           # Realistic lazy-load AVI workflow demo

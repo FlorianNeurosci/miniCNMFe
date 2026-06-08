@@ -34,7 +34,7 @@ cv2 = pytest.importorskip("cv2")
 from minicnmfe.avi_mc import concat_avis_to_mc_zarr  # noqa: E402
 from minicnmfe.motion_correction import motion_correction_rigid  # noqa: E402
 from minicnmfe.pipeline import CNMFeParams, CNMFe  # noqa: E402
-from concat_avis_to_zarr import concat_avis_to_zarr  # noqa: E402
+from minicnmfe.concat_avis_to_zarr import concat_avis_to_zarr  # noqa: E402
 
 
 def _write_synthetic_avi(path: Path, T: int, H: int, W: int, seed: int) -> None:

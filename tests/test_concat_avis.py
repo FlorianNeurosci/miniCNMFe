@@ -22,7 +22,7 @@ import zarr
 
 cv2 = pytest.importorskip("cv2")
 
-from concat_avis_to_zarr import concat_avis_to_zarr  # noqa: E402
+from minicnmfe.concat_avis_to_zarr import concat_avis_to_zarr  # noqa: E402
 
 
 def _write_synthetic_avi(path: Path, T: int, H: int, W: int, seed: int) -> None:

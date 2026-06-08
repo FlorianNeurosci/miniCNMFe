@@ -169,12 +169,11 @@ def tune_then_validate(cfg, *, validate: bool = True, lowthr: bool = True,
     if validate:
         rec = result["recommended"]
         ssub, tsub = int(result["ssub"]), int(result["tsub"])
-        # Match validate_session.py: good_defaults (the long-recording overrides)
-        # carries everything except sigma + thresholds + ssub/tsub + decay.
-        native = good_defaults(
-            frame_rate_hz=cfg.frame_rate_hz, decay_time_ms=cfg.decay_time_ms,
-            sigma=float(rec["sigma"]), min_corr=float(rec["min_corr"]),
-            min_pnr=float(rec["min_pnr"]), n_jobs=cfg.n_jobs)
+        # Validate exactly what we recommend: the merged CNMFeParams the tuner
+        # wrote to recommended_params.json (long-recording base + data-driven
+        # fields), NOT a fresh good_defaults. So the full/ figures reflect the
+        # params applied downstream. (run_tuning already builds it on good_defaults.)
+        native = result["recommended_params"]
         thresholds = [("recommended", float(rec["min_corr"]), float(rec["min_pnr"]))]
         if lowthr:
             thresholds.append(("lowthr",

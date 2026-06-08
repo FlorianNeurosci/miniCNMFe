@@ -110,6 +110,52 @@ def test_heuristics_on_simulator(sim_movie):
     assert min_pixel >= 1
 
 
+def test_sigma_heuristic_robust_to_background_haze():
+    """The neuron-radius estimate must not be inflated by broad out-of-focus
+    haze. A hazy FOV = small neurons riding on large diffuse background bumps;
+    without the spatial high-pass blob_log latches onto the bumps and the median
+    radius blows up (the real-recording sprawl bug). The high-pass must recover
+    the neuron scale while a clean FOV stays unchanged.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    rng = np.random.default_rng(0)
+    nh = nw = 200
+    # A few small neurons (radius ~3 px) ...
+    neurons = np.zeros((nh, nw), np.float32)
+    for _ in range(10):
+        y, x = rng.integers(20, nh - 20), rng.integers(20, nw - 20)
+        neurons[y, x] = 1.0
+    neurons = gaussian_filter(neurons, 3.0)
+    neurons /= neurons.max()
+    # ... riding on many broad, detectable-scale background bumps (radius ~12 px):
+    # the out-of-focus-haze signature that dominates the blob set and inflates
+    # the radius estimate when it isn't removed.
+    haze = np.zeros((nh, nw), np.float32)
+    for _ in range(40):
+        y, x = rng.integers(15, nh - 15), rng.integers(15, nw - 15)
+        haze[y, x] = 1.0
+    haze = gaussian_filter(haze, 12.0)
+    haze = 1.2 * haze / haze.max()
+
+    # sample.std(axis=0) reproduces the target image exactly for [+img, -img].
+    def sample_of(img):
+        return np.stack([img, -img]).astype(np.float32)
+
+    hazy = neurons + haze
+    _g_on, sig_on, _ = H.suggest_mc_gsig_and_sigma(sample_of(hazy))           # default high-pass
+    _g_off, sig_off, _ = H.suggest_mc_gsig_and_sigma(sample_of(hazy),
+                                                     highpass_sigma=0)         # disabled
+    # High-pass recovers the neuron scale; without it the haze inflates it badly.
+    assert sig_on <= 5.0 < sig_off
+
+    # A clean FOV (no haze) is left essentially unchanged by the high-pass.
+    _g_c_on, sig_clean_on, _ = H.suggest_mc_gsig_and_sigma(sample_of(neurons))
+    _g_c_off, sig_clean_off, _ = H.suggest_mc_gsig_and_sigma(sample_of(neurons),
+                                                             highpass_sigma=0)
+    assert abs(sig_clean_on - sig_clean_off) <= 1.5
+
+
 def test_metrics_on_fitted_model(fitted_model):
     q = M.model_quality(fitted_model)
     for key in ("K", "K_accepted", "accepted_frac", "cprojcorr_mean",

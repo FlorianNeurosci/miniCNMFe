@@ -273,7 +273,7 @@ Miniscope recordings typically arrive as `0.avi`, `1.avi`, ..., `65.avi`. Use th
 
 ```bash
 # Step 1: concatenate all AVI files in the folder into one zarr store
-python concat_avis_to_zarr.py /path/to/recording/
+python -m minicnmfe.concat_avis_to_zarr /path/to/recording/
 # creates /path/to/recording/movie.zarr
 
 # Step 2: run the full pipeline
@@ -315,7 +315,7 @@ jupyter notebook tutorial_demo.ipynb
 
 The `tutorial_demo.ipynb` notebook opens a zarr lazily, runs the full pipeline, and scores extraction quality against the ground-truth.
 
-### `concat_avis_to_zarr.py` options
+### `python -m minicnmfe.concat_avis_to_zarr` options
 
 | Flag | Default | Description |
 |------|---------|-------------|

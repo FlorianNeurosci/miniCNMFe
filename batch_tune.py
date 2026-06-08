@@ -38,11 +38,13 @@ _BLAS = {k: "1" for k in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS",
 def _tune_cmd(sess, out, fps, indicator, nj, lowthr):
     """One consolidated `tune.py` call per session: tune + full-recording
     validation in a single BLAS-capped subprocess (tune.py owns both stages)."""
+    # No --grid-bg-rank: global_bg_rank is pinned to the long-recording base (=1)
+    # because the short cutout sweep can't see its benefit (see tuning/tuner.py).
     cmd = [sys.executable, "-u", str(ROOT / "tune.py"), str(sess),
            "-o", str(out), "--frame-rate", str(fps),
            "--indicator", indicator, "--mode", "both", "--region", "cutout",
            "--max-avis", "6", "--grid-min-corr", "0.7,0.8",
-           "--grid-min-pnr", "6,10,14", "--grid-bg-rank", "0,1",
+           "--grid-min-pnr", "6,10,14",
            "--n-jobs", str(nj), "--validate", "--html"]
     if not lowthr:
         cmd.append("--no-lowthr")

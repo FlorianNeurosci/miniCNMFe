@@ -68,8 +68,9 @@ def main() -> None:
     parser.add_argument("--mode", choices=["heuristic", "sweep", "both"], default="both")
     parser.add_argument("--region", choices=["cutout", "full"], default="cutout")
 
-    parser.add_argument("--frame-rate", type=float, default=20.0,
-                        help="Acquisition frame rate (Hz, native)")
+    parser.add_argument("--frame-rate", type=float, default=None,
+                        help="Acquisition frame rate (Hz, native); "
+                             "default: read from metaData.json (AVI input), else 20")
     parser.add_argument("--decay-time-ms", type=float, default=None,
                         help="Indicator single-AP decay τ (ms)")
     parser.add_argument("--indicator", type=str, default=None,
@@ -170,7 +171,20 @@ def main() -> None:
     from minicnmfe.pipeline import CNMFeParams
     from tuning.sweep import SweepSpec
     from tuning.tuner import TunerConfig
-    from tuning.validate import tune_then_validate
+    from tuning.validate import read_session_meta, tune_then_validate
+
+    # Resolve frame rate: explicit flag wins; else auto-read metaData.json from an
+    # AVI session folder (or its parent), matching batch_tune / validate_session;
+    # fall back to 20 Hz. A wrong fps silently mis-tunes the decay-time g prior.
+    if args.frame_rate is not None:
+        fps, fps_src = args.frame_rate, "flag"
+    else:
+        fps = None
+        if kind == "avi":
+            fps = (read_session_meta(args.input).get("fps")
+                   or read_session_meta(args.input.parent).get("fps"))
+        fps, fps_src = (fps, "metaData.json") if fps else (20.0, "default")
+        print(f"frame rate: {fps} Hz ({fps_src})")
 
     base_params = CNMFeParams.from_json(args.params) if args.params else None
     spec = SweepSpec(
@@ -180,7 +194,7 @@ def main() -> None:
 
     cfg = TunerConfig(
         input_path=args.input, output_dir=run_dir, mode=args.mode, region=args.region,
-        frame_rate_hz=args.frame_rate, decay_time_ms=decay, base_params=base_params,
+        frame_rate_hz=fps, decay_time_ms=decay, base_params=base_params,
         ssub=args.ssub, tsub=args.tsub, reuse_mc_zarr=args.reuse_mc_zarr,
         max_avis=args.max_avis, pattern=args.pattern,
         n_template_avis=args.n_template_avis, stride_within_avi=args.stride_within_avi,

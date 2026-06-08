@@ -1,9 +1,9 @@
 """Concatenate sequentially numbered AVI files into a single zarr store.
 
-Usage (from project root or anywhere):
-    python concat_avis_to_zarr.py /path/to/folder/
-    python concat_avis_to_zarr.py /path/to/folder/ --output /path/to/movie.zarr
-    python concat_avis_to_zarr.py /path/to/folder/ --pattern "*.avi"
+Usage (from anywhere, once the package is installed):
+    python -m minicnmfe.concat_avis_to_zarr /path/to/folder/
+    python -m minicnmfe.concat_avis_to_zarr /path/to/folder/ --output /path/to/movie.zarr
+    python -m minicnmfe.concat_avis_to_zarr /path/to/folder/ --pattern "*.avi"
 
 The AVI files are sorted by the integer embedded in their filename:
     0.avi, 1.avi, ..., 65.avi   (numeric order, not lexicographic)
@@ -26,7 +26,7 @@ fractional — pass ``--dtype float32`` to keep that precision (uint8 would
 round each averaged pixel).
 
 Programmatic use:
-    from concat_avis_to_zarr import concat_avis_to_zarr
+    from minicnmfe import concat_avis_to_zarr  # or: from minicnmfe.concat_avis_to_zarr import concat_avis_to_zarr
     z = concat_avis_to_zarr(folder, output_path="session.zarr",
                             pattern="*.avi", skip_if_exists=True)
     # Single-pass downsample-on-write (e.g. 2x spatial, 2x temporal):
@@ -312,6 +312,7 @@ def concat_avis_to_zarr(
     shuffle: str = "shuffle",
     ssub: int = 1,
     tsub: int = 1,
+    crop_bbox: "tuple[int, int, int, int] | None" = None,
 ):
     """Concatenate numbered AVIs in `folder` into a single time-chunked zarr.
 
@@ -377,10 +378,17 @@ def concat_avis_to_zarr(
             ``< tsub`` frames are dropped, so the output frame count is
             ``sum(n_i // tsub)``. Pass ``dtype="float32"`` to keep the
             fractional precision of the binned means.
+        crop_bbox: Optional ``(y0, y1, x0, x1)`` native-pixel spatial crop
+            applied to every frame **before** ``ssub``/``tsub`` binning.
+            ``None`` (default) = no crop. Output spatial dims become
+            ``((y1-y0)//ssub, (x1-x0)//ssub)``. Bounds are validated against
+            the source frame size from the pre-scan.
 
     Returns:
-        Open zarr.Array with shape (T_out, H//ssub, W//ssub), where
-        ``T_out == sum(n_i // tsub)`` (``== T_total`` when ``tsub == 1``).
+        Open zarr.Array with shape (T_out, H//ssub, W//ssub), where ``H, W``
+        are the cropped dims when ``crop_bbox`` is given (else the source
+        dims), and ``T_out == sum(n_i // tsub)`` (``== T_total`` when
+        ``tsub == 1``).
 
     Raises:
         FileNotFoundError: `folder` is not a directory.
@@ -460,9 +468,22 @@ def concat_avis_to_zarr(
     # are dropped.
     out_counts = [c // tsub for c in counts] if tsub > 1 else list(counts)
     T_out = int(sum(out_counts))
-    out_H, out_W = ref_H // ssub, ref_W // ssub
+    # Spatial crop (applied per frame before binning) changes H/W, not T.
+    if crop_bbox is not None:
+        y0, y1, x0, x1 = crop_bbox
+        if not (0 <= y0 < y1 <= ref_H and 0 <= x0 < x1 <= ref_W):
+            raise ValueError(
+                f"crop_bbox {crop_bbox} (y0,y1,x0,x1) out of bounds for "
+                f"{ref_H}x{ref_W} frames"
+            )
+        crop_H, crop_W = y1 - y0, x1 - x0
+    else:
+        crop_H, crop_W = ref_H, ref_W
+    out_H, out_W = crop_H // ssub, crop_W // ssub
     if verbose:
         print(f"\nTotal: {T_total} frames  x  {ref_H}x{ref_W} px")
+        if crop_bbox is not None:
+            print(f"Crop {crop_bbox} -> {crop_H}x{crop_W} px")
         if ssub > 1 or tsub > 1:
             print(f"Downsample ssub={ssub} tsub={tsub} -> "
                   f"{T_out} frames  x  {out_H}x{out_W} px")
@@ -496,14 +517,14 @@ def concat_avis_to_zarr(
     if n_jobs == 1:
         write_start = _run_serial(
             avis, counts, store, chunk_t, dtype, grayscale, grayscale_method,
-            ssub, tsub, verbose,
+            ssub, tsub, verbose, crop_bbox,
         )
     else:
         if queue_maxsize is None:
             queue_maxsize = 2 * n_jobs
         write_start = _run_parallel(
             avis, out_counts, store, chunk_t, dtype, grayscale, grayscale_method,
-            ssub, tsub, n_jobs, queue_maxsize, verbose,
+            ssub, tsub, n_jobs, queue_maxsize, verbose, crop_bbox,
         )
     _decode_secs = _time.time() - _t0_decode
 
@@ -527,7 +548,7 @@ def concat_avis_to_zarr(
 # ---------------------------------------------------------------------------
 
 def _run_serial(avis, counts, store, chunk_t, dtype, grayscale,
-                grayscale_method, ssub, tsub, verbose) -> int:
+                grayscale_method, ssub, tsub, verbose, crop_bbox=None) -> int:
     """Single-threaded path: same loop as before, plus the luma fast-path.
 
     Kept as a verbatim alternative to the parallel pipeline for debugging
@@ -554,6 +575,18 @@ def _run_serial(avis, counts, store, chunk_t, dtype, grayscale,
     if use_luma:
         import av
 
+    # Spatial crop applied per frame before binning (matches the parallel
+    # path's _decode_avi_worker, so serial output stays byte-equal).
+    if crop_bbox is not None:
+        _cy0, _cy1, _cx0, _cx1 = crop_bbox
+
+        def _crop(it):
+            for fr in it:
+                yield fr[_cy0:_cy1, _cx0:_cx1]
+    else:
+        def _crop(it):
+            return it
+
     for avi_idx, avi in enumerate(avis):
         if verbose:
             print(f"  [{avi_idx + 1}/{len(avis)}] {avi.name} ...",
@@ -565,7 +598,7 @@ def _run_serial(avis, counts, store, chunk_t, dtype, grayscale,
                 stream.thread_type = "FRAME"
                 raw_iter = (frame.to_ndarray(format="gray8")
                             for frame in container.decode(stream))
-                for out_fr in _binned_file_frames(raw_iter, ssub, tsub):
+                for out_fr in _binned_file_frames(_crop(raw_iter), ssub, tsub):
                     buf.append(out_fr)
                     if len(buf) == chunk_t:
                         write_start = _flush(buf, write_start)
@@ -574,7 +607,7 @@ def _run_serial(avis, counts, store, chunk_t, dtype, grayscale,
                 container.close()
         else:
             raw_iter = _iter_frames(avi, grayscale=grayscale)
-            for out_fr in _binned_file_frames(raw_iter, ssub, tsub):
+            for out_fr in _binned_file_frames(_crop(raw_iter), ssub, tsub):
                 buf.append(out_fr)
                 if len(buf) == chunk_t:
                     write_start = _flush(buf, write_start)
@@ -588,7 +621,7 @@ def _run_serial(avis, counts, store, chunk_t, dtype, grayscale,
 
 def _run_parallel(avis, out_counts, store, chunk_t, dtype, grayscale,
                   grayscale_method, ssub, tsub, n_jobs, queue_maxsize,
-                  verbose) -> int:
+                  verbose, crop_bbox=None) -> int:
     """Producer-consumer parallel pipeline.
 
     Spawns up to `n_jobs` decoder threads (one per AVI, capped at `n_jobs`
@@ -620,7 +653,7 @@ def _run_parallel(avis, out_counts, store, chunk_t, dtype, grayscale,
         t = threading.Thread(
             target=_decode_with_admission,
             args=(path, i, offset, chunk_t, grayscale, grayscale_method,
-                  dtype, ssub, tsub, out_q, errors, stop_event),
+                  dtype, ssub, tsub, out_q, errors, stop_event, crop_bbox),
             name=f"decoder-{i}-{path.name}",
             daemon=True,
         )

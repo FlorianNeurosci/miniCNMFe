@@ -28,16 +28,31 @@ from minicnmfe.temporal import estimate_ar_params
 def suggest_mc_gsig_and_sigma(
     sample: np.ndarray, *, min_sigma: float = 2, max_sigma: float = 15,
     num_sigma: int = 10, threshold: float = 0.05, top_n: int = 30,
+    highpass_sigma: "float | None" = 8.0,
 ) -> "tuple[int, float, dict]":
     """Neuron radius from a temporal-std projection + ``blob_log``.
 
     Returns ``(mc_gSig_filt, sigma_native, evidence)``. The high-pass radius for
     MC should roughly match the neuron radius, so the same value seeds the
     extraction-grid ``sigma`` (stage 3).
+
+    ``highpass_sigma`` (default 8 px) subtracts a wide Gaussian blur from the
+    temporal-std image before ``blob_log``, removing broad out-of-focus haze /
+    vignetting / gradients. Without it, on a hazy or out-of-focus FOV ``blob_log``
+    latches onto large diffuse background structures and the median radius
+    inflates (e.g. 6.3 px when the neurons are ~4 px), which then blows up
+    ``sigma`` / ``ssub`` / ``min_pixel`` and makes footprints sprawl. The cutoff
+    is set well above the neuron scale so real neurons survive; clean FOVs (no
+    broad background) are left unchanged. Pass ``0`` / ``None`` to disable.
     """
     from skimage.feature import blob_log
 
-    std_img = sample.std(axis=0)
+    std_img = sample.std(axis=0).astype(np.float32)
+    if highpass_sigma:
+        import cv2
+
+        bg = cv2.GaussianBlur(std_img, (0, 0), sigmaX=float(highpass_sigma))
+        std_img = np.clip(std_img - bg, 0.0, None)
     std_norm = (std_img - std_img.min()) / (std_img.max() - std_img.min() + 1e-8)
     blobs = blob_log(
         std_norm, min_sigma=min_sigma, max_sigma=max_sigma,

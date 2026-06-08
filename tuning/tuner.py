@@ -10,7 +10,7 @@ correctly. ``ssub``/``tsub`` are carried separately in ``downsample.json``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +21,7 @@ from tuning import heuristics as H
 from tuning import io_sample as S
 from tuning.metrics import mc_quality
 from tuning.sweep import SweepSpec, run_sweep
+from tuning.validate import good_defaults
 
 
 @dataclass
@@ -66,7 +67,14 @@ def run_tuning(cfg: TunerConfig) -> dict:
     """Run the tuning workflow and write the report folder. Returns the result dict."""
     from tuning import report as R
 
-    base = cfg.base_params or CNMFeParams()
+    # Default base = the long-recording overrides (global_bg_rank=1, n_iter_main=2,
+    # init_stride=2, min_pixel floor + SNR ghost cut, physical-decay prior). The
+    # tuner overwrites only the fields it has data-driven values for, so the
+    # recommendation *contains* these wins and validation can run it verbatim.
+    # An explicit --params base is respected unchanged.
+    base = cfg.base_params or good_defaults(
+        frame_rate_hz=cfg.frame_rate_hz, decay_time_ms=cfg.decay_time_ms,
+        n_jobs=cfg.n_jobs)
     base = replace(base, n_jobs=cfg.n_jobs,
                    frame_rate_hz=cfg.frame_rate_hz, decay_time_ms=cfg.decay_time_ms)
     kind = _detect_kind(cfg.input_path)
@@ -79,7 +87,7 @@ def run_tuning(cfg: TunerConfig) -> dict:
     sources: dict = {"frame_rate_hz": "user", "decay_time_ms": "user"}
     rationale: dict = {}
 
-    sigma_native = 4.0
+    sigma_native = 4.0  # fallback; set from the raw sample (AVI) or mc sample (zarr) below
     ssub = cfg.ssub if cfg.ssub is not None else 1
     tsub = cfg.tsub if cfg.tsub is not None else 1
 
@@ -113,11 +121,15 @@ def run_tuning(cfg: TunerConfig) -> dict:
             tsub = t_auto
 
     # -- Resolve the mc.zarr the extraction stages run on --
+    mc_shifts = None
     if cfg.reuse_mc_zarr is not None:
         mc = open_zarr(cfg.reuse_mc_zarr)
         mc_path = Path(cfg.reuse_mc_zarr)
+        sh_npy = mc_path.parent / "shifts.npy"
+        if sh_npy.exists():
+            mc_shifts = np.load(sh_npy)
     elif kind == "avi":
-        mc, _shifts = S.quick_fused_mc(
+        mc, mc_shifts = S.quick_fused_mc(
             cfg.input_path, run_dir / "mc", base, ssub=ssub, tsub=tsub,
             n_template_avis=cfg.n_template_avis, max_avis=cfg.max_avis, pattern=cfg.pattern)
         mc_path = run_dir / "mc" / "mc.zarr"
@@ -125,10 +137,22 @@ def run_tuning(cfg: TunerConfig) -> dict:
         mc = open_zarr(cfg.input_path)
         mc_path = Path(cfg.input_path)
         ssub = tsub = 1  # a provided zarr is taken as-is
+        sh_npy = mc_path.parent / "shifts.npy"
+        if sh_npy.exists():
+            mc_shifts = np.load(sh_npy)
 
     dims = (int(mc.shape[1]), int(mc.shape[2]))
     T = int(mc.shape[0])
     mc_sample, sample_idx = S.load_mc_sample(mc, cfg.n_init_frames)
+
+    # For a directly-provided zarr there was no raw-AVI sample to measure the
+    # neuron radius from (the AVI path sets sigma_native at stage 1). Estimate it
+    # from the mc sample instead of leaving the hardcoded default — it seeds the
+    # CORR/PNR PSF width for the sigma refit below. ssub==1 here (provided zarr is
+    # taken as-is), so the mc grid is native and the estimate is in native units.
+    if kind == "zarr":
+        _gsig, sigma_native, ev = H.suggest_mc_gsig_and_sigma(mc_sample)
+        stages["sigma_native"] = ev
 
     # -- Stage 3: initialisation (on the mc.zarr grid) --
     sigma_seed = max(2.0, sigma_native / ssub) if ssub > 1 else sigma_native
@@ -164,9 +188,16 @@ def run_tuning(cfg: TunerConfig) -> dict:
                                         sample_idx=sample_idx)
         rows, best_params, best_model = run_sweep(
             mc_path, base_grid, cfg.sweep, region_crop=region_crop,
-            n_jobs=cfg.n_jobs, workdir=run_dir / "sweep", max_candidates=cfg.max_candidates)
+            n_jobs=cfg.n_jobs, workdir=run_dir / "sweep",
+            max_candidates=cfg.max_candidates, cn=cn)
         sweep_result = {"rows": rows, "region": cfg.region, "region_crop": region_crop}
         for f in best_swept:
+            # global_bg_rank / init_stride are long-recording wins the short sweep
+            # cutout can't evaluate (see LEARNINGS.md): keep them pinned to the base
+            # so a misleading cutout sweep can't downgrade them in the recommendation.
+            if f in ("global_bg_rank", "init_stride"):
+                sources[f] = "base"
+                continue
             best_swept[f] = getattr(best_params, f)
             sources[f] = "sweep"
 
@@ -181,11 +212,14 @@ def run_tuning(cfg: TunerConfig) -> dict:
         fr_grid = base_grid.frame_rate_hz
         decay_ms, ev = H.suggest_decay_time(stage4_model, fr_grid)
         stages["decay"] = ev
-        recommended["decay_time_ms"] = decay_ms
-        sources["decay_time_ms"] = "data"
-        rationale["decay_time_ms"] = "median per-component Yule-Walker τ"
+        # Diagnostic only: the data Yule-Walker τ is drift-inflated on long
+        # recordings (LEARNINGS.md), so the recommendation keeps the physical
+        # indicator τ (cfg.decay_time_ms, already in `recommended`).
+        rationale["decay_time_ms"] = (
+            f"physical indicator τ (data Yule-Walker τ ≈ {decay_ms:.0f} ms is "
+            "drift-inflated; shown for diagnosis, not used)")
 
-        gpw, ev = H.suggest_g_prior_weight(ev["g_yw"], fr_grid, decay_ms)
+        gpw, ev = H.suggest_g_prior_weight(ev["g_yw"], fr_grid, cfg.decay_time_ms)
         stages["g_prior"] = ev
         recommended["g_prior_weight"] = gpw
         sources["g_prior_weight"] = "data"
@@ -216,15 +250,24 @@ def run_tuning(cfg: TunerConfig) -> dict:
     rationale["min_corr"] = rationale["min_pnr"] = "knee of the seed-count surface"
     rationale["min_pixel"] = "25th-pct footprint area (×ssub² → native)"
 
+    # One merged CNMFeParams: the long-recording base with the tuner's data-driven
+    # native-unit fields layered on. This is the single source of truth — it is
+    # serialized to recommended_params.json AND validated verbatim on the full
+    # recording (tuning.validate.tune_then_validate), so what you see validated is
+    # what you apply downstream.
+    _valid = {f.name for f in fields(CNMFeParams)}
+    rec_params = replace(base, **{k: v for k, v in recommended.items() if k in _valid})
+
     result = {
         "config": {"name": cfg.name, "input": str(cfg.input_path),
                    "input_kind": kind, "mode": cfg.mode, "region": cfg.region,
                    "ssub": ssub, "tsub": tsub, "frame_rate_hz": cfg.frame_rate_hz,
                    "decay_time_ms": cfg.decay_time_ms, "n_jobs": cfg.n_jobs,
                    "timestamp": cfg.timestamp, "cli": cfg.cli},
-        "recommended": recommended, "sources": sources, "rationale": rationale,
+        "recommended": recommended, "recommended_params": rec_params,
+        "sources": sources, "rationale": rationale,
         "ssub": ssub, "tsub": tsub, "stages": stages,
-        "sweep": sweep_result, "mc_quality": mc_quality(getattr(mc, "shifts", None)),
+        "sweep": sweep_result, "mc_quality": mc_quality(mc_shifts),
     }
 
     R.write_report(run_dir, result, best_model=stage4_model, cn=cn)

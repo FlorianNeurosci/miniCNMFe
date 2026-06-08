@@ -1,5 +1,6 @@
 """minicnmfe — clean CNMFe for 1-photon calcium imaging."""
 
+from minicnmfe.concat_avis_to_zarr import concat_avis_to_zarr
 from minicnmfe.evaluate import auto_evaluate_components
 from minicnmfe.io import (
     avi_to_zarr,
@@ -15,6 +16,7 @@ __all__ = [
     "CNMFeParams",
     "auto_evaluate_components",
     "avi_to_zarr",
+    "concat_avis_to_zarr",
     "open_zarr",
     "save_zarr",
     "stage_zarr_to_local",

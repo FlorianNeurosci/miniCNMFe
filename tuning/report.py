@@ -37,6 +37,7 @@ SYMPTOM_CAUSE_KNOB = """\
 |---|---|---|---|
 | **Two or more bright peaks** in many footprints | `sigma` too large → seed-suppression disk wipes neighbours → LASSO merges them in space | `sigma` 5→3 (single biggest lever), also reduce `min_pnr` to let more seeds in | footprint_grid |
 | **Soft amoeba blobs** filling crop window | Halo dominated; `spatial_max_thr` too low, residual background drift | `spatial_max_thr` 0.1→0.25; `global_bg_rank` 0→1; verify detrend ran | footprint_grid, eccentricity |
+| **Sprawling footprints + `sigma`/`ssub`/`min_pixel` ~2× a comparable session** | Hazy / out-of-focus FOV: `blob_log` measured the neuron radius off broad background, not the cells | Auto-fixed by the `highpass_sigma` pre-filter in the radius estimate; check `fig_mc_gsig` (histogram should sit at neuron scale), raise `highpass_sigma` if it persists | mc_gsig, footprint_grid |
 | **Donut / hollow ring** footprints | Ring background ate the soma | `ring_constrain_sum=True`; `ring_size_factor` 1.5→1.2 | footprint_grid |
 | **Crescent / arc** footprints | Asymmetric ring subtraction; usually paired with multi-peak | Fix `sigma` first; then `spatial_circular_max_dist_factor` 1.5→1.0 | footprint_grid |
 | **Streaky / elongated** (ecc > 0.8 common) | Vasculature contamination, or two close neurons unsplit | `spatial_circular_max_dist_factor` 1.5→1.0; for vasculature draw an ROI mask | footprint_grid, eccentricity |
@@ -369,8 +370,37 @@ def fig_sweep_traces(model, out_path=None, n: int = 10):
     Cproj = C + np.asarray(model.YrA)
     K = C.shape[0]
     n = min(n, K)
-    # Pick the highest-amplitude cells.
-    order = np.argsort(-C.max(axis=1))[:n]
+
+    # Cap the correlation work on very dense models (full-FOV path).
+    if K > 400:
+        keep = np.argsort(-C.max(axis=1))[:400]
+    else:
+        keep = np.arange(K)
+    corr = np.corrcoef(C[keep]) if len(keep) > 1 else np.array([[1.0]])
+    corr = np.nan_to_num(corr)
+
+    # Greedy DIVERSE pick: seed with the highest-amplitude cell, then repeatedly
+    # add the component LEAST correlated with those already chosen. The old
+    # top-N-by-amplitude picked exactly the cells riding a shared signal, making
+    # synchronized data look like a bug; this shows the most distinct signals
+    # available, and the title quantifies how distinct they actually are.
+    seed = int(np.argmax(C[keep].max(axis=1)))
+    chosen = [seed]
+    while len(chosen) < min(n, len(keep)):
+        maxc = np.abs(corr[chosen]).max(axis=0)
+        maxc[chosen] = np.inf  # don't reselect
+        chosen.append(int(np.argmin(maxc)))
+    order = [int(keep[c]) for c in chosen]
+
+    # redundancy annotation: median |pairwise corr| among components
+    if corr.shape[0] > 1:
+        iu = np.triu_indices(corr.shape[0], k=1)
+        pair = np.abs(corr[iu])
+        pair = pair[np.isfinite(pair)]
+        med = float(np.median(pair)) if pair.size else float("nan")
+    else:
+        med = float("nan")
+
     fig, ax = plt.subplots(1, 1, figsize=(11, 1.0 * n + 1))
     for row, k in enumerate(order):
         off = row * 1.2
@@ -383,7 +413,12 @@ def fig_sweep_traces(model, out_path=None, n: int = 10):
         ax.text(-0.01 * C.shape[1], off + 0.5, f"k={k}", fontsize=7, ha="right", va="center")
     ax.set_yticks([])
     ax.set_xlabel("frame")
-    ax.set_title("best candidate: C (blue) vs C+YrA (grey), top cells by amplitude")
+    verdict = "high → synchronized / shared signal" if (med == med and med > 0.5) \
+        else "low → distinct signals"
+    ax.set_title(
+        "most-decorrelated candidates: C (blue) vs C+YrA (grey)\n"
+        f"median pairwise trace corr = {med:.2f} ({verdict})"
+    )
     fig.tight_layout()
     return _finish(fig, out_path)
 
@@ -770,8 +805,12 @@ def write_report(run_dir, result, *, best_model=None, cn=None):
             fig_sweep_traces(best_model, out_path=run_dir / "fig_sweep_traces.png")
             saved["sweep_traces"] = "fig_sweep_traces.png"
 
-    # recommended_params.json + downsample.json
-    params, filtered = _params_json(result["recommended"])
+    # recommended_params.json + downsample.json. Serialize the merged CNMFeParams
+    # (the long-recording base + the tuner's data-driven fields) so the JSON is a
+    # complete param set — and the exact one validated on the full recording.
+    # Fall back to the curated dict for older callers that don't pass it.
+    _, filtered = _params_json(result["recommended"])
+    params = result.get("recommended_params") or _params_json(result["recommended"])[0]
     params.to_json(run_dir / "recommended_params.json")
     (run_dir / "downsample.json").write_text(json.dumps(
         {"ssub": int(result.get("ssub", 1)), "tsub": int(result.get("tsub", 1))}, indent=2))
