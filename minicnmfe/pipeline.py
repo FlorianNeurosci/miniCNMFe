@@ -327,7 +327,7 @@ class CNMFeParams:
     # "N pixels hit max_iter ..." at the end of update_spatial;
     # alternatively loosen `spatial_tol` (less strict convergence, faster).
     # Both knobs trade compute for tightness of the LASSO solution.
-    spatial_max_iter: int = 1000
+    spatial_max_iter: int = 10000
     spatial_tol: float = 1e-4
     # [NON-STANDARD; bandaid for LASSO spread] Apply `circular_constraint`
     # (initialization.py:33-53) as the final step of `threshold_footprint`.
