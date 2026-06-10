@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from minicnmfe.initialization import detect_seeds, greedy_corr_pnr
+from minicnmfe.initialization import greedy_corr_pnr
 from minicnmfe.motion_correction import estimate_shifts
 from minicnmfe.preprocess import correlation_pnr
 from minicnmfe.temporal import estimate_ar_params
@@ -184,43 +184,68 @@ def suggest_sigma_extraction(
     return sigma_refit, cn, pnr, evidence
 
 
+def _celllike_curve(img, thr_axis, a_min, a_max, min_solidity):
+    """Per-threshold ``(#cell-like components, largest-CC fraction)`` for one image.
+
+    A cell-like component is connected, soma-sized (``a_min ≤ area ≤ a_max``) and
+    compact (``solidity > min_solidity``). ``largest_frac`` = largest component area
+    ÷ total foreground — near 1 while one background mesh dominates, dropping once it
+    fragments into blobs.
+    """
+    from skimage.measure import label, regionprops
+
+    n_cell = np.zeros(len(thr_axis), dtype=int)
+    largest_frac = np.zeros(len(thr_axis), dtype=float)
+    for k, t in enumerate(thr_axis):
+        mask = img > t
+        fg = int(mask.sum())
+        if fg == 0:
+            continue
+        props = regionprops(label(mask))
+        areas = np.fromiter((p.area for p in props), dtype=float, count=len(props))
+        largest_frac[k] = float(areas.max() / fg)
+        n_cell[k] = sum(1 for p in props
+                        if a_min <= p.area <= a_max and p.solidity > min_solidity)
+    return n_cell, largest_frac
+
+
 def suggest_corr_pnr(
     cn: np.ndarray, pnr: np.ndarray, sigma: float, *,
-    corr_grid: "np.ndarray | None" = None, pnr_grid: "np.ndarray | None" = None,
-    keep_frac: float = 0.3,
+    corr_floor: float = 0.4, pnr_floor: float = 2.0, n_thr: int = 30,
+    min_solidity: float = 0.85,
 ) -> "tuple[float, float, dict]":
-    """``min_corr`` / ``min_pnr`` from the knee of a seed-count surface.
+    """``min_corr`` / ``min_pnr`` by image-threshold morphology.
 
-    Sweeps ``detect_seeds`` over a (corr, pnr) grid; suggests the most
-    permissive pair whose seed count is still ≥ ``keep_frac`` of the peak
-    (stricter is safer — past the knee, count rises by recruiting noise).
-    Returns ``(min_corr, min_pnr, evidence)``.
+    Mirrors manual CaImAn tuning: raise each image's threshold (``vmin``) until the
+    diffuse background mesh fragments and only compact cell-blobs remain. For the CORR
+    and PNR images independently, sweep the threshold and count **cell-like** connected
+    components (soma-sized area from ``sigma``, ``solidity > min_solidity``); pick the
+    threshold that maximises that count — most blobs visible = background gone, cells
+    not yet lost. ``min_corr`` is read off the CORR image, ``min_pnr`` off the PNR
+    image (independent, like the two sliders). Returns ``(min_corr, min_pnr, evidence)``.
     """
-    if corr_grid is None:
-        corr_grid = np.linspace(0.6, 0.95, 8)
-    if pnr_grid is None:
-        pnr_grid = np.linspace(3.0, 20.0, 8)
-    counts = np.zeros((len(corr_grid), len(pnr_grid)), dtype=int)
-    min_dist = max(2, int(sigma))
-    for i, mc_thr in enumerate(corr_grid):
-        for j, mp_thr in enumerate(pnr_grid):
-            seeds = detect_seeds(cn, pnr, float(mc_thr), float(mp_thr),
-                                 min_distance=min_dist)
-            counts[i, j] = len(seeds)
+    import math
 
-    peak = int(counts.max())
-    keep_mask = counts >= keep_frac * peak
-    if peak > 0 and keep_mask.any():
-        ii = np.argwhere(keep_mask)
-        pair_idx = ii[np.lexsort((-ii[:, 1], -ii[:, 0]))][0]
-        min_corr = float(corr_grid[pair_idx[0]])
-        min_pnr = float(pnr_grid[pair_idx[1]])
-    else:
-        pair_idx = None
-        min_corr, min_pnr = 0.8, 10.0
-    evidence = {"counts": counts, "corr_grid": np.asarray(corr_grid),
-                "pnr_grid": np.asarray(pnr_grid), "peak": peak,
-                "pair_idx": pair_idx, "cn": cn, "pnr": pnr}
+    a_min = max(3, int(0.5 * math.pi * sigma ** 2))
+    a_max = max(a_min + 1, int(math.pi * (3.0 * sigma) ** 2))
+    corr_axis = np.linspace(corr_floor, 0.95, n_thr)
+    pnr_hi = float(np.percentile(pnr, 99.5))
+    pnr_axis = np.linspace(pnr_floor, max(pnr_floor + 1.0, pnr_hi), n_thr)
+
+    nc_corr, lf_corr = _celllike_curve(cn, corr_axis, a_min, a_max, min_solidity)
+    nc_pnr, lf_pnr = _celllike_curve(pnr, pnr_axis, a_min, a_max, min_solidity)
+
+    # argmax ties -> lowest threshold (more permissive). Fall back to safe defaults
+    # when no cell-like blob is ever found (degenerate / empty image).
+    min_corr = float(corr_axis[int(np.argmax(nc_corr))]) if nc_corr.max() > 0 else 0.8
+    min_pnr = float(pnr_axis[int(np.argmax(nc_pnr))]) if nc_pnr.max() > 0 else 10.0
+
+    evidence = {"cn": cn, "pnr": pnr, "sigma": float(sigma),
+                "corr_axis": corr_axis, "pnr_axis": pnr_axis,
+                "ncell_corr": nc_corr, "ncell_pnr": nc_pnr,
+                "largest_frac_corr": lf_corr, "largest_frac_pnr": lf_pnr,
+                "a_min": a_min, "a_max": a_max,
+                "min_corr": min_corr, "min_pnr": min_pnr}
     return min_corr, min_pnr, evidence
 
 

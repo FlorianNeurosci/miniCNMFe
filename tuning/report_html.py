@@ -46,7 +46,8 @@ _FIG_GROUPS = [
 
 _SWEEP_COLS = ["idx", "sigma", "min_corr", "min_pnr", "merge_thr_corr",
                "global_bg_rank", "init_stride", "K", "K_accepted",
-               "cprojcorr_median", "npix_median", "snr_median", "score", "wall_s"]
+               "cprojcorr_median", "npix_median", "multipeak_frac", "npix_oversize",
+               "snr_median", "score", "wall_s"]
 
 _CSS = """
 :root { color-scheme: light dark; }
