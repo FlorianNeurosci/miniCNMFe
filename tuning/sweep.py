@@ -54,6 +54,61 @@ class SweepSpec:
         return out
 
 
+def resolve_offset_grid(
+    spec, anchor: float, *, floor: float, default_around=(0,),
+    round_anchor: bool = False, clip_max: "float | None" = None,
+) -> "list[float]":
+    """Resolve a heuristic-relative sweep spec into concrete grid values ("Offset DSL").
+
+    A data-driven ``anchor`` (sigma radius, or a detected ``min_corr``/``min_pnr``) is
+    only known at sweep runtime, so a stored spec expresses the grid *relative* to it.
+    Resolving here guarantees the anchor is always one of the tested candidates — the
+    failure mode it fixes is a static grid (e.g. sigma 3,4,5 or pnr 6,10,14) that sits
+    away from the data-driven value, which then can never be a candidate.
+
+    Accepted ``spec`` forms:
+    - ``None`` — ``{anchor + o for o in default_around}``.
+    - ``{"around": [...], "extra": [...]}`` — offsets around the anchor plus absolute
+      ``extra`` values (either key optional; ``around`` defaults to ``[0]`` so the
+      anchor is always present).
+    - ``list``/``tuple`` — back-compat absolute values, with the anchor injected.
+    - scalar — a single absolute value, anchor injected.
+
+    The anchor is optionally ``round``-ed (``round_anchor``), all values are clamped to
+    ``[floor, clip_max]``, deduped and sorted.
+    """
+    base = float(anchor)
+    if round_anchor:
+        base = float(int(round(base)))
+    base = max(floor, base)
+    if spec is None:
+        around, extra = list(default_around), []
+    elif isinstance(spec, dict):
+        around = list(spec.get("around", [0]))
+        extra = list(spec.get("extra", []))
+    elif isinstance(spec, (list, tuple)):
+        around, extra = [0], list(spec)
+    else:
+        around, extra = [0], [spec]
+    vals = {base + float(o) for o in around} | {float(v) for v in extra}
+    out = set()
+    for v in vals:
+        v = max(floor, v)
+        if clip_max is not None:
+            v = min(clip_max, v)
+        out.add(v)
+    return sorted(out)
+
+
+def resolve_sigma_grid(spec_sigma, sigma_ds: float) -> "list[float]":
+    """Sigma grid via the Offset DSL, anchored on the ``blob_log`` radius ``sigma_ds``.
+
+    Omitted -> heuristic-centred ``{s-1, s, s+1}``; floored at 2. Thin wrapper over
+    :func:`resolve_offset_grid` (see it for the full spec form)."""
+    return resolve_offset_grid(spec_sigma, sigma_ds, floor=2.0,
+                               default_around=(-1, 0, 1), round_anchor=True)
+
+
 def build_candidates(
     base_params: CNMFeParams, spec: SweepSpec, max_candidates: int = 24,
 ) -> "list[tuple[CNMFeParams, dict]]":

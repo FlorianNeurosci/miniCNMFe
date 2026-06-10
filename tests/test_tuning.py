@@ -103,7 +103,8 @@ def test_heuristics_on_simulator(sim_movie):
     assert np.isfinite(sigma_refit) and cn.shape == sim_movie.shape[1:]
 
     min_corr, min_pnr, ev = H.suggest_corr_pnr(cn, pnr, sigma_refit)
-    assert 0.0 < min_corr < 1.0 and min_pnr > 0.0 and "counts" in ev
+    assert 0.0 < min_corr < 1.0 and min_pnr > 0.0
+    assert {"ncell_corr", "ncell_pnr", "corr_axis", "pnr_axis"} <= set(ev)
 
     min_pixel, ev = H.suggest_min_pixel(sample, sigma_refit, min_corr, min_pnr,
                                         sim_movie.shape[1:])
@@ -159,13 +160,120 @@ def test_sigma_heuristic_robust_to_background_haze():
 def test_metrics_on_fitted_model(fitted_model):
     q = M.model_quality(fitted_model)
     for key in ("K", "K_accepted", "accepted_frac", "cprojcorr_mean",
-                "cprojcorr_median", "npix_median", "npix_iqr", "snr_mean",
-                "snr_median"):
+                "cprojcorr_median", "npix_median", "npix_iqr", "multipeak_frac",
+                "npix_oversize", "snr_mean", "snr_median"):
         assert key in q
     assert 0.0 <= q["accepted_frac"] <= 1.0
     if q["K"] > 0:
         assert -1.0 <= q["cprojcorr_median"] <= 1.0
     assert np.isfinite(M.composite_score(q))
+
+
+def _gauss_blob(dims, centre, sigma=3.0):
+    from scipy.ndimage import gaussian_filter
+
+    img = np.zeros(dims, np.float32)
+    img[centre] = 1.0
+    img = gaussian_filter(img, sigma)
+    return img / (img.max() + 1e-8)
+
+
+def _fake_model(footprints_2d, sigma=3.0):
+    """Lightweight stand-in exposing exactly what ``model_quality`` reads."""
+    import types
+
+    import scipy.sparse as sp
+
+    H_, W_ = footprints_2d[0].shape
+    K = len(footprints_2d)
+    A = sp.csc_matrix(np.stack([fp.ravel() for fp in footprints_2d], axis=1))
+    rng = np.random.default_rng(0)
+    C = rng.standard_normal((K, 60))  # non-constant so per-cell corr is defined
+    return types.SimpleNamespace(
+        A=A, C=C, YrA=np.zeros_like(C),          # YrA=0 -> cprojcorr == 1 for all
+        accepted_mask=np.ones(K, bool), eval_info=None,
+        dims=(H_, W_), params=CNMFeParams(sigma=sigma))
+
+
+def test_multipeak_penalises_over_merge():
+    """An over-merged candidate (two somata fused into each footprint) must score
+    BELOW a compact one-cell-per-footprint candidate at matched purity/accepted
+    fraction — the bug that picked the over-large-sigma footprints. The only
+    score difference is the multi-peak penalty."""
+    dims = (40, 40)
+    # All peaks well inside the frame (>=10 px from any border) so peak_local_max's
+    # border exclusion can't drop a genuine peak.
+    centres = [(10, 10), (10, 26), (26, 10), (26, 26)]
+    compact = _fake_model([_gauss_blob(dims, c) for c in centres])
+    # Same cells, but each footprint fuses a second, 14-16 px separated soma.
+    pairs = [((10, 10), (10, 26)), ((26, 10), (26, 26)),
+             ((10, 12), (26, 12)), ((12, 26), (26, 26))]
+    merged = _fake_model([_gauss_blob(dims, a) + _gauss_blob(dims, b)
+                          for a, b in pairs])
+
+    qc, qm = M.model_quality(compact), M.model_quality(merged)
+    # Matched purity (corr==1) and accepted fraction; differ only on multipeak.
+    assert qc["cprojcorr_median"] == pytest.approx(1.0)
+    assert qm["cprojcorr_median"] == pytest.approx(1.0)
+    assert qc["multipeak_frac"] == pytest.approx(0.0)
+    assert qm["multipeak_frac"] >= 0.75
+    assert M.composite_score(qc) > M.composite_score(qm)
+
+
+def test_resolve_sigma_grid_always_includes_heuristic():
+    from tuning.sweep import resolve_sigma_grid
+
+    # None -> heuristic-centred {s-1, s, s+1}, floored at 2.
+    assert resolve_sigma_grid(None, 5.0) == [4.0, 5.0, 6.0]
+    assert resolve_sigma_grid(None, 2.0) == [2.0, 3.0]          # s-1 clips to 2
+    # Offset DSL: around offsets + absolute extras, heuristic (offset 0) present.
+    assert resolve_sigma_grid({"around": [-1, 0, 1], "extra": [9]}, 5.0) == [4.0, 5.0, 6.0, 9.0]
+    # Back-compat absolute list: heuristic injected alongside the given values.
+    assert resolve_sigma_grid([3, 4, 5], 2.0) == [2.0, 3.0, 4.0, 5.0]
+    # Scalar + sub-floor extra dropped.
+    assert resolve_sigma_grid(4, 2.0) == [2.0, 4.0]
+    assert resolve_sigma_grid({"extra": [1]}, 2.0) == [2.0]
+
+
+def test_resolve_offset_grid_thresholds():
+    from tuning.sweep import resolve_offset_grid
+
+    # min_pnr style: omitted -> just the detected value (no sweep).
+    assert resolve_offset_grid(None, 12.0, floor=2.0) == [12.0]
+    # around offsets, anchor always present.
+    assert resolve_offset_grid({"around": [-3, 0, 3]}, 12.0, floor=2.0) == [9.0, 12.0, 15.0]
+    # min_corr style: floor + clip_max applied to offsets.
+    assert resolve_offset_grid({"around": [-0.05, 0, 0.05]}, 0.84, floor=0.3, clip_max=0.98) == \
+        pytest.approx([0.79, 0.84, 0.89])
+    assert resolve_offset_grid({"around": [0, 0.2]}, 0.9, floor=0.3, clip_max=0.98) == [0.9, 0.98]
+    # sub-floor offset clamps to floor.
+    assert resolve_offset_grid({"around": [-20, 0]}, 12.0, floor=2.0) == [2.0, 12.0]
+    # back-compat absolute list injects the anchor.
+    assert resolve_offset_grid([6, 10, 14], 12.0, floor=2.0) == [6.0, 10.0, 12.0, 14.0]
+
+
+def test_suggest_corr_pnr_morphology():
+    from scipy.ndimage import gaussian_filter
+
+    # CORR-like image: compact cell blobs (radius ~3) on diffuse low-level haze.
+    rng = np.random.default_rng(1)
+    H_ = W_ = 120
+    cells = np.zeros((H_, W_), np.float32)
+    for _ in range(15):
+        y, x = rng.integers(15, H_ - 15), rng.integers(15, W_ - 15)
+        cells[y, x] = 1.0
+    cells = gaussian_filter(cells, 3.0); cells /= cells.max()
+    haze = gaussian_filter(rng.standard_normal((H_, W_)).astype(np.float32), 15.0)
+    haze = 0.4 * (haze - haze.min()) / (np.ptp(haze) + 1e-8)
+    cn_img = np.clip(cells + haze, 0, 1).astype(np.float32)
+    pnr_img = (2 + 18 * cn_img).astype(np.float32)        # PNR tracks the blobs
+
+    mc, mp, ev = H.suggest_corr_pnr(cn_img, pnr_img, sigma=3.0)
+    # Threshold must sit above the haze floor (so background is gone) but below the
+    # blob peaks (so cells survive), and the cell-like-count curve must be non-trivial.
+    assert 0.3 < mc < 0.95 and mp > 2.0
+    assert ev["ncell_corr"].max() >= 3
+    assert ev["a_min"] >= 3 and ev["a_max"] > ev["a_min"]
 
     # K==0 guard.
     empty = M.model_quality(CNMFe(CNMFeParams()))

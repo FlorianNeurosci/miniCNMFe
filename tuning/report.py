@@ -23,8 +23,11 @@ METRICS_BLURB = (
     "These are **ground-truth-free proxies**, not validation. `cprojcorr_median` "
     "(median `corr(C, C+YrA)`) is the primary purity signal — in a dense FOV it "
     "*falls* as the cell count rises (YrA cross-talk), so there is a density↔purity "
-    "sweet spot rather than a 'more cells = better' rule. `composite_score` ranks "
-    "candidates as `cprojcorr_median + 0.5·accepted_frac − 0.25·(npix_iqr/npix_median)`; "
+    "sweet spot rather than a 'more cells = better' rule. `multipeak_frac` is the "
+    "fraction of footprints carrying ≥2 distinct soma-scale peaks — the signature of "
+    "`sigma` too large fusing neighbours; `npix_oversize` (diagnostic) is the median "
+    "footprint area over one expected soma. `composite_score` ranks candidates as "
+    "`cprojcorr_median + 0.5·accepted_frac − 0.25·(npix_iqr/npix_median) − 0.5·multipeak_frac`; "
     "re-rank from the table with your own weights if needed. See the roadmap "
     "(C1/C2) for true validation."
 )
@@ -155,39 +158,40 @@ def fig_corr_pnr_sigma(ev, out_path=None):
 
 
 def fig_seed_heatmap(ev, out_path=None):
+    """min_corr/min_pnr by image-threshold morphology (mirrors the manual workflow).
+
+    Top row: # cell-like connected components (and largest-CC fraction) vs the CORR /
+    PNR threshold, with the auto pick marked. Bottom row: the CORR and PNR images
+    thresholded at the picks (``vmin`` raised) — only cell-blobs should remain.
+    """
     import matplotlib.pyplot as plt
+    import numpy as np
 
-    counts, cg, pg = ev["counts"], ev["corr_grid"], ev["pnr_grid"]
-    fig = plt.figure(figsize=(13, 9))
-    ax_cn = plt.subplot2grid((2, 3), (0, 0))
-    ax_pnr = plt.subplot2grid((2, 3), (0, 1))
-    ax_hm = plt.subplot2grid((2, 3), (0, 2))
-    ax_hc = plt.subplot2grid((2, 3), (1, 0))
-    ax_hp = plt.subplot2grid((2, 3), (1, 1))
-    ax_log = plt.subplot2grid((2, 3), (1, 2))
+    cn, pnr = ev["cn"], ev["pnr"]
+    ca, pa = ev["corr_axis"], ev["pnr_axis"]
+    mc, mp = ev["min_corr"], ev["min_pnr"]
+    fig, ax = plt.subplots(2, 2, figsize=(13, 9))
 
-    ax_cn.imshow(ev["cn"], cmap="viridis"); ax_cn.set_title("CORR"); ax_cn.axis("off")
-    ax_pnr.imshow(ev["pnr"], cmap="magma"); ax_pnr.set_title("PNR"); ax_pnr.axis("off")
-    im = ax_hm.imshow(counts, origin="lower", aspect="auto", cmap="cividis",
-                      extent=[pg[0], pg[-1], cg[0], cg[-1]])
-    ax_hm.set_xlabel("min_pnr"); ax_hm.set_ylabel("min_corr"); ax_hm.set_title("seed count")
-    plt.colorbar(im, ax=ax_hm, fraction=0.046)
-    ax_hc.hist(ev["cn"].ravel(), bins=50, color="C0", edgecolor="k")
-    ax_hc.set_xlabel("CORR pixel value"); ax_hc.set_yscale("log"); ax_hc.set_title("CORR hist")
-    ax_hp.hist(ev["pnr"].ravel(), bins=50, color="C1", edgecolor="k")
-    ax_hp.set_xlabel("PNR pixel value"); ax_hp.set_yscale("log"); ax_hp.set_title("PNR hist")
-    ax_log.axis("off")
-    pair = ev.get("pair_idx")
-    if pair is not None:
-        msg = (f"peak seed count: {ev['peak']}\n"
-               f"suggested (min_corr, min_pnr) =\n"
-               f"  ({cg[pair[0]]:.2f}, {pg[pair[1]]:.1f})\n"
-               f"  seed count there: {counts[pair[0], pair[1]]}\n\n"
-               "rule: most permissive pair where\n"
-               "seed count stays >= 30% of peak.")
-    else:
-        msg = "no seeds over the grid; using defaults (0.8, 10.0)"
-    ax_log.text(0.0, 0.95, msg, family="monospace", va="top", transform=ax_log.transAxes)
+    ax[0, 0].plot(ca, ev["ncell_corr"], ".-", c="C2", label="# cell-like")
+    twa = ax[0, 0].twinx(); twa.plot(ca, ev["largest_frac_corr"], ".-", c="C3", alpha=0.55)
+    ax[0, 0].axvline(mc, c="k", ls="--")
+    ax[0, 0].set_xlabel("min_corr (CORR threshold)"); ax[0, 0].set_ylabel("# cell-like", color="C2")
+    twa.set_ylabel("largest-CC frac", color="C3")
+    ax[0, 0].set_title(f"CORR morphology  ->  min_corr={mc:.2f}")
+
+    ax[0, 1].plot(pa, ev["ncell_pnr"], ".-", c="C2")
+    twb = ax[0, 1].twinx(); twb.plot(pa, ev["largest_frac_pnr"], ".-", c="C3", alpha=0.55)
+    ax[0, 1].axvline(mp, c="k", ls="--")
+    ax[0, 1].set_xlabel("min_pnr (PNR threshold)"); ax[0, 1].set_ylabel("# cell-like", color="C2")
+    twb.set_ylabel("largest-CC frac", color="C3")
+    ax[0, 1].set_title(f"PNR morphology  ->  min_pnr={mp:.1f}")
+
+    ax[1, 0].imshow(cn, cmap="viridis", vmin=mc, vmax=float(cn.max()))
+    ax[1, 0].set_title(f"CORR thresholded (vmin={mc:.2f})"); ax[1, 0].axis("off")
+    ax[1, 1].imshow(pnr, cmap="magma", vmin=mp, vmax=float(np.percentile(pnr, 99.5)))
+    ax[1, 1].set_title(f"PNR thresholded (vmin={mp:.1f})"); ax[1, 1].axis("off")
+    fig.suptitle(f"cell-area window {ev['a_min']}–{ev['a_max']} px (from σ={ev['sigma']:.1f})",
+                 y=1.0, fontsize=10)
     fig.tight_layout()
     return _finish(fig, out_path)
 
@@ -893,10 +897,17 @@ def _render_md(result, saved, filtered) -> str:
               f"Region: **{sweep['region']}**"
               + (f" — crop {sweep.get('region_crop')}" if sweep.get("region_crop") else ""),
               ""]
+        sgrid = (result.get("stages") or {}).get("sigma_grid")
+        if sgrid:
+            grid_s = ", ".join(f"{v:g}" for v in sgrid.get("values", []))
+            L += [f"Resolved σ grid: **{grid_s}** "
+                  f"(anchored on heuristic σ≈{sgrid.get('heuristic', float('nan')):.2f}).",
+                  ""]
         rows = sweep["rows"]
         cols = ["idx", "sigma", "min_corr", "min_pnr", "merge_thr_corr",
                 "global_bg_rank", "init_stride", "K", "K_accepted",
-                "cprojcorr_median", "npix_median", "snr_median", "score", "wall_s"]
+                "cprojcorr_median", "npix_median", "multipeak_frac", "npix_oversize",
+                "snr_median", "score", "wall_s"]
         L.append("| " + " | ".join(cols) + " |")
         L.append("|" + "|".join("---" for _ in cols) + "|")
         for i, r in enumerate(rows):

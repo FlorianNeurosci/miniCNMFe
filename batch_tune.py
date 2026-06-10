@@ -40,11 +40,13 @@ def _tune_cmd(sess, out, fps, indicator, nj, lowthr):
     validation in a single BLAS-capped subprocess (tune.py owns both stages)."""
     # No --grid-bg-rank: global_bg_rank is pinned to the long-recording base (=1)
     # because the short cutout sweep can't see its benefit (see tuning/tuner.py).
+    # No --grid-min-corr/--grid-min-pnr: min_corr/min_pnr are auto-detected per
+    # recording by image-threshold morphology (suggest_corr_pnr); the sweep tests
+    # a small auto-anchored range around them, so a hardcoded grid is unneeded.
     cmd = [sys.executable, "-u", str(ROOT / "tune.py"), str(sess),
            "-o", str(out), "--frame-rate", str(fps),
            "--indicator", indicator, "--mode", "both", "--region", "cutout",
-           "--max-avis", "6", "--grid-min-corr", "0.7,0.8",
-           "--grid-min-pnr", "6,10,14",
+           "--max-avis", "6",
            "--n-jobs", str(nj), "--validate", "--html"]
     if not lowthr:
         cmd.append("--no-lowthr")
