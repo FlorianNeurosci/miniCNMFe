@@ -58,6 +58,36 @@ def decode_strided_sample(avi_paths, n_avis: int, stride: int) -> np.ndarray:
     return np.stack(pool, axis=0).astype(np.float32)
 
 
+def decode_contiguous_clip(avi_paths, n_frames: int, start_frac: float = 0.4) -> np.ndarray:
+    """Decode up to ``n_frames`` **consecutive** frames into RAM.
+
+    Unlike ``decode_strided_sample`` (which subsamples for projections /
+    histograms), the MC parameter search needs a temporally contiguous clip:
+    motion is continuous in time, so registration quality can only be judged on
+    successive frames. Starts ``start_frac`` of the way through the recording
+    (avoids LED-warmup at the very start) and spans consecutive AVIs until
+    ``n_frames`` are collected. Returns a ``(T<=n_frames, H, W)`` float32 stack.
+    """
+    import av
+
+    start_avi = min(len(avi_paths) - 1, int(start_frac * len(avi_paths)))
+    pool: list = []
+    for p in avi_paths[start_avi:]:
+        container = av.open(str(p))
+        try:
+            stream = container.streams.video[0]
+            stream.thread_type = "FRAME"
+            for frame in container.decode(stream):
+                pool.append(frame.to_ndarray(format="gray8"))
+                if len(pool) >= n_frames:
+                    break
+        finally:
+            container.close()
+        if len(pool) >= n_frames:
+            break
+    return np.stack(pool, axis=0).astype(np.float32)
+
+
 def load_mc_sample(mc_zarr, n_frames: int) -> "tuple[np.ndarray, np.ndarray]":
     """Load a linspace-strided sample of an ``mc.zarr`` into RAM.
 

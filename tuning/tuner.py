@@ -20,7 +20,7 @@ from minicnmfe.pipeline import CNMFe, CNMFeParams
 from tuning import heuristics as H
 from tuning import io_sample as S
 from tuning.metrics import mc_quality
-from tuning.sweep import SweepSpec, run_sweep
+from tuning.sweep import SweepSpec, resolve_offset_grid, resolve_sigma_grid, run_sweep
 from tuning.validate import good_defaults
 
 
@@ -134,6 +134,11 @@ def run_tuning(cfg: TunerConfig) -> dict:
             n_template_avis=cfg.n_template_avis, max_avis=cfg.max_avis, pattern=cfg.pattern)
         mc_path = run_dir / "mc" / "mc.zarr"
     else:
+        # Extraction-only path: a provided zarr is already motion-corrected
+        # (e.g. the DB's mc.zarr). Stage 1 is skipped entirely, so MC params
+        # (mc_gSig_filt / max_shift / mc_n_iter) are NEVER (re-)estimated here —
+        # they are chosen upstream by tuning.mc_tune. This tuner only tunes the
+        # extraction params on the corrected movie.
         mc = open_zarr(cfg.input_path)
         mc_path = Path(cfg.input_path)
         ssub = tsub = 1  # a provided zarr is taken as-is
@@ -186,8 +191,20 @@ def run_tuning(cfg: TunerConfig) -> dict:
             region_crop = S.pick_cutout(cn, T=T, cutout_hw=cfg.cutout_hw,
                                         window_t=cfg.window_t, sample=mc_sample,
                                         sample_idx=sample_idx)
+        # Resolve the (possibly heuristic-relative) grids against the measured
+        # heuristics before the spec is expanded, so each data-driven value is
+        # always a candidate (see tuning.sweep.resolve_offset_grid). Omitted
+        # min_corr/min_pnr collapse to the single detected value (no sweep).
+        sweep = cfg.sweep or SweepSpec()
+        sigma_grid = resolve_sigma_grid(sweep.sigma, sigma_ds)
+        corr_grid = resolve_offset_grid(sweep.min_corr, min_corr, floor=0.3, clip_max=0.98)
+        pnr_grid = resolve_offset_grid(sweep.min_pnr, min_pnr, floor=2.0)
+        sweep = replace(sweep, sigma=sigma_grid, min_corr=corr_grid, min_pnr=pnr_grid)
+        stages["sigma_grid"] = {"values": sigma_grid, "heuristic": float(sigma_ds)}
+        stages["thr_grid"] = {"min_corr": corr_grid, "min_pnr": pnr_grid,
+                              "detected": (float(min_corr), float(min_pnr))}
         rows, best_params, best_model = run_sweep(
-            mc_path, base_grid, cfg.sweep, region_crop=region_crop,
+            mc_path, base_grid, sweep, region_crop=region_crop,
             n_jobs=cfg.n_jobs, workdir=run_dir / "sweep",
             max_candidates=cfg.max_candidates, cn=cn)
         sweep_result = {"rows": rows, "region": cfg.region, "region_crop": region_crop}
@@ -247,7 +264,8 @@ def run_tuning(cfg: TunerConfig) -> dict:
         recommended["init_stride"] = int(best_swept["init_stride"])
     sources["min_pixel"] = "heuristic"
     rationale["sigma"] = "blob_log on CORR·PNR (×ssub → native)"
-    rationale["min_corr"] = rationale["min_pnr"] = "knee of the seed-count surface"
+    rationale["min_corr"] = rationale["min_pnr"] = (
+        "image-threshold morphology (max # cell-like blobs)")
     rationale["min_pixel"] = "25th-pct footprint area (×ssub² → native)"
 
     # One merged CNMFeParams: the long-recording base with the tuner's data-driven
