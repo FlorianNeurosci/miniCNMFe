@@ -626,24 +626,35 @@ def _motion_correction_in_memory(
     template,
     batch_size,
     n_jobs,
+    template_max_frames,
     verbose,
+    in_place=False,
 ):
+    """In-memory rigid MC with bounded peak RAM.
+
+    Peak RAM ~= 1x the movie when ``in_place=True`` (frames are warped back into
+    the input buffer), ~2x otherwise (one owned output buffer). Either way the
+    template is built from a strided sample via ``_build_template_streaming`` —
+    not a full-movie high-pass copy — so the previous ~3-4x peak (an extra
+    ``filtered`` / ``filtered_corrected`` / ``corrected_iter`` full-movie float32
+    buffer each) is gone. float32 throughout.
+
+    ``in_place=True`` mutates the caller's array and is only safe when the caller
+    treats the movie as consumed (it does NOT, e.g., recompute a "raw" image from
+    it afterwards). Default False keeps the input intact.
+    """
     movie = np.asarray(movie, dtype=np.float32)
     T, H, W = movie.shape
 
     if template is None:
-        if gSig_filt is not None:
-            # Stream high-pass over frames; keep filtered as one allocation.
-            filtered = np.empty_like(movie)
-            for i in range(T):
-                filtered[i] = high_pass_filter_space(movie[i], gSig_filt)
-        else:
-            filtered = movie
-        template = caiman_bin_median(filtered, window=bin_window)
-        if gSig_filt is not None:
-            del filtered  # free the intermediate
+        # Sample-based template (same builder the streaming path uses, so the two
+        # paths agree). Allocates ~template_max_frames*H*W*4, not T*H*W*4.
+        template = _build_template_streaming(
+            movie, gSig_filt, bin_window, batch_size, template_max_frames,
+            verbose=verbose,
+        )
 
-    corrected = movie  # we'll overwrite per iteration via _process_batch output
+    corrected = movie if in_place else np.empty_like(movie)
     shifts_total = np.zeros((T, 2), dtype=np.float32)
 
     for iteration in range(niter_rig):
@@ -655,36 +666,33 @@ def _motion_correction_in_memory(
             if gSig_filt is not None else template
         )
 
-        # Batch-and-parallel the per-frame work. One full alloc for the corrected
-        # output of this iteration (same as before), but the work is parallel.
-        corrected_iter = np.empty_like(corrected)
+        # Read the original movie on the first pass, the running corrected movie
+        # thereafter. _process_batch returns a fresh array per batch, so writing
+        # it back into `corrected` is safe even when corrected aliases the source
+        # (frames are independent given a fixed template).
+        source = movie if iteration == 0 else corrected
         shifts_iter = np.zeros((T, 2), dtype=np.float32)
-
         iter_ = range(0, T, batch_size)
         if verbose:
             iter_ = tqdm(iter_)
         for start in iter_:
             end = min(start + batch_size, T)
             corrected_batch, shifts_batch = _process_batch(
-                corrected[start:end], filtered_template, gSig_filt,
+                source[start:end], filtered_template, gSig_filt,
                 upsample_factor, max_shift, n_jobs,
             )
-            corrected_iter[start:end] = corrected_batch
+            corrected[start:end] = corrected_batch
             shifts_iter[start:end] = shifts_batch
 
-        corrected = corrected_iter
         shifts_total += shifts_iter
 
-        # Template update
-        if gSig_filt is not None:
-            filtered_corrected = np.empty_like(corrected)
-            for i in range(T):
-                filtered_corrected[i] = high_pass_filter_space(corrected[i], gSig_filt)
-        else:
-            filtered_corrected = corrected
-        template = caiman_bin_median(filtered_corrected, window=bin_window)
-        if gSig_filt is not None:
-            del filtered_corrected
+        # Rebuild the template from the corrected frames for the NEXT pass only
+        # (the last pass's template would be unused). Sample-based again.
+        if iteration + 1 < niter_rig:
+            template = _build_template_streaming(
+                corrected, gSig_filt, bin_window, batch_size, template_max_frames,
+                verbose=verbose,
+            )
 
     return corrected, shifts_total
 
@@ -709,6 +717,7 @@ def motion_correction_rigid(
     output_dtype: str = "float32",
     compression: bool = True,
     verbose: bool = True,
+    in_place: bool = False,
 ):
     """CaImAn-compatible rigid motion correction.
 
@@ -776,7 +785,8 @@ def motion_correction_rigid(
 
     return _motion_correction_in_memory(
         movie, max_shift, gSig_filt, upsample_factor, niter_rig, bin_window,
-        template, batch_size, n_jobs, verbose,
+        template, batch_size, n_jobs, template_max_frames, verbose,
+        in_place=in_place,
     )
 
 

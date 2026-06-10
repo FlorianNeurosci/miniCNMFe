@@ -737,6 +737,7 @@ class CNMFe:
         self,
         movie: "zarr.Array | np.ndarray",
         output_dir: str | Path | None = None,
+        in_place: bool = False,
     ) -> "zarr.Array | np.ndarray":
         """Run only the motion correction step.
 
@@ -788,6 +789,7 @@ class CNMFe:
             template_max_frames=p.mc_template_max_frames,
             output_chunk_t=p.mc_output_chunk_t,
             output_dtype=p.mc_output_dtype,
+            in_place=in_place,
         )
         return corrected
 
