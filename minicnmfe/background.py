@@ -472,15 +472,31 @@ def compute_W(
     if Y_is_numpy:
         # In-memory path: build X_fit once at subsampled time resolution,
         # then dispatch per-pixel batches over the dense slab.
+        #
+        # Build X_fit = Y_sub - A@C_sub - b0[:,None] IN PLACE: a naive
+        # `Y_sub - AC_sub - b0[:,None]` holds Y_sub, AC_sub and X_fit (three
+        # full (H*W, T/tsub) slabs) simultaneously -- ~36 GB transient on a
+        # 60 GB / tsub=5 movie, the term that pushed in-RAM extraction to ~2x
+        # the movie. Start X_fit as the (only) full slab, then subtract A@C in
+        # pixel-row chunks so the dense AC product is never fully materialised.
+        # Always materialise X_fit as a fresh (contiguous) copy: the in-place
+        # `-=` below must not write through to the caller's Y_flat. np.asarray
+        # would ALIAS here -- `Y_flat[:, ::tsub]` is a non-contiguous view of a
+        # float32 array, and np.asarray(view, float32) returns the view, so the
+        # subtraction would silently corrupt the movie for later BCD steps.
+        # np.array (copy=True by default) gives us the one full slab we want.
         if actual_tsub > 1:
-            Y_sub = np.asarray(Y_flat[:, ::actual_tsub], dtype=np.float32)
+            X_fit = np.array(Y_flat[:, ::actual_tsub], dtype=np.float32)
             C_sub = C[:, ::actual_tsub]
         else:
-            Y_sub = np.asarray(Y_flat, dtype=np.float32)
+            X_fit = np.array(Y_flat, dtype=np.float32)
             C_sub = C
-        AC_sub = np.asarray(A.dot(C_sub), dtype=np.float32)
-        X_fit = Y_sub - AC_sub - b0[:, np.newaxis]
-        del Y_sub, AC_sub
+        X_fit -= b0[:, np.newaxis]
+        A_csr = A.tocsr()
+        ac_chunk = 8192
+        for s in range(0, n_pixels, ac_chunk):
+            e = min(s + ac_chunk, n_pixels)
+            X_fit[s:e] -= np.asarray(A_csr[s:e].dot(C_sub), dtype=np.float32)
     else:
         # Zarr / on-disk: defer X_fit construction to the per-batch loop
         # below so the full ``(H*W, T/tsub)`` slab is never materialised.
