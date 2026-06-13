@@ -159,6 +159,9 @@ GPU speedup is most significant for large recordings (≥ 256 × 256, T ≥ 1000
 | `ar_order` | `1` | AR model order for calcium dynamics (1 or 2) |
 | `ring_size_factor` | `1.5` | Ring radius = factor × (2σ + 1) |
 | `init_stride` | auto | Temporal stride for greedy init (None = `max(1, T // 5000)`) |
+| `init_patches` | `True` | Parallelize the serial greedy seed loop across overlapping FOV patches (auto-skips for small FOV / GPU / streaming movies; see usage guide) |
+| `spatial_ridge` | `1e-2` | Elastic-net L2 on the per-pixel `update_spatial` LASSO; keeps the CD converging when components are correlated (`0.0` = pure LASSO) |
+| `spatial_max_iter` | `1000` | Per-pixel CD iteration cap (backstop; rarely hit with `spatial_ridge`) |
 | `n_jobs` | `1` | CPU workers (`-1` = all cores) |
 | `device` | `"cpu"` | `"cpu"` or `"cuda"` |
 

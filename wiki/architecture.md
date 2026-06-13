@@ -170,7 +170,7 @@ Parallelism is **axis-aligned** — partitioning along frames, flattened pixels,
 | `update_temporal` (OASIS) | neurons (K) | `_deconvolve_with` | one component |
 
 > [!WARNING]
-> On Windows, `n_jobs != 1` uses `spawn` (no fork). Avoid large global state; prefer passing arguments explicitly. The greedy seed loop in `greedy_corr_pnr` is itself sequential — only the per-frame PSF convolution that feeds it is parallel. OASIS is sequential along T per component (cannot be parallelised within a trace), only across K.
+> On Windows, `n_jobs != 1` uses `spawn` (no fork). Avoid large global state; prefer passing arguments explicitly. The greedy seed loop in `greedy_corr_pnr` is itself sequential — only the per-frame PSF convolution that feeds it is parallel. By default (`init_patches=True`) the FOV is split into overlapping patches run in parallel **processes** (`greedy_corr_pnr_patched`), but each patch's seed loop is still sequential. OASIS is sequential along T per component (cannot be parallelised within a trace), only across K.
 
 ### Why axis-aligned and not patch-based (vs CaImAn)
 

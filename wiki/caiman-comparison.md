@@ -132,7 +132,7 @@ shifts it can pick a too-high `min_pnr` and hurt CaImAn's recall.)
 | AR `g` | estimated **once** from `C_raw`, cached (global or per-neuron); optional Bayesian `decay_time`/`fps` prior | per-neuron, per-iteration |
 | Spatial solve | per-pixel non-neg LASSO on **raw** traces | LASSO on `StandardScaler`-normalised traces |
 | Quality filter | non-destructive SNR-amplitude auto-eval (`accepted_mask`) | CNN + SNR + spatial-corr `evaluate_components` |
-| Init | greedy corr/pnr (+ optional patch-parallel) | corr/pnr in patches |
+| Init | greedy corr/pnr (patch-parallel by default) | corr/pnr in patches |
 
 Speed caveat: the ~10× wall-time advantage is partly because the comparison runs
 CaImAn with `N_PROCESSES=1` + patches (sequential); CaImAn parallelises across

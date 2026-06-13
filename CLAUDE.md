@@ -309,24 +309,46 @@ patch-parallel init (`greedy_corr_pnr_patched`), which uses the default loky
 wouldn't help. Process workers must set their own `threadpool_limits` inside the
 worker body (the parent context does not cross the process boundary).
 
-### Patch-based parallel initialization (opt-in — `init_patches`)
+### Patch-based parallel initialization (default ON — `init_patches`)
 The greedy seed loop (`greedy_corr_pnr`) is the dominant **serial** bottleneck in
 extraction and can't be threaded (each extraction subtracts its component from the
-residual the next seed reads). `CNMFeParams.init_patches=True` (default **off**)
-switches the pipeline init to `greedy_corr_pnr_patched`: tile the in-RAM
-`(T_init, H, W)` init sample into **overlapping** patches, run the unchanged
-`greedy_corr_pnr` on each in parallel processes (inner `n_jobs=1`, `border_px=0`,
-`max_neurons=None`), remap each patch's footprints/centres to global coords,
-concatenate, and **dedup** border duplicates with `merge_components` (the
-centre-distance fallback — duplicate copies of one neuron have near-identical
-traces + close centres). `border_px` and `max_neurons` are applied **globally**
-after dedup. Gated on `min(H,W) >= init_patch_min_fov` (default 128) and CPU only.
-Defaults derive from `sigma`: `patch_size = max(int(12·sigma), 48)`,
-`patch_overlap = int(4·sigma)` (overlap > `patch_radius ≈ 3·sigma` so a border
-neuron is fully captured in — and merged across — both patches). Because it's
-opt-in and the default path is byte-identical, the `test_stage_split.py`
-bit-for-bit regression still holds. Regression test:
-`test_pipeline.py::test_patched_init_recovers_same_neurons_as_global`.
+residual the next seed reads). `CNMFeParams.init_patches=True` (**default on**)
+runs `greedy_corr_pnr_patched`: tile the in-RAM `(T_init, H, W)` init sample into
+**overlapping** patches, run the unchanged `greedy_corr_pnr` on each in parallel
+processes (inner `n_jobs=1`, `border_px=0`, `max_neurons=None`), remap each patch's
+footprints/centres to global coords, concatenate, and **dedup** border duplicates
+with `merge_components` (the centre-distance fallback — duplicate copies of one
+neuron have near-identical traces + close centres). `border_px` and `max_neurons`
+are applied **globally** after dedup. Defaults derive from `sigma`:
+`patch_size = max(int(12·sigma), 48)`, `patch_overlap = int(4·sigma)` (overlap >
+`patch_radius ≈ 3·sigma` so a border neuron is fully captured in — and merged
+across — both patches).
+
+**Auto-skips back to the serial `greedy_corr_pnr`** when patching can't help or
+would break (so the bit-for-bit serial path still runs there — that's why the
+small-FOV `test_stage_split.py` regressions hold): `min(H,W) < init_patch_min_fov`
+(default 128), `device != "cpu"`, or a streaming/zarr `init_movie` (the patched
+driver does `np.asarray(movie)` → **in-RAM only**, no OOM). **The tuning sweep also
+forces `init_patches=False` for its candidates** (`tuning/tuner.py`): they already
+run in parallel loky processes, and nesting loky would serialise the inner patches.
+So in practice patched init runs for the single full-FOV final extraction
+(`MiniCnmfeExtraction`, wired to `init_patches=use_ram`) and standalone fits, **not**
+inside the sweep. Validated equivalent to serial — seeds land on the same cells
+(footprint corr ≈ 0.96, trace ≈ 0.99), ≈3× faster at `n_jobs=8` (more with more
+cores). Set `init_patches=False` to force the bit-for-bit serial path. Regression
+test: `test_pipeline.py::test_patched_init_recovers_same_neurons_as_global`.
+
+### `update_spatial` per-pixel CD: ridge for convergence (`spatial_ridge`)
+`update_spatial` solves a per-pixel non-negative LASSO via
+`enet_coordinate_descent_gram`. On real data, active components often have
+correlated/near-duplicate traces, so the per-pixel Gram `C_active @ C_active.T` is
+near-singular and the **pure** LASSO CD crawls to 1000–10000 iters / fails to
+converge. `CNMFeParams.spatial_ridge` (default `1e-2`) sets the solver's L2 `beta`
+to `spatial_ridge · max(diag(Gram))`, bounding the condition number to ≈
+`1/spatial_ridge` so the CD converges in tens of iters with ~1% coefficient
+shrinkage (set `0.0` for pure LASSO). `spatial_max_iter` default lowered 10000→1000
+(now just a backstop). `update_spatial` prints a one-line `update_spatial stats:`
+diagnostic (mean/max CD iters, % hitting the cap, mean active-set size).
 
 ### Streaming `Y.T @ A` projections are threaded (`n_jobs`)
 The two zarr/streaming projection loops — `BackgroundSubtractor.project_onto`
