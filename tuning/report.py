@@ -160,40 +160,49 @@ def fig_corr_pnr_sigma(ev, out_path=None):
     return _finish(fig, out_path)
 
 
-def fig_seed_heatmap(ev, out_path=None):
-    """min_corr/min_pnr by image-threshold morphology (mirrors the manual workflow).
+def fig_corr_pnr_separation(ev, out_path=None):
+    """min_corr/min_pnr by neuron-vs-background separation (mirrors the diagnosis).
 
-    Top row: # cell-like connected components (and largest-CC fraction) vs the CORR /
-    PNR threshold, with the auto pick marked. Bottom row: the CORR and PNR images
-    thresholded at the picks (``vmin`` raised) — only cell-blobs should remain.
+    Top row: histograms of the CORR / PNR values **at the detected neuron blob
+    centres** (signal) vs the **background** pixels (noise), with the chosen
+    threshold marked — it sits where the two populations separate best (max
+    Youden's J). Bottom row: the CORR·PNR product with the detected blobs circled
+    (the cells the eye picks out), and the product masked by the chosen thresholds
+    (neurons retained, background removed).
     """
     import matplotlib.pyplot as plt
     import numpy as np
 
     cn, pnr = ev["cn"], ev["pnr"]
-    ca, pa = ev["corr_axis"], ev["pnr_axis"]
     mc, mp = ev["min_corr"], ev["min_pnr"]
+    sigma = float(ev["sigma"])
+    rc = ev.get("blob_rc", np.zeros((0, 2), int))
     fig, ax = plt.subplots(2, 2, figsize=(13, 9))
 
-    ax[0, 0].plot(ca, ev["ncell_corr"], ".-", c="C2", label="# cell-like")
-    twa = ax[0, 0].twinx(); twa.plot(ca, ev["largest_frac_corr"], ".-", c="C3", alpha=0.55)
-    ax[0, 0].axvline(mc, c="k", ls="--")
-    ax[0, 0].set_xlabel("min_corr (CORR threshold)"); ax[0, 0].set_ylabel("# cell-like", color="C2")
-    twa.set_ylabel("largest-CC frac", color="C3")
-    ax[0, 0].set_title(f"CORR morphology  ->  min_corr={mc:.2f}")
+    def _hist(a, neuron, bg, thr, xlabel, title):
+        if len(bg):
+            a.hist(bg, bins=40, density=True, color="0.6", alpha=0.7, label="background")
+        if len(neuron):
+            a.hist(neuron, bins=40, density=True, color="C2", alpha=0.7, label="neuron centres")
+        a.axvline(thr, c="k", ls="--", lw=1.5, label=f"thr={thr:.2f}")
+        a.set_xlabel(xlabel); a.set_ylabel("density"); a.set_title(title); a.legend(fontsize=8)
 
-    ax[0, 1].plot(pa, ev["ncell_pnr"], ".-", c="C2")
-    twb = ax[0, 1].twinx(); twb.plot(pa, ev["largest_frac_pnr"], ".-", c="C3", alpha=0.55)
-    ax[0, 1].axvline(mp, c="k", ls="--")
-    ax[0, 1].set_xlabel("min_pnr (PNR threshold)"); ax[0, 1].set_ylabel("# cell-like", color="C2")
-    twb.set_ylabel("largest-CC frac", color="C3")
-    ax[0, 1].set_title(f"PNR morphology  ->  min_pnr={mp:.1f}")
+    _hist(ax[0, 0], ev.get("corr_neuron", []), ev.get("corr_bg", []), mc,
+          "CORR", f"CORR separation  ->  min_corr={mc:.2f}")
+    _hist(ax[0, 1], ev.get("pnr_neuron", []), ev.get("pnr_bg", []), mp,
+          "PNR", f"PNR separation  ->  min_pnr={mp:.1f}")
 
-    ax[1, 0].imshow(cn, cmap="viridis", vmin=mc, vmax=float(cn.max()))
-    ax[1, 0].set_title(f"CORR thresholded (vmin={mc:.2f})"); ax[1, 0].axis("off")
-    ax[1, 1].imshow(pnr, cmap="magma", vmin=mp, vmax=float(np.percentile(pnr, 99.5)))
-    ax[1, 1].set_title(f"PNR thresholded (vmin={mp:.1f})"); ax[1, 1].axis("off")
-    fig.suptitle(f"cell-area window {ev['a_min']}–{ev['a_max']} px (from σ={ev['sigma']:.1f})",
+    product = cn * pnr
+    pvmax = float(np.percentile(product, 99.5)) if np.isfinite(product).any() else None
+    ax[1, 0].imshow(product, cmap="magma", vmax=pvmax)
+    for y, x in rc:
+        ax[1, 0].add_patch(plt.Circle((x, y), 1.5 * sigma, color="cyan", fill=False, lw=0.6))
+    ax[1, 0].set_title(f"CORR·PNR + {len(rc)} detected neurons"); ax[1, 0].axis("off")
+
+    kept = product * ((cn >= mc) & (pnr >= mp))
+    ax[1, 1].imshow(kept, cmap="magma", vmax=pvmax)
+    ax[1, 1].set_title("CORR·PNR kept by (corr≥min_corr & pnr≥min_pnr)"); ax[1, 1].axis("off")
+    fig.suptitle(f"min_corr / min_pnr from neuron-vs-background separation (σ={sigma:.1f})",
                  y=1.0, fontsize=10)
     fig.tight_layout()
     return _finish(fig, out_path)
@@ -884,7 +893,7 @@ DIAGNOSTIC_FIGS = {
 
 _FIG_FOR_STAGE = {
     "mc_gsig": fig_mc_gsig, "max_shift": fig_max_shift, "downsample": fig_downsample,
-    "sigma": fig_corr_pnr_sigma, "corr_pnr": fig_seed_heatmap, "min_pixel": fig_min_pixel,
+    "sigma": fig_corr_pnr_sigma, "corr_pnr": fig_corr_pnr_separation, "min_pixel": fig_min_pixel,
     "decay": fig_decay, "g_prior": fig_g_prior, "merge": fig_merge_corr,
 }
 

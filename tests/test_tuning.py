@@ -104,7 +104,7 @@ def test_heuristics_on_simulator(sim_movie):
 
     min_corr, min_pnr, ev = H.suggest_corr_pnr(cn, pnr, sigma_refit)
     assert 0.0 < min_corr < 1.0 and min_pnr > 0.0
-    assert {"ncell_corr", "ncell_pnr", "corr_axis", "pnr_axis"} <= set(ev)
+    assert {"corr_neuron", "corr_bg", "j_corr", "n_blobs"} <= set(ev)
 
     min_pixel, ev = H.suggest_min_pixel(sample, sigma_refit, min_corr, min_pnr,
                                         sim_movie.shape[1:])
@@ -302,7 +302,7 @@ def test_resolve_offset_grid_thresholds():
     assert resolve_offset_grid([6, 10, 14], 12.0, floor=2.0) == [6.0, 10.0, 12.0, 14.0]
 
 
-def test_suggest_corr_pnr_morphology():
+def test_suggest_corr_pnr_separation():
     from scipy.ndimage import gaussian_filter
 
     # CORR-like image: compact cell blobs (radius ~3) on diffuse low-level haze.
@@ -320,10 +320,18 @@ def test_suggest_corr_pnr_morphology():
 
     mc, mp, ev = H.suggest_corr_pnr(cn_img, pnr_img, sigma=3.0)
     # Threshold must sit above the haze floor (so background is gone) but below the
-    # blob peaks (so cells survive), and the cell-like-count curve must be non-trivial.
-    assert 0.3 < mc < 0.95 and mp > 2.0
-    assert ev["ncell_corr"].max() >= 3
-    assert ev["a_min"] >= 3 and ev["a_max"] > ev["a_min"]
+    # blob peaks (so cells survive). The pick separates the two populations: it
+    # should land above the median background CORR and below the median neuron CORR.
+    assert 0.4 <= mc < 0.95 and mp > 2.0
+    assert np.median(ev["corr_bg"]) <= mc <= np.median(ev["corr_neuron"])
+    # Evidence carries the separation arrays the figure draws from.
+    assert ev["n_blobs"] >= 3 and ev["corr_neuron"].size and ev["corr_bg"].size
+    assert ev["j_corr"].shape == ev["thr_axis_corr"].shape
+
+    # Degenerate guard: a flat image detects no neurons -> safe defaults.
+    flat = np.full((60, 60), 0.5, np.float32)
+    mc0, mp0, ev0 = H.suggest_corr_pnr(flat, flat, sigma=3.0)
+    assert (mc0, mp0) == (0.8, 10.0) and ev0["n_blobs"] == 0
 
     # K==0 guard.
     empty = M.model_quality(CNMFe(CNMFeParams()))

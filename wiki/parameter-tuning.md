@@ -65,7 +65,7 @@ python run_extract.py mc/mc.zarr -o results/ \
 
 | Mode | What it does | Speed |
 |------|--------------|-------|
-| `heuristic` | Image-based suggestions only — `blob_log` neuron radius, seed-count knee, shift histograms. No extraction. | Fast |
+| `heuristic` | Image-based suggestions only — `blob_log` neuron radius, neuron-vs-background threshold separation, shift histograms. No extraction. | Fast |
 | `sweep` | Actually runs `fit_extract` across a grid of the key knobs and **scores** each candidate with quality proxies. | Slower |
 | `both` *(default)* | Heuristics seed the grid; the sweep refines and adds the temporal/eval knobs. | Slower |
 
@@ -104,8 +104,9 @@ suggestions, because those need a fitted model to read.
 downsample factors `ssub`/`tsub`.
 
 **Initialisation** (`sigma`, `min_corr`, `min_pnr`, `min_pixel`) — `sigma` from
-`blob_log` on the CORR·PNR image, the thresholds from the *knee* of a seed-count
-surface, `min_pixel` from the footprint-area distribution of a fast greedy init.
+`blob_log` on the CORR·PNR image, the thresholds from the best separation of the
+CORR/PNR values at detected neuron blobs vs background, `min_pixel` from the
+footprint-area distribution of a fast greedy init.
 
 **Sweep grid** (the most-impactful extraction knobs, per the real-recording
 findings in [[usage-guide#Tuning long or dense recordings]]): `sigma`,
@@ -121,8 +122,8 @@ Pass comma-lists, e.g. `--grid-min-pnr 6,10,14 --grid-bg-rank 0,1`.
 
 - **Stage 1** — temporal-std with detected blobs (neuron radius); shift
   histograms (`max_shift`); ssub/tsub rule tables.
-- **Stage 3** — CORR / PNR / CORR·PNR triptych (`sigma`); seed-count heatmap
-  over (`min_corr`, `min_pnr`); footprint-area histogram (`min_pixel`).
+- **Stage 3** — CORR / PNR / CORR·PNR triptych (`sigma`); neuron-vs-background
+  separation histograms (`min_corr`, `min_pnr`); footprint-area histogram (`min_pixel`).
 - **Stage 4** — per-component τ and AR-`g` distributions (`decay_time_ms`,
   `g_prior_weight`); pairwise-correlation histogram (`merge_thr_corr`); SNR
   histogram + footprint montage at the threshold boundary (`auto_eval_snr_amp_thr`).

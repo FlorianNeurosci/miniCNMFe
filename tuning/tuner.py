@@ -272,7 +272,7 @@ def run_tuning(cfg: TunerConfig) -> dict:
     sources["min_pixel"] = "heuristic"
     rationale["sigma"] = "blob_log on CORR·PNR (×ssub → native)"
     rationale["min_corr"] = rationale["min_pnr"] = (
-        "image-threshold morphology (max # cell-like blobs)")
+        "best separation of CORR/PNR at detected neuron blobs vs background")
     rationale["min_pixel"] = "25th-pct footprint area (×ssub² → native)"
 
     # One merged CNMFeParams: the long-recording base with the tuner's data-driven

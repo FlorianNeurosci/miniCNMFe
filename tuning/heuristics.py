@@ -184,67 +184,88 @@ def suggest_sigma_extraction(
     return sigma_refit, cn, pnr, evidence
 
 
-def _celllike_curve(img, thr_axis, a_min, a_max, min_solidity):
-    """Per-threshold ``(#cell-like components, largest-CC fraction)`` for one image.
+def _separating_threshold(neuron_vals, bg_vals, thr_axis):
+    """Threshold on ``thr_axis`` that best separates ``neuron_vals`` from ``bg_vals``.
 
-    A cell-like component is connected, soma-sized (``a_min ≤ area ≤ a_max``) and
-    compact (``solidity > min_solidity``). ``largest_frac`` = largest component area
-    ÷ total foreground — near 1 while one background mesh dominates, dropping once it
-    fragments into blobs.
+    Maximises Youden's J = TPR − FPR, where TPR is the fraction of neuron-centre
+    values kept (``>= t``) and FPR the fraction of background values leaked. This is
+    "keep most neurons, filter background as well as possible." Returns ``(thr, j)``
+    where ``j`` is the per-threshold J curve over ``thr_axis``.
     """
-    from skimage.measure import label, regionprops
-
-    n_cell = np.zeros(len(thr_axis), dtype=int)
-    largest_frac = np.zeros(len(thr_axis), dtype=float)
-    for k, t in enumerate(thr_axis):
-        mask = img > t
-        fg = int(mask.sum())
-        if fg == 0:
-            continue
-        props = regionprops(label(mask))
-        areas = np.fromiter((p.area for p in props), dtype=float, count=len(props))
-        largest_frac[k] = float(areas.max() / fg)
-        n_cell[k] = sum(1 for p in props
-                        if a_min <= p.area <= a_max and p.solidity > min_solidity)
-    return n_cell, largest_frac
+    nv = np.asarray(neuron_vals, dtype=np.float64)
+    bv = np.asarray(bg_vals, dtype=np.float64)
+    tpr = (nv[None, :] >= thr_axis[:, None]).mean(axis=1)
+    fpr = (bv[None, :] >= thr_axis[:, None]).mean(axis=1)
+    j = tpr - fpr
+    return float(thr_axis[int(np.argmax(j))]), j
 
 
 def suggest_corr_pnr(
     cn: np.ndarray, pnr: np.ndarray, sigma: float, *,
-    corr_floor: float = 0.4, pnr_floor: float = 2.0, n_thr: int = 30,
-    min_solidity: float = 0.85,
+    corr_floor: float = 0.4, pnr_floor: float = 2.0, n_thr: int = 60,
+    min_blobs: int = 5, bg_radius_factor: float = 2.0, max_bg: int = 5000,
 ) -> "tuple[float, float, dict]":
-    """``min_corr`` / ``min_pnr`` by image-threshold morphology.
+    """``min_corr`` / ``min_pnr`` from neuron-vs-background separation.
 
-    Mirrors manual CaImAn tuning: raise each image's threshold (``vmin``) until the
-    diffuse background mesh fragments and only compact cell-blobs remain. For the CORR
-    and PNR images independently, sweep the threshold and count **cell-like** connected
-    components (soma-sized area from ``sigma``, ``solidity > min_solidity``); pick the
-    threshold that maximises that count — most blobs visible = background gone, cells
-    not yet lost. ``min_corr`` is read off the CORR image, ``min_pnr`` off the PNR
-    image (independent, like the two sliders). Returns ``(min_corr, min_pnr, evidence)``.
+    Mirrors the manual diagnosis: detect the neuron blobs on the CORR·PNR image
+    (:func:`tuning.metrics.detect_product_blobs` — the same detector the
+    ``blob_coverage`` diagnosis uses) and choose, for the CORR and PNR images
+    independently, the threshold that best separates the values **at those neuron
+    centres** from the **background** (pixels ≥ ``bg_radius_factor·sigma`` px from
+    every neuron). "Best" = max Youden's J (most neurons kept, least background
+    leaked) — the two sliders the user drags, derived from the data. ``min_corr`` is
+    read off the CORR image, ``min_pnr`` off the PNR image. Falls back to safe
+    defaults when too few neurons are detected. Returns ``(min_corr, min_pnr,
+    evidence)``.
     """
-    import math
+    from scipy.ndimage import binary_dilation
+    from skimage.morphology import disk
 
-    a_min = max(3, int(0.5 * math.pi * sigma ** 2))
-    a_max = max(a_min + 1, int(math.pi * (3.0 * sigma) ** 2))
+    from tuning.metrics import detect_product_blobs
+
+    cn = np.asarray(cn, dtype=np.float64)
+    pnr = np.asarray(pnr, dtype=np.float64)
+    blobs = detect_product_blobs(cn, pnr, sigma)
+
     corr_axis = np.linspace(corr_floor, 0.95, n_thr)
     pnr_hi = float(np.percentile(pnr, 99.5))
     pnr_axis = np.linspace(pnr_floor, max(pnr_floor + 1.0, pnr_hi), n_thr)
 
-    nc_corr, lf_corr = _celllike_curve(cn, corr_axis, a_min, a_max, min_solidity)
-    nc_pnr, lf_pnr = _celllike_curve(pnr, pnr_axis, a_min, a_max, min_solidity)
+    # Background = pixels away from every neuron (complement of the dilated
+    # neuron-centre mask). Empty / too-few-blobs => safe defaults.
+    rc = blobs.astype(int) if len(blobs) else np.zeros((0, 2), int)
+    centre_mask = np.zeros(cn.shape, dtype=bool)
+    if len(rc):
+        centre_mask[rc[:, 0], rc[:, 1]] = True
+    radius = max(1, int(round(bg_radius_factor * sigma)))
+    neuron_region = binary_dilation(centre_mask, structure=disk(radius))
+    bg_mask = ~neuron_region
 
-    # argmax ties -> lowest threshold (more permissive). Fall back to safe defaults
-    # when no cell-like blob is ever found (degenerate / empty image).
-    min_corr = float(corr_axis[int(np.argmax(nc_corr))]) if nc_corr.max() > 0 else 0.8
-    min_pnr = float(pnr_axis[int(np.argmax(nc_pnr))]) if nc_pnr.max() > 0 else 10.0
+    corr_neuron = cn[rc[:, 0], rc[:, 1]] if len(rc) else np.empty(0)
+    pnr_neuron = pnr[rc[:, 0], rc[:, 1]] if len(rc) else np.empty(0)
+    corr_bg = cn[bg_mask]
+    pnr_bg = pnr[bg_mask]
+    # Subsample background for cheap, stable thresholding (deterministic stride).
+    if corr_bg.size > max_bg:
+        step = corr_bg.size // max_bg
+        corr_bg, pnr_bg = corr_bg[::step], pnr_bg[::step]
+
+    if len(blobs) >= min_blobs and corr_bg.size and pnr_bg.size:
+        min_corr, j_corr = _separating_threshold(corr_neuron, corr_bg, corr_axis)
+        min_pnr, j_pnr = _separating_threshold(pnr_neuron, pnr_bg, pnr_axis)
+        min_corr = float(max(corr_floor, min_corr))
+        min_pnr = float(max(pnr_floor, min_pnr))
+    else:
+        min_corr, min_pnr = 0.8, 10.0
+        j_corr = np.zeros(n_thr)
+        j_pnr = np.zeros(n_thr)
 
     evidence = {"cn": cn, "pnr": pnr, "sigma": float(sigma),
-                "corr_axis": corr_axis, "pnr_axis": pnr_axis,
-                "ncell_corr": nc_corr, "ncell_pnr": nc_pnr,
-                "largest_frac_corr": lf_corr, "largest_frac_pnr": lf_pnr,
-                "a_min": a_min, "a_max": a_max,
+                "blob_rc": rc, "n_blobs": int(len(blobs)),
+                "corr_neuron": corr_neuron, "pnr_neuron": pnr_neuron,
+                "corr_bg": corr_bg, "pnr_bg": pnr_bg,
+                "thr_axis_corr": corr_axis, "thr_axis_pnr": pnr_axis,
+                "j_corr": j_corr, "j_pnr": j_pnr,
                 "min_corr": min_corr, "min_pnr": min_pnr}
     return min_corr, min_pnr, evidence
 
