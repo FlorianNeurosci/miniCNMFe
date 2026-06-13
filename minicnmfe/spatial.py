@@ -590,6 +590,7 @@ def update_spatial(
 
     support = compute_support(A, dims, dilation_radius)
 
+    spatial_path = "serial"   # diagnostic: which CD path ran (see stats print)
     if n_jobs == 1:
         # Serial path — avoids joblib import overhead. Fixed 256-pixel batches
         # (kept byte-identical: the n_jobs=1 path is pinned bit-for-bit by
@@ -627,6 +628,7 @@ def update_spatial(
         # = cpu_count) — set_num_threads rejects anything larger.
         n_workers = max(1, min(effective_n_jobs(n_jobs),
                                int(numba.config.NUMBA_NUM_THREADS)))
+        spatial_path = f"numba prange x{n_workers}"
         all_results, totals = _spatial_numba_update(
             Y_flat, C, support, sn, T, n_pixels, n_jobs,
             max_iter, tol, spatial_ridge, n_workers,
@@ -644,6 +646,7 @@ def update_spatial(
         # threads thrash the GIL rather than help. Size batches to ~4x workers so
         # dispatch overhead is small while a batch's dense slab stays bounded.
         n_workers = max(1, min(effective_n_jobs(n_jobs), int(spatial_thread_cap)))
+        spatial_path = f"threaded x{n_workers} GIL-bound (pip install numba to scale)"
         batch_size = (n_pixels + 4 * n_workers - 1) // (4 * n_workers)
         batch_size = max(256, batch_size)
         max_batch_by_mem = max(256, (64 * 1024 * 1024) // (4 * max(int(T), 1)))
@@ -687,7 +690,7 @@ def update_spatial(
             f"  update_spatial stats: {total_ran}/{n_pixels} pixels ran CD; "
             f"mean_iter={mean_iter:.1f} max_iter_seen={max_iter_seen} "
             f"(cap={max_iter}); {total_unconverged} hit cap; "
-            f"mean_active={mean_active:.1f}"
+            f"mean_active={mean_active:.1f} [{spatial_path}]"
         )
     if total_unconverged > 0:
         print(

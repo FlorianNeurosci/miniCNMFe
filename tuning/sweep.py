@@ -276,7 +276,18 @@ def run_sweep(
         budget = max(1, n_jobs)
     cand_jobs = min(len(candidates), budget)
     inner_jobs = max(1, budget // cand_jobs)
-    candidates = [(replace(params, n_jobs=inner_jobs), swept)
+
+    # Patch-parallel greedy init (loky processes) is the only way to parallelise
+    # the otherwise-serial greedy seed loop — the dominant cost on long/large
+    # fits. It must NOT nest under candidate-level loky, so enable it only when
+    # there's no candidate-level fan-out (cand_jobs == 1: candidates run inline in
+    # the parent). Then a candidate's init uses the full inner_jobs across patches.
+    # With cand_jobs > 1, init parallelism comes from candidates running
+    # concurrently instead, and per-candidate patches stay off (tuner set
+    # init_patches=False on the base).
+    cand_init_patches = (cand_jobs == 1 and inner_jobs > 1)
+    candidates = [(replace(params, n_jobs=inner_jobs,
+                           init_patches=cand_init_patches), swept)
                   for params, swept in candidates]
 
     # candidate figures use a crop-local correlation image; slice the FOV cn to
@@ -301,8 +312,10 @@ def run_sweep(
 
     best_idx = rows[0]["idx"]
     # The best-model re-fit runs alone in the parent (no candidate-level fan-out),
-    # so give it the full core budget instead of the throttled inner_jobs.
-    best_params = replace(candidates[best_idx][0], n_jobs=budget)
+    # so give it the full core budget and patch-parallel init (top-level loky,
+    # nothing to nest under).
+    best_params = replace(candidates[best_idx][0], n_jobs=budget,
+                          init_patches=(budget > 1))
     best_model = _fit_candidate(best_params, str(mc_zarr_path), region_crop,
                                 str(workdir / "best"))
     return rows, best_params, best_model
