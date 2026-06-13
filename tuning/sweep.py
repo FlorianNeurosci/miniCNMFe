@@ -230,6 +230,10 @@ def run_sweep(
     the best candidate **re-fit once in the parent** on the same region (so the
     stage-4 heuristics have a live model to read).
 
+    ``n_jobs`` is the **total core budget**, split internally between candidate-level
+    concurrency (loky processes) and each candidate's inner ``fit_extract`` threads
+    so the product never exceeds the budget (avoids N*N thread oversubscription).
+
     ``cn`` is the FOV correlation image; when given, each candidate also gets a
     footprints + traces PNG written to the tuner output dir (``workdir.parent``)
     as ``fig_cand_<i>_footprints.png`` / ``fig_cand_<i>_traces.png``, and the
@@ -240,6 +244,21 @@ def run_sweep(
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     candidates = build_candidates(base_params, spec, max_candidates)
+
+    # Split the `n_jobs` core budget across the two parallelism levels so their
+    # product ~= budget (no N*N thread oversubscription). Candidates run as loky
+    # *processes* (cand_jobs of them); each fit_extract then runs cand-internal
+    # *threads* (inner_jobs). BLAS is pinned to 1 per process in _run_one_candidate,
+    # so total OS threads ~= cand_jobs * inner_jobs ~= budget. With the default
+    # few-candidate sweep this puts the surplus cores into each fit (e.g. 3 cands x
+    # ~10 inner on a 32-core box); with a large grid it goes candidate-parallel,
+    # inner-serial. Candidate level must stay processes: with init_patches=False the
+    # per-candidate greedy seed loop is pure-Python/GIL-bound, so threads wouldn't help.
+    budget = max(1, n_jobs)
+    cand_jobs = min(len(candidates), budget)
+    inner_jobs = max(1, budget // cand_jobs)
+    candidates = [(replace(params, n_jobs=inner_jobs), swept)
+                  for params, swept in candidates]
 
     # candidate figures use a crop-local correlation image; slice the FOV cn to
     # the cutout so contours land on the right pixels (region_crop=None at render).
@@ -258,11 +277,13 @@ def run_sweep(
          str(fig_dir / f"fig_cand_{i}_traces.png"))
         for i, (params, swept) in enumerate(candidates)
     ]
-    rows = Parallel(n_jobs=n_jobs)(delayed(_run_one_candidate)(t) for t in tasks)
+    rows = Parallel(n_jobs=cand_jobs)(delayed(_run_one_candidate)(t) for t in tasks)
     rows = sorted(rows, key=lambda r: r.get("score", float("-inf")), reverse=True)
 
     best_idx = rows[0]["idx"]
-    best_params = candidates[best_idx][0]
+    # The best-model re-fit runs alone in the parent (no candidate-level fan-out),
+    # so give it the full core budget instead of the throttled inner_jobs.
+    best_params = replace(candidates[best_idx][0], n_jobs=budget)
     best_model = _fit_candidate(best_params, str(mc_zarr_path), region_crop,
                                 str(workdir / "best"))
     return rows, best_params, best_model

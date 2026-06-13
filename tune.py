@@ -101,7 +101,11 @@ def main() -> None:
     parser.add_argument("--existing-results", type=Path, default=None,
                         help="Pre-fit results dir for the temporal heuristics "
                              "(when not running a sweep)")
-    parser.add_argument("--n-jobs", type=int, default=1)
+    parser.add_argument("--n-jobs", type=int, default=1,
+                        help="total core budget for the sweep; split across "
+                             "candidate-level processes x inner per-fit threads "
+                             "(default 1 = fully serial). Set near your physical "
+                             "core count.")
 
     # -- consolidated front-door flags --
     parser.add_argument("--validate", action=argparse.BooleanOptionalAction, default=None,
