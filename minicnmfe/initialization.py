@@ -495,7 +495,15 @@ def greedy_corr_pnr(
                 ind_search[r0:r1, c0:c1] |= support
 
             # ----- Local CN/PNR update against the cached noise -----
+            # Subsample time by corrpnr_stride, MATCHING the global CORR/PNR pass
+            # (lines ~353): the initial cn/pnr that seed the search were computed
+            # on strided frames, so the per-seed refresh should use the same
+            # frames for consistency — and it's the per-seed hot spot
+            # (local_correlations_fft ≈ 40% of greedy), so striding cuts it
+            # ~corrpnr_stride×. No-op when corrpnr_stride == 1.
             box = data_filtered[:, r2_0:r2_1, c2_0:c2_1]
+            if corrpnr_stride > 1:
+                box = box[::corrpnr_stride]
             cn_box, pnr_box = _local_cn_pnr_box(
                 box, noise_pixel[r2_0:r2_1, c2_0:c2_1], thresh_init=thresh_init,
             )

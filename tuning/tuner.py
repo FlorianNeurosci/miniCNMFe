@@ -75,8 +75,15 @@ def run_tuning(cfg: TunerConfig) -> dict:
     base = cfg.base_params or good_defaults(
         frame_rate_hz=cfg.frame_rate_hz, decay_time_ms=cfg.decay_time_ms,
         n_jobs=cfg.n_jobs)
+    # Patch-parallel greedy init is ON by default, but the sweep runs candidates
+    # in parallel loky processes — patched-greedy inside a candidate would nest
+    # loky (joblib serializes the inner patches → slower, not faster). The sweep
+    # already parallelizes at the candidate level, so force serial greedy per
+    # candidate here. (The final MiniCnmfeExtraction is a single fit → keeps the
+    # default patched path.)
     base = replace(base, n_jobs=cfg.n_jobs,
-                   frame_rate_hz=cfg.frame_rate_hz, decay_time_ms=cfg.decay_time_ms)
+                   frame_rate_hz=cfg.frame_rate_hz, decay_time_ms=cfg.decay_time_ms,
+                   init_patches=False)
     kind = _detect_kind(cfg.input_path)
     run_dir = Path(cfg.output_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -288,5 +295,5 @@ def run_tuning(cfg: TunerConfig) -> dict:
         "sweep": sweep_result, "mc_quality": mc_quality(mc_shifts),
     }
 
-    R.write_report(run_dir, result, best_model=stage4_model, cn=cn)
+    R.write_report(run_dir, result, best_model=stage4_model, cn=cn, pnr=pnr)
     return result

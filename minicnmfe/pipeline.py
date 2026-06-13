@@ -272,11 +272,17 @@ class CNMFeParams:
     # near-identical seed map at a fraction of the cost. None auto-selects
     # max(1, T_init // 2000) so the sweep sees ~2000 frames regardless of T.
     init_corrpnr_stride: "int | None" = None
-    # [NON-STANDARD speed] Patch-based PARALLEL initialization (opt-in, OFF by
-    # default so behaviour is bit-for-bit unchanged). When True and the FOV is
-    # large enough, the greedy init is tiled into overlapping spatial patches
-    # run in parallel processes, then border duplicates are merged. CPU only.
-    init_patches: bool = False
+    # [speed] Patch-based PARALLEL initialization (ON by default). The greedy
+    # seed loop is inherently serial, so for a large FOV we tile it into
+    # overlapping spatial patches run in parallel processes and merge border
+    # duplicates (validated: seeds land on the same cells as the serial path,
+    # ~3x faster at n_jobs=8, more with more cores). Auto-skips when it can't
+    # help or could hurt: small FOV (min(H,W) < init_patch_min_fov), GPU
+    # (device != cpu), a streaming/zarr movie (patches materialise, so in-RAM
+    # only -> no OOM), and nested parallelism (the tuning sweep sets this False
+    # for its candidates, since loky can't nest and candidates already run in
+    # parallel). Set False to force the bit-for-bit serial greedy.
+    init_patches: bool = True
     init_patch_size: "int | None" = None     # patch side px; None -> max(int(12*sigma), 48)
     init_patch_overlap: "int | None" = None  # overlap px; None -> int(4*sigma) (> patch_radius ~3*sigma)
     init_patch_min_fov: int = 128            # only tile when min(H, W) >= this; else global init
@@ -322,13 +328,24 @@ class CNMFeParams:
     # exact prior behaviour); ``1`` (default, 3×3 SE) is what CaImAn uses.
     spatial_close_radius: int = 1
     # Per-pixel LASSO coordinate-descent budget (sklearn's
-    # `enet_coordinate_descent_gram`). Defaults match the long-standing
-    # hardcoded values. Increase `spatial_max_iter` if the pipeline logs
-    # "N pixels hit max_iter ..." at the end of update_spatial;
-    # alternatively loosen `spatial_tol` (less strict convergence, faster).
-    # Both knobs trade compute for tightness of the LASSO solution.
-    spatial_max_iter: int = 10000
+    # `enet_coordinate_descent_gram`). With `spatial_ridge` (below) the CD
+    # converges in tens of iterations even on real data, so this cap is rarely
+    # reached; it is just a backstop. Increase it only if the pipeline logs
+    # "N pixels hit max_iter ..." at the end of update_spatial (and prefer
+    # raising `spatial_ridge` slightly first); loosening `spatial_tol` also
+    # speeds convergence at the cost of LASSO tightness.
+    spatial_max_iter: int = 1000
     spatial_tol: float = 1e-4
+    # [PERF/STABILITY] Elastic-net L2 fraction for the per-pixel solve. The
+    # solver's beta is set to `spatial_ridge * max(diag(Gram))`, bounding the
+    # condition number of the per-pixel Gram (`C_active @ C_active.T`) to
+    # ~`1/spatial_ridge`. This is what keeps the CD converging when active
+    # components have correlated/near-duplicate traces (a near-singular Gram) —
+    # the cause of pixels running to thousands of iterations / not converging on
+    # real recordings. Shrinkage on the coefficients is ~`spatial_ridge` (≈1% at
+    # the default), negligible and confined to the degenerate components it
+    # stabilises. Set ``0.0`` to restore pure LASSO (pre-change behaviour).
+    spatial_ridge: float = 1e-2
     # [NON-STANDARD; bandaid for LASSO spread] Apply `circular_constraint`
     # (initialization.py:33-53) as the final step of `threshold_footprint`.
     # Clips pixels further than `factor * sqrt(area/pi)` from the footprint
@@ -1372,6 +1389,9 @@ class CNMFe:
             p.init_patches
             and min(H, W) >= p.init_patch_min_fov
             and p.device == "cpu"
+            # in-RAM only: greedy_corr_pnr_patched does np.asarray(movie), so a
+            # streaming/zarr init_movie would be fully materialised (OOM risk).
+            and isinstance(init_movie, np.ndarray)
         )
         if use_patches:
             patch_size = p.init_patch_size or max(int(12 * p.sigma), 48)
@@ -1628,6 +1648,7 @@ class CNMFe:
                 max_iter=p.spatial_max_iter,
                 tol=p.spatial_tol,
                 circular_max_dist_factor=p.spatial_circular_max_dist_factor,
+                spatial_ridge=p.spatial_ridge,
             )
             timer.add("update_spatial", time.perf_counter() - _t)
 

@@ -39,7 +39,8 @@ def _spatial_pixel_batch(
     T: int,
     max_iter: int = 1000,
     tol: float = 1e-4,
-) -> tuple[list[tuple[int, int, float]], int]:
+    ridge: float = 1e-2,
+) -> tuple[list[tuple[int, int, float]], tuple[int, int, int, int, int]]:
     """Process one contiguous batch of pixels.
 
     Args:
@@ -53,15 +54,32 @@ def _spatial_pixel_batch(
         max_iter: Per-pixel CD iteration cap (passed straight through to
             ``enet_coordinate_descent_gram``).
         tol: Per-pixel CD convergence tolerance (passed straight through).
+        ridge: Elastic-net L2 fraction. The solver's ``beta`` is set to
+            ``ridge * max(diag(Gram))`` per pixel, which bounds the condition
+            number of ``Gram + beta*I`` to ~``1/ridge``. This is what keeps the
+            CD converging in tens of iterations when active components have
+            correlated/near-duplicate traces (a near-singular Gram) — without it
+            (``ridge=0``, pure LASSO) such pixels crawl to thousands of
+            iterations and may hit ``max_iter``. The coefficient shrinkage it
+            introduces is ~``ridge`` (≈1% at the default), negligible and
+            confined to the degenerate components it stabilises.
 
     Returns:
-        Tuple of (results, n_unconverged):
+        Tuple of (results, stats):
           - results: list of (global_pixel_idx, component_idx, coef) for
             coefficients > 0.
-          - n_unconverged: number of pixels in this batch where the CD
-            solver hit ``max_iter`` without converging. Aggregated by
-            ``update_spatial`` into a single summary line instead of
-            sklearn's default per-pixel ConvergenceWarning.
+          - stats: (n_unconverged, n_ran, iter_sum, iter_max, active_sum)
+            diagnostic counters aggregated by ``update_spatial``:
+              * n_unconverged: pixels whose CD hit ``max_iter`` without
+                converging (also drives the existing warning line).
+              * n_ran: pixels that actually ran CD (non-empty support, lam>0).
+              * iter_sum / iter_max: sum / max of CD iteration counts over
+                ``n_ran`` pixels (mean iter = iter_sum / n_ran).
+              * active_sum: sum of active-set sizes over ``n_ran`` pixels
+                (mean active = active_sum / n_ran).
+            These let ``update_spatial`` print one line distinguishing
+            "slow because CD never converges" from "slow because active
+            sets are huge" from "slow because there are many pixels".
     """
     # Call the underlying Cython CD solver directly instead of going
     # through sklearn's Lasso estimator. The estimator's .fit() path
@@ -79,6 +97,10 @@ def _spatial_pixel_batch(
     #   arg, so we pass `lam * T` to match `Lasso(alpha=lam)`.
     results: list[tuple[int, int, float]] = []
     n_unconverged = 0
+    n_ran = 0
+    iter_sum = 0
+    iter_max = 0
+    active_sum = 0
     # Suppress sklearn's per-pixel ConvergenceWarning once for the whole batch
     # (entering a catch_warnings context per pixel — ~256× here, 90k× per
     # update — is pure-Python GIL-bound overhead that threads can't hide). The
@@ -109,7 +131,9 @@ def _spatial_pixel_batch(
                 w, _, _, n_iter = enet_coordinate_descent_gram(
                     w,                       # initial coef, mutated in place
                     float(lam) * T,          # alpha * n_samples
-                    0.0,                     # beta (no L2 / no Elastic-Net)
+                    float(ridge) * max_energy,  # beta = ridge * max diag(Q):
+                    #                          # bounds cond(Q+beta*I) ~ 1/ridge so
+                    #                          # CD converges even for correlated comps
                     gram,                    # Q = X.T @ X
                     Xy,                      # q = X.T @ y
                     y_p_64,                  # y (for dual-gap check)
@@ -119,8 +143,14 @@ def _spatial_pixel_batch(
                     0,                       # random=0 -> cyclic, deterministic
                     1,                       # positive
                 )
-                if int(n_iter) >= int(max_iter):
+                n_iter_i = int(n_iter)
+                if n_iter_i >= int(max_iter):
                     n_unconverged += 1
+                n_ran += 1
+                iter_sum += n_iter_i
+                if n_iter_i > iter_max:
+                    iter_max = n_iter_i
+                active_sum += len(active)
                 coef = w
             except Exception:
                 coef = np.zeros(len(active), dtype=np.float64)
@@ -130,7 +160,7 @@ def _spatial_pixel_batch(
                 val = float(coef[idx])
                 if val > 0:
                     results.append((p_global, int(k), val))
-    return results, n_unconverged
+    return results, (n_unconverged, n_ran, iter_sum, iter_max, active_sum)
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +332,7 @@ def update_spatial(
     max_iter: int = 1000,
     tol: float = 1e-4,
     circular_max_dist_factor: float = 1.5,
+    spatial_ridge: float = 1e-2,
 ) -> sp.csc_matrix:
     """Refine spatial footprints by per-pixel non-negative LASSO regression.
 
@@ -336,6 +367,11 @@ def update_spatial(
             ``0`` disables; ``1.5`` (default) is tighter than the
             init-time factor because BCD-refined footprints are known
             better and a generous factor lets thin tendrils survive.
+        spatial_ridge: Elastic-net L2 fraction for the per-pixel solve (see
+            ``_spatial_pixel_batch``). The default ``1e-2`` keeps the CD
+            converging in tens of iterations on real data, where correlated /
+            duplicate components otherwise make the Gram near-singular and the
+            pure-LASSO CD run to ``max_iter``. ``0`` restores pure LASSO.
 
     Returns:
         A_new: Updated sparse (H*W, K) footprints.
@@ -355,10 +391,8 @@ def update_spatial(
 
     if n_jobs == 1:
         # Serial path — avoids joblib import overhead
-        all_results: list[tuple[int, int, float]] = []
-        total_unconverged = 0
-        for start, end in batches:
-            batch_results, batch_unconv = _spatial_pixel_batch(
+        per_batch = [
+            _spatial_pixel_batch(
                 start,
                 Y_flat[start:end],
                 C,
@@ -367,9 +401,11 @@ def update_spatial(
                 T,
                 max_iter,
                 tol,
+                spatial_ridge,
             )
-            all_results.extend(batch_results)
-            total_unconverged += batch_unconv
+            for start, end in batches
+        ]
+        all_results = [item for batch_res, _ in per_batch for item in batch_res]
     else:
         from joblib import Parallel, delayed
         from threadpoolctl import threadpool_limits
@@ -397,12 +433,31 @@ def update_spatial(
                     T,
                     max_iter,
                     tol,
+                    spatial_ridge,
                 )
                 for start, end in batches
             )
         all_results = [item for batch_res, _ in per_batch for item in batch_res]
-        total_unconverged = sum(batch_unconv for _, batch_unconv in per_batch)
 
+    # Aggregate per-batch diagnostic counters (see _spatial_pixel_batch stats).
+    total_unconverged = sum(s[0] for _, s in per_batch)
+    total_ran = sum(s[1] for _, s in per_batch)
+    total_iter = sum(s[2] for _, s in per_batch)
+    max_iter_seen = max((s[3] for _, s in per_batch), default=0)
+    total_active = sum(s[4] for _, s in per_batch)
+
+    if total_ran > 0:
+        mean_iter = total_iter / total_ran
+        mean_active = total_active / total_ran
+        # One always-on summary that distinguishes the three slowness causes:
+        # convergence (mean_iter near max_iter), active-set size (mean_active
+        # large -> heavy per-pixel Gram matmul), or sheer pixel count.
+        print(
+            f"  update_spatial stats: {total_ran}/{n_pixels} pixels ran CD; "
+            f"mean_iter={mean_iter:.1f} max_iter_seen={max_iter_seen} "
+            f"(cap={max_iter}); {total_unconverged} hit cap; "
+            f"mean_active={mean_active:.1f}"
+        )
     if total_unconverged > 0:
         print(
             f"  update_spatial: {total_unconverged}/{n_pixels} pixels hit "
