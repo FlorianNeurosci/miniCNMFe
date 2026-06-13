@@ -347,6 +347,12 @@ class CNMFeParams:
     # the default), negligible and confined to the degenerate components it
     # stabilises. Set ``0.0`` to restore pure LASSO (pre-change behaviour).
     spatial_ridge: float = 1e-2
+    # [PERF] Max worker threads for the parallel per-pixel CD in update_spatial.
+    # That loop is GIL-bound, so handing it the full core budget (e.g. n_jobs=256
+    # on a big server) thrashes the GIL and collapses to ~1 effective core; the
+    # effective worker count is min(n_jobs, spatial_thread_cap). 16 is a sweet
+    # spot. Does not affect the serial (n_jobs=1) path or extracted results.
+    spatial_thread_cap: int = 16
     # [NON-STANDARD; bandaid for LASSO spread] Apply `circular_constraint`
     # (initialization.py:33-53) as the final step of `threshold_footprint`.
     # Clips pixels further than `factor * sqrt(area/pi)` from the footprint
@@ -1652,6 +1658,7 @@ class CNMFe:
                 tol=p.spatial_tol,
                 circular_max_dist_factor=p.spatial_circular_max_dist_factor,
                 spatial_ridge=p.spatial_ridge,
+                spatial_thread_cap=p.spatial_thread_cap,
             )
             timer.add("update_spatial", time.perf_counter() - _t)
 

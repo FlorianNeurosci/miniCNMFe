@@ -96,6 +96,41 @@ class TestUpdateSpatialParallel:
         A_new = update_spatial(Y_flat, C, A, sn, d["dims"], n_jobs=2)
         assert A_new.data.min() >= 0
 
+    def test_thread_cap_applied(self, synth_data, monkeypatch):
+        """A huge n_jobs is capped to spatial_thread_cap for the CD parallel
+        path (the loop is GIL-bound; >cap threads just thrash the GIL), while
+        results stay equivalent to serial."""
+        import joblib
+        from minicnmfe import spatial as _spatial
+        from minicnmfe.spatial import update_spatial
+        from minicnmfe._utils import make_2d
+        d = synth_data
+        Y_flat = make_2d(d["movie"])
+        A = sp.csc_matrix(d["A_true"].astype(np.float32))
+        C = d["C_true"].copy()
+        sn = np.ones(d["dims"][0] * d["dims"][1], dtype=np.float32) * d["sn_true"]
+
+        calls = []          # n_jobs of every joblib.Parallel created
+        real_parallel = joblib.Parallel
+
+        def _spy(*args, **kwargs):
+            calls.append(kwargs.get("n_jobs", args[0] if args else None))
+            return real_parallel(*args, **kwargs)
+
+        monkeypatch.setattr(joblib, "Parallel", _spy)
+
+        A1 = update_spatial(Y_flat, C, A, sn, d["dims"], n_jobs=1)
+        A2 = update_spatial(Y_flat, C, A, sn, d["dims"],
+                            n_jobs=1000, spatial_thread_cap=4)
+
+        expected = min(joblib.effective_n_jobs(1000), 4)
+        # The per-pixel CD is the FIRST Parallel in update_spatial; it must be
+        # capped to spatial_thread_cap (<=4), not run with the raw 1000. (The
+        # later threshold_footprint Parallel parallelises over K components with
+        # GIL-releasing scipy.ndimage and is intentionally left uncapped.)
+        assert calls[0] == expected
+        assert abs(A1 - A2).max() < 1e-5     # still matches serial
+
 
 # ---------------------------------------------------------------------------
 # Temporal update

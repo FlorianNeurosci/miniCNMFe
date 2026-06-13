@@ -25,6 +25,16 @@ from sklearn.linear_model._cd_fast import enet_coordinate_descent_gram
 # call -- never mutated when random=0.
 _CD_RNG = np.random.RandomState(0)
 
+# Worker-thread cap for the per-pixel CD parallel path. The loop in
+# `_spatial_pixel_batch` is dominated by GIL-held Python/numpy glue
+# (fancy-indexing C[active], the tiny C_active@C_active.T, np.diag/np.max,
+# array allocation) wrapped around a *short* GIL-released Cython solve. A
+# GIL-bound loop can't use more than ~one Python thread at a time, so handing
+# it the full core budget (e.g. 256) just thrashes the GIL and collapses to
+# ~1 effective core. Capping at a sweet spot saturates the GIL-released
+# fraction without the thrash. Tunable via CNMFeParams.spatial_thread_cap.
+_SPATIAL_THREAD_CAP = 16
+
 
 # ---------------------------------------------------------------------------
 # Module-level worker (must be importable for multiprocessing pickling)
@@ -333,6 +343,7 @@ def update_spatial(
     tol: float = 1e-4,
     circular_max_dist_factor: float = 1.5,
     spatial_ridge: float = 1e-2,
+    spatial_thread_cap: int = _SPATIAL_THREAD_CAP,
 ) -> sp.csc_matrix:
     """Refine spatial footprints by per-pixel non-negative LASSO regression.
 
@@ -372,6 +383,11 @@ def update_spatial(
             converging in tens of iterations on real data, where correlated /
             duplicate components otherwise make the Gram near-singular and the
             pure-LASSO CD run to ``max_iter``. ``0`` restores pure LASSO.
+        spatial_thread_cap: Max worker threads for the parallel (``n_jobs>1``)
+            per-pixel CD. The loop is GIL-bound, so more than ~16 threads thrash
+            the GIL instead of helping (observed ~1 effective core at
+            ``n_jobs=256``). The effective worker count is
+            ``min(n_jobs, spatial_thread_cap)``. Does not affect the serial path.
 
     Returns:
         A_new: Updated sparse (H*W, K) footprints.
@@ -382,15 +398,15 @@ def update_spatial(
 
     support = compute_support(A, dims, dilation_radius)
 
-    # Build list of (start, end) batch ranges
-    batch_size = 256
-    batches = [
-        (s, min(s + batch_size, n_pixels))
-        for s in range(0, n_pixels, batch_size)
-    ]
-
     if n_jobs == 1:
-        # Serial path — avoids joblib import overhead
+        # Serial path — avoids joblib import overhead. Fixed 256-pixel batches
+        # (kept byte-identical: the n_jobs=1 path is pinned bit-for-bit by
+        # tests/test_stage_split.py).
+        batch_size = 256
+        batches = [
+            (s, min(s + batch_size, n_pixels))
+            for s in range(0, n_pixels, batch_size)
+        ]
         per_batch = [
             _spatial_pixel_batch(
                 start,
@@ -405,25 +421,38 @@ def update_spatial(
             )
             for start, end in batches
         ]
-        all_results = [item for batch_res, _ in per_batch for item in batch_res]
     else:
-        from joblib import Parallel, delayed
+        from joblib import Parallel, delayed, effective_n_jobs
         from threadpoolctl import threadpool_limits
 
-        # Threads, not processes: loky would pickle ~10 MB of Y_flat[start:end]
-        # plus the full C per batch -- with ~1400 batches on a 600x600 movie
-        # that's ~25 GB of IPC overhead drowning the compute. The Cython CD
-        # solver releases the GIL during its inner loop, so threads get real
-        # concurrency without the pickling tax.
+        # Threads, not processes: the object passed as Y_flat is a lazy
+        # BackgroundSubtractor referencing the full sparse W + full movie, so
+        # loky would have to marshal those per task. The Cython CD solver
+        # releases the GIL during its inner loop, so threads get real
+        # concurrency on the solve without any pickling tax.
         #
+        # Cap the worker count (see _SPATIAL_THREAD_CAP): the per-pixel loop is
+        # GIL-bound, so >~16 threads thrash the GIL rather than help (observed
+        # ~1 effective core at n_jobs=256). With the cap, size batches to ~4x
+        # workers so dispatch overhead is small while a batch's dense slab
+        # (batch_size*T*4 bytes) stays bounded (~64 MB cap).
+        n_workers = max(1, min(effective_n_jobs(n_jobs), int(spatial_thread_cap)))
+        batch_size = (n_pixels + 4 * n_workers - 1) // (4 * n_workers)
+        batch_size = max(256, batch_size)
+        max_batch_by_mem = max(256, (64 * 1024 * 1024) // (4 * max(int(T), 1)))
+        batch_size = min(batch_size, max_batch_by_mem)
+        batches = [
+            (s, min(s + batch_size, n_pixels))
+            for s in range(0, n_pixels, batch_size)
+        ]
+
         # threadpool_limits caps inner BLAS threads to 1 for the duration
         # of the parallel section. Without this cap, on Linux each worker
         # thread's BLAS calls (the small Gram matmul, the CD inner solve)
         # try to spawn up to n_cores OpenMP threads, producing
-        # n_jobs * n_cores OS threads competing for n_cores. Observed:
-        # 20+ min update_spatial on 16-core Ubuntu vs minutes when capped.
+        # n_workers * n_cores OS threads competing for n_cores.
         with threadpool_limits(limits=1, user_api="blas"):
-            per_batch = Parallel(n_jobs=n_jobs, prefer="threads")(
+            per_batch = Parallel(n_jobs=n_workers, prefer="threads")(
                 delayed(_spatial_pixel_batch)(
                     start,
                     Y_flat[start:end],
@@ -437,7 +466,8 @@ def update_spatial(
                 )
                 for start, end in batches
             )
-        all_results = [item for batch_res, _ in per_batch for item in batch_res]
+
+    all_results = [item for batch_res, _ in per_batch for item in batch_res]
 
     # Aggregate per-batch diagnostic counters (see _spatial_pixel_batch stats).
     total_unconverged = sum(s[0] for _, s in per_batch)
