@@ -106,10 +106,15 @@ def test_validate_two_thresholds(session_folder, tmp_path):
         threshold_sets=[("recommended", 0.7, 6.0), ("lowthr", 0.6, 3.0)],
         n_template_avis=2, verbose=False)
 
-    # MC + Y_flat produced exactly once, shared across runs.
+    # MC + Y_flat (and the shared CORR/PNR images) produced exactly once.
     assert (out / "mc" / "mc.zarr").exists()
     assert (out / "Y_flat_pixel.zarr").exists()
+    assert (out / "cn.npy").exists() and (out / "pnr.npy").exists()
     assert (out / "comparison.md").exists()
+    # comparison table surfaces the new quality columns + verdict.
+    comp = (out / "comparison.md").read_text()
+    for col in ("blob_recall", "footprint_precision", "trace_corr_median", "status"):
+        assert col in comp, col
 
     assert len(res["rows"]) == 2
     labels = {r["label"] for r in res["rows"]}
@@ -118,11 +123,16 @@ def test_validate_two_thresholds(session_folder, tmp_path):
         rd = out / f"run_{label}"
         assert (rd / "A.npz").exists() and (rd / "C.npy").exists()
         assert (rd / "summary.txt").exists()
-        # at least one diagnostic figure when components were found
-        figs = list((rd / "figs").glob("*.png"))
         row = next(r for r in res["rows"] if r["label"] == label)
+        # quality metrics + verdict present on every row.
+        for key in ("blob_recall", "footprint_precision", "n_blobs",
+                    "n_footprints", "status"):
+            assert key in row, key
+        assert row["status"] in ("PASS", "WARN")
+        figs = list((rd / "figs").glob("*.png"))
         if row["K"] > 0:
             assert figs, f"no figures for {label} despite K={row['K']}"
+            assert (rd / "figs" / "blob_coverage.png").exists()
 
 
 def test_validate_reuse_mc(session_folder, tmp_path):

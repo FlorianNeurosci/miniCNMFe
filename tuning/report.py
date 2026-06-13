@@ -48,6 +48,9 @@ SYMPTOM_CAUSE_KNOB = """\
 | **Hard circular outer boundary** (clipped circle) | `circular_constraint` cutoff too tight | raise `spatial_circular_max_dist_factor` (1.2→1.5→2.0) | footprint_grid |
 | **Heavy spatial + trace overlap** between pairs that didn't merge | `merge_thr_corr` too strict | `merge_thr_corr` 0.85→0.75 | jaccard_merge |
 | **Ghost components** (dots on dark areas; bimodal peak histogram) | `min_corr` / `min_pnr` too lax for this recording | raise `min_pnr` (10→15); auto-eval flags ghosts by SNR | eccentricity, centroid_drift |
+| **Bright CORR·PNR blobs with no footprint** (low `blob_recall`) | thresholds too tight, or init under-seeding a long movie | lower `min_corr`/`min_pnr`; pin `init_stride` to 1–2 on long recordings | blob_coverage |
+| **Footprints sitting on no CORR·PNR blob** (low `footprint_precision`) | thresholds too lax → ghosts, or `sigma` mismatch | raise `min_pnr`/`min_corr`, or `auto_eval_snr_amp_thr` to cut ghosts | blob_coverage, snr_eval |
+| **`C+YrA` far from `C` / traces correlated across all cells** (low `cprojcorr_median`, high `trace_corr_median`) | over-split or unremoved global drift in a dense FOV (YrA cross-talk) | `global_bg_rank=1`; gentler merge; `n_iter_main≥2` + tighter footprints (`spatial_max_thr`↑, `spatial_circular_max_dist_factor`↓) | traces, jaccard_merge |
 | **All traces fire in lockstep** | Global drift not removed (bleach, LED warm-up, focus step) | per-pixel detrend; or `global_bg_rank=1` | traces, mean_proj_and_activity |
 | **Monotonic ramp at the start** of every trace | LED warm-up | crop first N frames via `temporal_crop`; or detrend | traces |
 | **Saturated / square-wave `C`** with normal `C + YrA` | OASIS over-smoothing; `g` pinned at the prior target | `g_prior_weight` 0.7→0.3; or unset `decay_time_ms` | traces, decay |
@@ -342,8 +345,19 @@ def fig_sweep_footprints(model, cn, out_path=None, region_crop=None):
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 8))
     if cn is not None:
-        ax.imshow(cn, cmap="gray")
-        ax.set_title("best-candidate footprints over the CORRELATION image")
+        # σ-smoothed CORR backdrop (gray, vmin=min_corr) — the cutout-selection
+        # look; cosmetic only, contours/data below are unchanged.
+        cn = np.asarray(cn, dtype=np.float32)
+        sigma = float(getattr(model.params, "sigma", 0.0) or 0.0)
+        if sigma > 0:
+            from scipy.ndimage import gaussian_filter
+            cn_disp = gaussian_filter(cn, sigma=sigma)
+        else:
+            cn_disp = cn
+        vmin = float(getattr(model.params, "min_corr", 0.0) or 0.0)
+        vmax = np.nanpercentile(cn_disp, 99.5) if np.isfinite(cn_disp).any() else None
+        ax.imshow(cn_disp, cmap="gray", vmin=vmin, vmax=vmax)
+        ax.set_title("best-candidate footprints over the σ-smoothed CORRELATION image")
     H, W = model.dims
     # The sweep extracts on a cutout (crop-local coords) but ``cn`` is the full
     # FOV correlation image. Offset the contours by the crop origin so they land
@@ -711,6 +725,88 @@ def fig_centroid_drift(model, cn, pnr=None, out_path=None):
     return _finish(fig, out_path)
 
 
+def fig_blob_coverage(model, cn, pnr, sigma, *, min_corr, min_pnr,
+                      radius_factor: float = 1.5, out_path=None):
+    """Blob-coverage check, drawn like the maintainer's manual selection overlay.
+
+    Single panel over the **σ-smoothed CORR image** (``gaussian_filter(cn, sigma)``,
+    gray, ``vmin=min_corr`` — the exact backdrop of the cutout-selection notebooks).
+    On top, in one view so detected blobs and the extracted footprints can be
+    compared by eye:
+
+    - **A footprint contours** at ``0.3·max`` — **cyan** accepted / **gray** rejected
+      (``model.accepted_mask``); the same overlay drawn when choosing components.
+    - **detected cell blobs** (:func:`tuning.metrics.detect_cell_blobs` — ``blob_log``
+      on the CORR·PNR product, thresholded by ``min_corr``/``min_pnr``) as open
+      circles: **green** when an accepted footprint peak lands within
+      ``radius_factor·sigma`` px, **red** when none does (a bright blob with no
+      footprint).
+    - **magenta ✕** at accepted-footprint peaks that sit on no blob (possible
+      spurious/ghost component).
+
+    Title carries ``blob_recall`` / ``footprint_precision``. Detection uses the raw
+    ``cn``/``pnr``; only the *backdrop* is smoothed. Shares its geometry with
+    :func:`tuning.metrics.blob_coverage` so figure and metric never diverge."""
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+    from scipy.ndimage import gaussian_filter
+
+    from tuning.metrics import _footprint_peaks, detect_cell_blobs
+
+    cn = np.asarray(cn, dtype=np.float32)
+    radius = float(radius_factor * sigma)
+    blobs = detect_cell_blobs(cn, pnr, sigma, min_corr=float(min_corr),
+                              min_pnr=float(min_pnr))
+    peaks = _footprint_peaks(model, accepted_only=True)
+
+    def _covered(pts_a, pts_b):
+        if len(pts_a) == 0 or len(pts_b) == 0:
+            return np.zeros(len(pts_a), dtype=bool)
+        d = np.hypot(pts_a[:, None, 0] - pts_b[None, :, 0],
+                     pts_a[:, None, 1] - pts_b[None, :, 1])
+        return (d <= radius).any(axis=1)
+
+    blob_ok = _covered(blobs, peaks)
+    peak_ok = _covered(peaks, blobs)
+    recall = float(blob_ok.mean()) if len(blobs) else float("nan")
+    prec = float(peak_ok.mean()) if len(peaks) else float("nan")
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    cn_s = gaussian_filter(cn, sigma=float(sigma)) if sigma and sigma > 0 else cn
+    vmax = np.nanpercentile(cn_s, 99.5) if np.isfinite(cn_s).any() else None
+    ax.imshow(cn_s, cmap="gray", vmin=float(min_corr), vmax=vmax)
+
+    # A footprint contours (the "compare to A" overlay) — cyan accepted / gray rejected.
+    A_dense, dims, K = _dense_components(model)
+    if K:
+        mask = getattr(model, "accepted_mask", None)
+        for k in range(K):
+            fp = A_dense[..., k]
+            if fp.max() <= 0:
+                continue
+            acc = mask is None or (len(mask) == K and mask[k])
+            ax.contour(fp, levels=[0.3 * fp.max()],
+                       colors=("cyan" if acc else "0.5"), linewidths=0.7)
+
+    # Detected blobs: green=covered by a footprint peak, red=uncovered.
+    for (r, c), ok in zip(blobs, blob_ok):
+        ax.add_patch(Circle((c, r), radius, fill=False,
+                            ec=("lime" if ok else "red"), lw=1.3, alpha=0.9))
+    # Footprint peaks sitting on no blob — possible ghosts.
+    if len(peaks):
+        off = peaks[~peak_ok]
+        if len(off):
+            ax.scatter(off[:, 1], off[:, 0], s=40, c="magenta", marker="x", lw=1.5)
+    ax.set_title(
+        f"blob coverage — recall {recall:.2f} ({int(blob_ok.sum())}/{len(blobs)} blobs), "
+        f"precision {prec:.2f} ({int(peak_ok.sum())}/{len(peaks)} footprints)\n"
+        "σ-smoothed CORR · cyan/gray=A footprint (acc/rej) · "
+        "green/red circle=covered/uncovered blob · magenta✕=footprint on no blob")
+    ax.axis("off")
+    fig.tight_layout()
+    return _finish(fig, out_path)
+
+
 def fig_footprint_grid(model, *, n: int = 24, ncols: int = 8, out_path=None):
     """Panel grid of the top-``n`` footprints by peak, each cropped around its
     ``footprint_center`` (so the soma is centred, not pushed to the crop edge by
@@ -801,12 +897,13 @@ def _params_json(recommended: dict):
     return CNMFeParams(**filtered), filtered
 
 
-def write_report(run_dir, result, *, best_model=None, cn=None):
+def write_report(run_dir, result, *, best_model=None, cn=None, pnr=None):
     """Write figures + recommended_params.json + downsample.json + report.md.
 
     ``result`` is the dict assembled by ``tuning.tuner.run_tuning``; ``best_model``
-    (live) and ``cn`` (correlation image) feed the stage-4 / sweep figures.
-    Returns the run_dir path.
+    (live) and ``cn`` (correlation image) feed the stage-4 / sweep figures. When
+    ``pnr`` (the matching peak-to-noise image) is also given, the sweep gets a
+    seed-coverage figure for the best candidate. Returns the run_dir path.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -832,9 +929,23 @@ def write_report(run_dir, result, *, best_model=None, cn=None):
         fig_sweep_scatter(sweep["rows"], out_path=run_dir / "fig_sweep_scatter.png")
         saved["sweep_scatter"] = "fig_sweep_scatter.png"
         if best_model is not None and best_model.A is not None and best_model.A.shape[1] > 0:
+            region_crop = sweep.get("region_crop")
             fig_sweep_footprints(best_model, cn, out_path=run_dir / "fig_sweep_footprints.png",
-                                 region_crop=sweep.get("region_crop"))
+                                 region_crop=region_crop)
             saved["sweep_footprints"] = "fig_sweep_footprints.png"
+            # Seed-coverage on the best candidate. The sweep extracts on a cutout
+            # (crop-local coords) while cn/pnr are full-FOV, so crop them to the
+            # region so detect_seeds + footprint peaks share one coordinate frame.
+            if cn is not None and pnr is not None:
+                cn_c, pnr_c = cn, pnr
+                if region_crop is not None:
+                    (y0, y1, x0, x1), _t = region_crop
+                    cn_c, pnr_c = cn[y0:y1, x0:x1], pnr[y0:y1, x0:x1]
+                bp = best_model.params
+                fig_blob_coverage(best_model, cn_c, pnr_c, float(bp.sigma),
+                                  min_corr=float(bp.min_corr), min_pnr=float(bp.min_pnr),
+                                  out_path=run_dir / "fig_sweep_blob_coverage.png")
+                saved["sweep_blob_coverage"] = "fig_sweep_blob_coverage.png"
             fig_sweep_traces(best_model, out_path=run_dir / "fig_sweep_traces.png")
             saved["sweep_traces"] = "fig_sweep_traces.png"
 
@@ -920,7 +1031,8 @@ def _render_md(result, saved, filtered) -> str:
             line = "| " + " | ".join(cells) + " |"
             L.append(f"**{line}**" if i == 0 else line)
         L.append("")
-        for k in ("sweep_scatter", "sweep_footprints", "sweep_traces"):
+        for k in ("sweep_scatter", "sweep_footprints", "sweep_blob_coverage",
+                  "sweep_traces"):
             if k in saved:
                 L += [f"![]({saved[k]})", ""]
 

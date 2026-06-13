@@ -40,6 +40,7 @@ _FIG_GROUPS = [
     ("Sweep", [
         ("fig_sweep_scatter.png", "Density↔purity: K vs corr(C, C+YrA), size=accepted, ★=best"),
         ("fig_sweep_footprints.png", "Best-candidate footprints over the correlation image"),
+        ("fig_sweep_blob_coverage.png", "Blob coverage: CORR·PNR cell blobs vs footprints (green=covered, red=uncovered, ✕=footprint on no blob)"),
         ("fig_sweep_traces.png", "Best candidate: C (blue) vs C+YrA (grey)"),
     ]),
 ]
@@ -282,9 +283,9 @@ def _validation_section(validation: dict) -> str:
     for lab in labels:
         figs_dir = out_dir / f"run_{lab}" / "figs"
         imgs = [_img(figs_dir / n, f"run_{lab}: {n[:-4]}")
-                for n in ("traces.png", "npix_dist.png", "snr_eval.png",
-                          "mc_shifts.png", "footprint_grid.png", "eccentricity.png",
-                          "jaccard_merge.png", "centroid_drift.png")]
+                for n in ("blob_coverage.png", "traces.png", "npix_dist.png",
+                          "snr_eval.png", "mc_shifts.png", "footprint_grid.png",
+                          "eccentricity.png", "jaccard_merge.png", "centroid_drift.png")]
         imgs = [i for i in imgs if i]
         if imgs:
             body.append(f"<h3>run_{html.escape(lab)}</h3>" + "\n".join(imgs))

@@ -248,6 +248,200 @@ def mc_crispness(corrected) -> dict:
             "crispness_std": crispness(arr.std(axis=0))}
 
 
+# --------------------------------------------------------------------------
+# Seed coverage + session quality verdict (the three by-eye checks the
+# maintainer runs when reviewing a tuned extraction, turned into numbers)
+# --------------------------------------------------------------------------
+
+# Default thresholds for the PASS/WARN verdict. These are **proxies, not
+# validation** (see the module docstring) — tune them per rig if needed.
+QUALITY_THRESHOLDS = {
+    "blob_recall_min": 0.80,         # < => bright CORR·PNR blobs with no footprint
+    "footprint_precision_min": 0.80, # < => footprints sitting on no CORR·PNR blob
+    "cprojcorr_min": 0.50,           # < => C+YrA diverges from the demixed C
+    "trace_corr_max": 0.40,          # > => traces too correlated across cells
+}
+
+
+def detect_cell_blobs(cn: np.ndarray, pnr: np.ndarray, sigma: float, *,
+                      min_corr: float, min_pnr: float,
+                      threshold: float = 0.05) -> np.ndarray:
+    """``(N, 2)`` cell-like blob centres ``(row, col)`` on the CORR·PNR image.
+
+    Uses ``skimage.feature.blob_log`` on the normalised ``cn * pnr`` product —
+    the same detector :func:`tuning.heuristics.suggest_sigma_extraction` uses to
+    size neurons — so a "blob" is a visually-distinct cell, not the dense local
+    maxima ``detect_seeds`` returns (which over-counts relative to the cells the
+    eye picks out). Blobs are kept only where ``cn >= min_corr`` and
+    ``pnr >= min_pnr`` at the centre, matching the thresholded CORR / min-corr
+    image the user inspects. Blob radius scales with ``sigma``.
+    """
+    from skimage.feature import blob_log
+
+    cn = np.asarray(cn, dtype=np.float64)
+    pnr = np.asarray(pnr, dtype=np.float64)
+    product = cn * pnr
+    rng = product.max() - product.min()
+    if rng <= 0:
+        return np.zeros((0, 2), dtype=float)
+    product_n = (product - product.min()) / (rng + 1e-8)
+    min_s = max(1.0, 0.5 * sigma)
+    max_s = max(min_s + 1.0, 3.0 * sigma)
+    blobs = blob_log(product_n, min_sigma=min_s, max_sigma=max_s,
+                     num_sigma=10, threshold=threshold)
+    if len(blobs) == 0:
+        return np.zeros((0, 2), dtype=float)
+    rc = blobs[:, :2].astype(int)
+    keep = (cn[rc[:, 0], rc[:, 1]] >= min_corr) & (pnr[rc[:, 0], rc[:, 1]] >= min_pnr)
+    return blobs[keep, :2].astype(float)
+
+
+def _footprint_peaks(model, *, accepted_only: bool = True) -> np.ndarray:
+    """``(M, 2)`` array of footprint peak ``(row, col)`` locations.
+
+    Uses :func:`minicnmfe._utils.footprint_center` (argmax of a lightly smoothed
+    footprint — the same centre the algorithm uses for circular_constraint /
+    merge, robust to sprawl/donuts). Columns whose footprint is all-zero are
+    dropped. When ``accepted_only`` and ``model.accepted_mask`` is present, only
+    accepted components contribute (the "circles" the user actually sees).
+    """
+    from minicnmfe._utils import footprint_center
+
+    A = getattr(model, "A", None)
+    dims = getattr(model, "dims", None)
+    if A is None or dims is None or A.shape[1] == 0:
+        return np.zeros((0, 2), dtype=float)
+    K = A.shape[1]
+    A_csc = A.tocsc() if sp.issparse(A) else sp.csc_matrix(A)
+    mask = getattr(model, "accepted_mask", None)
+    if accepted_only and mask is not None and len(mask) == K:
+        idx = [k for k in range(K) if mask[k]]
+    else:
+        idx = list(range(K))
+    H, W = dims
+    pts = []
+    for k in idx:
+        fp = np.asarray(A_csc[:, k].todense()).reshape(H, W)
+        if fp.max() <= 0:
+            continue
+        pts.append(footprint_center(fp))
+    return np.asarray(pts, dtype=float) if pts else np.zeros((0, 2), dtype=float)
+
+
+def _bidirectional_match(blobs: np.ndarray, peaks: np.ndarray, radius: float):
+    """Count, for each side, how many points have a neighbour within ``radius``.
+
+    Returns ``(n_blobs_covered, n_peaks_on_blob)``. Robust to either side being
+    empty. Uses a cKDTree when both sides are non-trivial, else a direct
+    distance matrix.
+    """
+    n_b, n_p = len(blobs), len(peaks)
+    if n_b == 0 or n_p == 0:
+        return 0, 0
+    if n_b * n_p > 4096:
+        from scipy.spatial import cKDTree
+        tree_p = cKDTree(peaks)
+        tree_b = cKDTree(blobs)
+        covered = sum(1 for nb in tree_p.query_ball_point(blobs, radius) if nb)
+        on_blob = sum(1 for nb in tree_b.query_ball_point(peaks, radius) if nb)
+        return int(covered), int(on_blob)
+    d = np.hypot(blobs[:, None, 0] - peaks[None, :, 0],
+                 blobs[:, None, 1] - peaks[None, :, 1])
+    within = d <= radius
+    return int(np.count_nonzero(within.any(axis=1))), \
+           int(np.count_nonzero(within.any(axis=0)))
+
+
+def blob_coverage(model, cn: np.ndarray, pnr: np.ndarray, sigma: float, *,
+                  min_corr: float, min_pnr: float,
+                  radius_factor: float = 1.5) -> dict:
+    """Two-way match between CORR·PNR cell blobs and extracted footprint peaks.
+
+    Encodes the maintainer's "does every bright blob in the CORR / min-corr
+    image have a circle, and does every circle sit on a blob?" check. Blobs come
+    from :func:`detect_cell_blobs` (deduplicated, cell-scale, thresholded by the
+    run's ``min_corr``/``min_pnr``); footprint peaks from :func:`_footprint_peaks`
+    (accepted components). A blob and a peak match when within
+    ``radius_factor * sigma`` pixels.
+
+    Returns a flat dict: ``n_blobs``, ``n_blobs_covered``, ``blob_recall``
+    (fraction of blobs with a footprint — "missing cells" when low),
+    ``n_footprints``, ``n_footprints_on_blob``, ``footprint_precision``
+    (fraction of footprints on a blob — possible ghosts when low),
+    ``coverage_radius``. Recall/precision are NaN when their denominator is 0.
+    """
+    radius = float(radius_factor * sigma)
+    blobs = detect_cell_blobs(cn, pnr, sigma, min_corr=min_corr, min_pnr=min_pnr)
+    peaks = _footprint_peaks(model, accepted_only=True)
+    n_blobs, n_peaks = len(blobs), len(peaks)
+    n_cov, n_on = _bidirectional_match(blobs, peaks, radius)
+    return {
+        "n_blobs": int(n_blobs),
+        "n_blobs_covered": int(n_cov),
+        "blob_recall": float(n_cov / n_blobs) if n_blobs else float("nan"),
+        "n_footprints": int(n_peaks),
+        "n_footprints_on_blob": int(n_on),
+        "footprint_precision": float(n_on / n_peaks) if n_peaks else float("nan"),
+        "coverage_radius": radius,
+    }
+
+
+def session_quality_verdict(q: dict, coverage: dict,
+                            thresholds: "dict | None" = None) -> dict:
+    """Turn the three by-eye checks into a PASS/WARN verdict with reasons.
+
+    Combines the blob-coverage metrics (:func:`blob_coverage`) with the two
+    trace metrics already in :func:`model_quality` (``cprojcorr_median`` =
+    agreement of ``C`` with ``C+YrA``; ``trace_corr_median`` = cross-cell trace
+    correlation). A check that cannot be evaluated (NaN metric) is skipped, not
+    failed. Returns ``{"status": "PASS"|"WARN", "warnings": [str, ...],
+    "checks": {name: bool}}`` where each ``checks`` value is True when the check
+    passes (or was skipped).
+    """
+    t = dict(QUALITY_THRESHOLDS)
+    if thresholds:
+        t.update(thresholds)
+    checks: dict = {}
+    warnings: list = []
+
+    def _ok(name: str, passed: "bool | None", msg: str):
+        # None => not evaluable; treat as passing but don't warn.
+        checks[name] = True if passed is None else bool(passed)
+        if passed is False:
+            warnings.append(msg)
+
+    recall = coverage.get("blob_recall")
+    rev = None if recall is None or np.isnan(recall) else recall >= t["blob_recall_min"]
+    _ok("blob_recall", rev,
+        f"low blob coverage: only {recall:.2f} of CORR·PNR cell blobs have a footprint "
+        f"(< {t['blob_recall_min']:.2f}) — bright blobs with no circle"
+        if rev is False else "")
+
+    prec = coverage.get("footprint_precision")
+    pev = None if prec is None or np.isnan(prec) else prec >= t["footprint_precision_min"]
+    _ok("footprint_precision", pev,
+        f"low footprint precision: only {prec:.2f} of footprints sit on a CORR·PNR "
+        f"blob (< {t['footprint_precision_min']:.2f}) — possible spurious/ghost components"
+        if pev is False else "")
+
+    cproj = q.get("cprojcorr_median")
+    cev = None if cproj is None or np.isnan(cproj) else cproj >= t["cprojcorr_min"]
+    _ok("cprojcorr", cev,
+        f"C+YrA diverges from C: cprojcorr_median {cproj:.2f} < {t['cprojcorr_min']:.2f} "
+        "— impure demixing / params off"
+        if cev is False else "")
+
+    tcorr = q.get("trace_corr_median")
+    tev = None if tcorr is None or np.isnan(tcorr) else tcorr <= t["trace_corr_max"]
+    _ok("trace_corr", tev,
+        f"traces heavily correlated across cells: trace_corr_median {tcorr:.2f} > "
+        f"{t['trace_corr_max']:.2f} — over-split or background bleed"
+        if tev is False else "")
+
+    status = "PASS" if all(checks.values()) else "WARN"
+    return {"status": status, "warnings": warnings, "checks": checks}
+
+
 def composite_score(q: dict, weights: "dict | None" = None) -> float:
     """Transparent per-candidate ranking score (NOT an absolute quality claim).
 

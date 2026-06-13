@@ -169,6 +169,56 @@ def test_metrics_on_fitted_model(fitted_model):
     assert np.isfinite(M.composite_score(q))
 
 
+def test_blob_coverage_metric(fitted_model, sim_movie):
+    """blob_coverage returns the expected keys with recall/precision in [0, 1]
+    and detects cell blobs on the simulator's CORR·PNR image."""
+    from minicnmfe.preprocess import correlation_pnr
+
+    cn, pnr = correlation_pnr(sim_movie, sigma=3.0)
+    cov = M.blob_coverage(fitted_model, cn, pnr, sigma=3.0,
+                          min_corr=0.7, min_pnr=6.0)
+    for key in ("n_blobs", "n_blobs_covered", "blob_recall", "n_footprints",
+                "n_footprints_on_blob", "footprint_precision", "coverage_radius"):
+        assert key in cov, key
+    if cov["n_blobs"]:
+        assert 0.0 <= cov["blob_recall"] <= 1.0
+    if cov["n_footprints"]:
+        assert 0.0 <= cov["footprint_precision"] <= 1.0
+    assert cov["n_footprints"] > 0 and cov["n_blobs"] > 0
+
+
+def test_blob_coverage_empty_model():
+    """K==0 model: NaN recall/precision, no crash."""
+    empty = CNMFe(CNMFeParams(sigma=3.0))
+    cn = np.zeros((32, 32), np.float32)
+    pnr = np.zeros((32, 32), np.float32)
+    cov = M.blob_coverage(empty, cn, pnr, sigma=3.0, min_corr=0.7, min_pnr=6.0)
+    assert cov["n_footprints"] == 0
+    assert np.isnan(cov["footprint_precision"])
+
+
+def test_session_quality_verdict():
+    """Each sub-check trips on the right metric; a clean set is PASS."""
+    clean_q = {"cprojcorr_median": 0.9, "trace_corr_median": 0.1}
+    clean_cov = {"blob_recall": 0.95, "footprint_precision": 0.95}
+    v = M.session_quality_verdict(clean_q, clean_cov)
+    assert v["status"] == "PASS" and not v["warnings"]
+
+    bad = M.session_quality_verdict(
+        {"cprojcorr_median": 0.2, "trace_corr_median": 0.8},
+        {"blob_recall": 0.3, "footprint_precision": 0.4})
+    assert bad["status"] == "WARN"
+    assert bad["checks"] == {"blob_recall": False, "footprint_precision": False,
+                             "cprojcorr": False, "trace_corr": False}
+    assert len(bad["warnings"]) == 4
+
+    # NaN metrics are skipped (treated as passing), not failed.
+    skip = M.session_quality_verdict(
+        {"cprojcorr_median": float("nan"), "trace_corr_median": float("nan")},
+        {"blob_recall": float("nan"), "footprint_precision": float("nan")})
+    assert skip["status"] == "PASS"
+
+
 def _gauss_blob(dims, centre, sigma=3.0):
     from scipy.ndimage import gaussian_filter
 
@@ -346,6 +396,9 @@ def test_run_tuning_writes_report(avi_folder, tmp_path):
     assert (run_dir / "downsample.json").exists()
     assert (run_dir / "report.md").exists()
     assert list(run_dir.glob("fig_*.png")), "no figures written"
+    # the sweep seed-coverage figure is produced when a best candidate is found
+    if result.get("sweep") and (run_dir / "fig_sweep_footprints.png").exists():
+        assert (run_dir / "fig_sweep_blob_coverage.png").exists()
 
     # Round-trips into the pipeline.
     params = CNMFeParams.from_json(run_dir / "recommended_params.json")
@@ -389,6 +442,8 @@ def test_diagnostic_figs_return_figure(fitted_model, corr_image, sim_movie, tmp_
         "eccentricity": lambda op: R.fig_eccentricity(fitted_model, out_path=op),
         "jaccard_merge": lambda op: R.fig_jaccard_merge(fitted_model, out_path=op),
         "centroid_drift": lambda op: R.fig_centroid_drift(fitted_model, cn, pnr=pnr, out_path=op),
+        "blob_coverage": lambda op: R.fig_blob_coverage(
+            fitted_model, cn, pnr, 3.0, min_corr=0.7, min_pnr=6.0, out_path=op),
         "mean_proj_activity": lambda op: R.fig_mean_proj_and_activity(sim_movie, out_path=op),
     }
     for name, fn in calls.items():
@@ -409,6 +464,9 @@ def test_diagnostic_figs_guard_empty(corr_image):
     assert isinstance(R.fig_eccentricity(empty), Figure)
     assert isinstance(R.fig_jaccard_merge(empty), Figure)
     assert isinstance(R.fig_centroid_drift(empty, cn), Figure)
+    assert isinstance(
+        R.fig_blob_coverage(empty, cn, _pnr, 3.0, min_corr=0.7, min_pnr=6.0),
+        Figure)
 
 
 def test_mean_proj_and_activity_on_zarr(sim_zarr):

@@ -28,7 +28,7 @@ from minicnmfe.io import open_zarr, open_zarr_pixel_major, transpose_zarr_to_pix
 from minicnmfe.pipeline import CNMFe, CNMFeParams
 from minicnmfe.preprocess import correlation_pnr
 from tuning import report as R
-from tuning.metrics import model_quality
+from tuning.metrics import blob_coverage, model_quality, session_quality_verdict
 
 
 def resolve_session_paths(items) -> "list[Path]":
@@ -192,7 +192,8 @@ def tune_then_validate(cfg, *, validate: bool = True, lowthr: bool = True,
             "html": str(run_dir / "report.html") if write_html else None}
 
 
-def _diagnostics(model, cn, sample, run_dir, *, with_shifts=True):
+def _diagnostics(model, cn, sample, run_dir, *, with_shifts=True,
+                 pnr=None, sigma=None, min_corr=None, min_pnr=None):
     """Write the standard diagnostic figure set for one fitted model."""
     figs = run_dir / "figs"
     figs.mkdir(parents=True, exist_ok=True)
@@ -200,6 +201,9 @@ def _diagnostics(model, cn, sample, run_dir, *, with_shifts=True):
         R.fig_sweep_footprints(model, cn, out_path=figs / "footprints_on_corr.png")
         R.fig_sweep_traces(model, out_path=figs / "traces.png", n=12)
         R.fig_npix_accepted(model, out_path=figs / "npix_dist.png")
+        if pnr is not None and sigma is not None:
+            R.fig_blob_coverage(model, cn, pnr, sigma, min_corr=min_corr,
+                                min_pnr=min_pnr, out_path=figs / "blob_coverage.png")
     if model.eval_info is not None and "snr_amp" in model.eval_info:
         ev = {"snr": np.asarray(model.eval_info["snr_amp"], float),
               "current_thr": model.params.auto_eval_snr_amp_thr,
@@ -270,8 +274,9 @@ def validate_session(
     T = int(mc.shape[0])
     idx = np.linspace(0, T - 1, min(T, 1500)).astype(int)
     sample = np.stack([np.asarray(mc[int(i)]) for i in idx]).astype(np.float32)
-    cn, _pnr = correlation_pnr(sample, sigma=grid.sigma, n_jobs=grid.n_jobs)
+    cn, pnr = correlation_pnr(sample, sigma=grid.sigma, n_jobs=grid.n_jobs)
     np.save(out_dir / "cn.npy", cn)
+    np.save(out_dir / "pnr.npy", pnr)
 
     # --- one extraction per threshold set, reusing Y_flat ---
     rows = []
@@ -286,24 +291,42 @@ def validate_session(
             model.shifts = shifts
         run_dir = out_dir / f"run_{label}"
         model.save(run_dir)
-        _diagnostics(model, cn, sample, run_dir)
+        _diagnostics(model, cn, sample, run_dir, pnr=pnr, sigma=grid.sigma,
+                     min_corr=mcorr, min_pnr=mpnr)
         q = model_quality(model)
+        cov = blob_coverage(model, cn, pnr, grid.sigma,
+                            min_corr=mcorr, min_pnr=mpnr)
+        verdict = session_quality_verdict(q, cov)
         row = {"label": label, "min_corr": float(mcorr), "min_pnr": float(mpnr),
-               "wall_s": round(time.time() - tr, 1), **q}
+               "wall_s": round(time.time() - tr, 1), **q, **cov,
+               "status": verdict["status"],
+               "warnings": "; ".join(verdict["warnings"])}
         rows.append(row)
         (run_dir / "summary.txt").write_text(
             f"{label}: min_corr={mcorr} min_pnr={mpnr}\n"
             f"K={q['K']} accepted={q['K_accepted']} ({q['accepted_frac']:.2f})\n"
             f"cprojcorr median={q['cprojcorr_median']:.3f}  "
+            f"trace_corr median={q['trace_corr_median']:.3f}  "
             f"npix median/IQR={q['npix_median']:.0f}/{q['npix_iqr']:.0f}  "
-            f"SNR median={q['snr_median']:.1f}\n")
+            f"SNR median={q['snr_median']:.1f}\n"
+            f"blob_recall={cov['blob_recall']:.2f} "
+            f"footprint_precision={cov['footprint_precision']:.2f}\n"
+            f"VERDICT: {verdict['status']}"
+            + ("\n  - " + "\n  - ".join(verdict["warnings"]) if verdict["warnings"] else "")
+            + "\n")
         if verbose:
-            print(f"    -> K={q['K']} accepted={q['K_accepted']} "
-                  f"cprojcorr={q['cprojcorr_median']:.3f} ({row['wall_s']:.0f}s)", flush=True)
+            print(f"    -> [{verdict['status']}] K={q['K']} accepted={q['K_accepted']} "
+                  f"cprojcorr={q['cprojcorr_median']:.3f} "
+                  f"recall={cov['blob_recall']:.2f} prec={cov['footprint_precision']:.2f} "
+                  f"({row['wall_s']:.0f}s)", flush=True)
+            for w in verdict["warnings"]:
+                print(f"       WARN: {w}", flush=True)
 
     # --- comparison table ---
     cols = ["label", "min_corr", "min_pnr", "K", "K_accepted", "accepted_frac",
-            "cprojcorr_median", "npix_median", "npix_iqr", "snr_median", "wall_s"]
+            "cprojcorr_median", "trace_corr_median", "blob_recall",
+            "footprint_precision", "npix_median", "npix_iqr", "snr_median",
+            "status", "wall_s"]
     lines = ["# Full-recording validation — threshold comparison", "",
              f"mc.zarr: `{tuple(mc.shape)}`  (ssub={ssub}, tsub={tsub})  "
              f"total {time.time()-t0:.0f}s", "",
@@ -314,6 +337,11 @@ def validate_session(
             v = r.get(c)
             cells.append(f"{v:.3f}" if isinstance(v, float) else str(v))
         lines.append("| " + " | ".join(cells) + " |")
+    notes = [r for r in rows if r.get("warnings")]
+    if notes:
+        lines += ["", "## Quality warnings", ""]
+        for r in notes:
+            lines.append(f"- **{r['label']}** ({r['status']}): {r['warnings']}")
     (out_dir / "comparison.md").write_text("\n".join(lines) + "\n")
 
     return {"rows": rows, "out_dir": str(out_dir), "mc_path": str(mc_path),
