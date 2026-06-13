@@ -246,6 +246,17 @@ def run_sweep(
     workdir.mkdir(parents=True, exist_ok=True)
     candidates = build_candidates(base_params, spec, max_candidates)
 
+    # Print the candidate grid up front (in the parent, before dispatch) so each
+    # sweep logs exactly which parameter combinations it is about to extract.
+    region_name = "full" if region_crop is None else "cutout"
+    print(f"[sweep] {len(candidates)} candidate(s) on {region_name} region:", flush=True)
+    for i, (_p, swept) in enumerate(candidates):
+        vals = ", ".join(
+            f"{f}={swept[f]:g}" if isinstance(swept.get(f), float) else f"{f}={swept[f]}"
+            for f in SWEPT_FIELDS if swept.get(f) is not None
+        )
+        print(f"[sweep]   cand {i}: {vals}", flush=True)
+
     # Split the `n_jobs` core budget across the two parallelism levels so their
     # product ~= budget (no N*N thread oversubscription). Candidates run as loky
     # *processes* (cand_jobs of them); each fit_extract then runs cand-internal
