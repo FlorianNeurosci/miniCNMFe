@@ -13,6 +13,7 @@ Reference (algorithmic only): CaImAn spatial.py:update_spatial_components (line 
 from __future__ import annotations
 
 import math
+import time
 import warnings
 
 import numpy as np
@@ -151,67 +152,101 @@ if _HAS_NUMBA:
                 out_coef[a0 + a] = w[a]
 
 
+def _materialize_slab(Y_flat, sn, bs, be):
+    """Materialize one (end-start, T) background-subtracted slab + its sn.
+
+    This is the expensive bit of update_spatial on real data: Y_flat[bs:be]
+    triggers BackgroundSubtractor.slice -> a GIL-releasing sparse W@Y matmul
+    (the ring-background subtraction). Run under joblib threads it parallelises.
+    """
+    Y_block = np.ascontiguousarray(Y_flat[bs:be], dtype=np.float64)
+    sn_block = np.ascontiguousarray(sn[bs:be], dtype=np.float64)
+    return Y_block, sn_block
+
+
 def _spatial_numba_update(Y_flat, C, support, sn, T, n_pixels, n_jobs,
                           max_iter, tol, ridge, n_workers):
-    """Run the per-pixel CD via the numba prange kernel (GIL-free).
+    """Per-pixel CD via the numba kernel, with THREADED slab materialization.
 
-    Chunks pixels into blocks so a dense slab ``Y_flat[start:end]`` stays
-    bounded in RAM (one block for an in-RAM cutout; several for a streaming
-    full-recording ``BackgroundSubtractor``). Returns ``(all_results, totals)``
-    matching ``_aggregate_spatial_batches`` so the diagnostic print is identical.
+    The dominant cost on real (mean_active~2) data is not the CD but the
+    background-subtraction slab (Y_flat[start:end] = sparse W@Y). That matmul
+    releases the GIL, so we materialize slabs in **waves of n_workers via joblib
+    threads** (bounded memory: ~n_workers * block * T * 8 bytes), then run the
+    numba kernel on each slab between waves (the kernel itself pranges over the
+    block's pixels using the same thread budget — cheap when mean_active is low,
+    parallel when the FOV is dense). Prints a slab-vs-cd timing breakdown.
+    Returns ``(all_results, totals)`` matching ``_aggregate_spatial_batches``.
     """
-    numba.set_num_threads(int(n_workers))
+    from joblib import Parallel, delayed
+    from threadpoolctl import threadpool_limits
+
+    n_workers = max(1, min(int(n_workers), int(numba.config.NUMBA_NUM_THREADS)))
+    numba.set_num_threads(n_workers)
 
     C64 = np.ascontiguousarray(C, dtype=np.float64)   # (K, T), shared read-only
-    # Block size: target ~256 MB per dense slab (block * T * 8 bytes).
-    block_px = max(256, int(256 * 1024 * 1024) // (8 * max(int(T), 1)))
+    # Small blocks so a wave of n_workers slabs stays bounded (~n_workers*32 MB).
+    block_px = max(256, int(32 * 1024 * 1024) // (8 * max(int(T), 1)))
+    blocks = [(bs, min(bs + block_px, n_pixels))
+              for bs in range(0, n_pixels, block_px)]
 
     all_results: list[tuple[int, int, float]] = []
     total_unconverged = total_ran = total_iter = max_iter_seen = total_active = 0
+    slab_wall = cd_wall = 0.0
 
-    for bs in range(0, n_pixels, block_px):
-        be = min(bs + block_px, n_pixels)
-        nb = be - bs
-        Y_block = np.ascontiguousarray(Y_flat[bs:be], dtype=np.float64)
-        sn_block = np.ascontiguousarray(sn[bs:be], dtype=np.float64)
+    for ws in range(0, len(blocks), n_workers):
+        wave = blocks[ws:ws + n_workers]
 
-        # Flatten this block's ragged supports CSR-style.
-        supp = support[bs:be]
-        lens = np.fromiter((len(s) for s in supp), dtype=np.int64, count=nb)
-        supp_off = np.zeros(nb + 1, dtype=np.int64)
-        np.cumsum(lens, out=supp_off[1:])
-        tot = int(supp_off[-1])
-        supp_idx = (np.concatenate([np.asarray(s, dtype=np.int64) for s in supp])
-                    if tot > 0 else np.empty(0, dtype=np.int64))
+        # Phase 1: materialize this wave's slabs in parallel (GIL-released W@Y).
+        t0 = time.perf_counter()
+        with threadpool_limits(limits=1, user_api="blas"):
+            slabs = Parallel(n_jobs=n_workers, prefer="threads")(
+                delayed(_materialize_slab)(Y_flat, sn, bs, be) for bs, be in wave
+            )
+        slab_wall += time.perf_counter() - t0
 
-        out_coef = np.zeros(tot, dtype=np.float64)
-        out_iter = np.zeros(nb, dtype=np.int64)
-        out_ran = np.zeros(nb, dtype=np.int64)
-        out_unconv = np.zeros(nb, dtype=np.int64)
-        out_active = np.zeros(nb, dtype=np.int64)
+        # Phase 2: run the (cheap, or prange-parallel) CD kernel on each slab.
+        t1 = time.perf_counter()
+        for (bs, be), (Y_block, sn_block) in zip(wave, slabs):
+            nb = be - bs
+            supp = support[bs:be]
+            lens = np.fromiter((len(s) for s in supp), dtype=np.int64, count=nb)
+            supp_off = np.zeros(nb + 1, dtype=np.int64)
+            np.cumsum(lens, out=supp_off[1:])
+            tot = int(supp_off[-1])
+            supp_idx = (np.concatenate([np.asarray(s, dtype=np.int64) for s in supp])
+                        if tot > 0 else np.empty(0, dtype=np.int64))
 
-        _spatial_cd_kernel(
-            C64, Y_block, sn_block, supp_idx, supp_off, int(T),
-            int(max_iter), float(tol), float(ridge),
-            out_coef, out_iter, out_ran, out_unconv, out_active,
-        )
+            out_coef = np.zeros(tot, dtype=np.float64)
+            out_iter = np.zeros(nb, dtype=np.int64)
+            out_ran = np.zeros(nb, dtype=np.int64)
+            out_unconv = np.zeros(nb, dtype=np.int64)
+            out_active = np.zeros(nb, dtype=np.int64)
 
-        total_unconverged += int(out_unconv.sum())
-        total_ran += int(out_ran.sum())
-        total_iter += int(out_iter.sum())
-        if out_iter.size and int(out_iter.max()) > max_iter_seen:
-            max_iter_seen = int(out_iter.max())
-        total_active += int(out_active.sum())
+            _spatial_cd_kernel(
+                C64, Y_block, sn_block, supp_idx, supp_off, int(T),
+                int(max_iter), float(tol), float(ridge),
+                out_coef, out_iter, out_ran, out_unconv, out_active,
+            )
 
-        for i in range(nb):
-            a0 = int(supp_off[i])
-            a1 = int(supp_off[i + 1])
-            p_global = bs + i
-            for a in range(a0, a1):
-                val = float(out_coef[a])
-                if val > 0.0:
-                    all_results.append((p_global, int(supp_idx[a]), val))
+            total_unconverged += int(out_unconv.sum())
+            total_ran += int(out_ran.sum())
+            total_iter += int(out_iter.sum())
+            if out_iter.size and int(out_iter.max()) > max_iter_seen:
+                max_iter_seen = int(out_iter.max())
+            total_active += int(out_active.sum())
 
+            for i in range(nb):
+                a0 = int(supp_off[i])
+                a1 = int(supp_off[i + 1])
+                p_global = bs + i
+                for a in range(a0, a1):
+                    val = float(out_coef[a])
+                    if val > 0.0:
+                        all_results.append((p_global, int(supp_idx[a]), val))
+        cd_wall += time.perf_counter() - t1
+
+    print(f"  update_spatial timing: slab={slab_wall:.1f}s cd={cd_wall:.1f}s "
+          f"(x{n_workers} threads, {len(blocks)} blocks)")
     totals = (total_unconverged, total_ran, total_iter, max_iter_seen, total_active)
     return all_results, totals
 
@@ -628,7 +663,7 @@ def update_spatial(
         # = cpu_count) — set_num_threads rejects anything larger.
         n_workers = max(1, min(effective_n_jobs(n_jobs),
                                int(numba.config.NUMBA_NUM_THREADS)))
-        spatial_path = f"numba prange x{n_workers}"
+        spatial_path = f"numba x{n_workers} (slab-parallel)"
         all_results, totals = _spatial_numba_update(
             Y_flat, C, support, sn, T, n_pixels, n_jobs,
             max_iter, tol, spatial_ridge, n_workers,
