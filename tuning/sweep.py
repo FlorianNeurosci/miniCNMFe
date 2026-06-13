@@ -18,6 +18,7 @@ Two regions (set by ``region_crop``):
 from __future__ import annotations
 
 import itertools
+import os
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -254,7 +255,14 @@ def run_sweep(
     # ~10 inner on a 32-core box); with a large grid it goes candidate-parallel,
     # inner-serial. Candidate level must stay processes: with init_patches=False the
     # per-candidate greedy seed loop is pure-Python/GIL-bound, so threads wouldn't help.
-    budget = max(1, n_jobs)
+    #
+    # The split arithmetic (min / //) needs a concrete core count, so resolve
+    # joblib's negative sentinels here: -1 -> all cores, -2 -> all but one, etc.
+    # (a bare `max(1, n_jobs)` would turn -1 into 1 = fully serial).
+    if n_jobs < 0:
+        budget = max(1, (os.cpu_count() or 1) + 1 + n_jobs)
+    else:
+        budget = max(1, n_jobs)
     cand_jobs = min(len(candidates), budget)
     inner_jobs = max(1, budget // cand_jobs)
     candidates = [(replace(params, n_jobs=inner_jobs), swept)
