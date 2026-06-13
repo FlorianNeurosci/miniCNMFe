@@ -12,6 +12,7 @@ Reference (algorithmic only): CaImAn spatial.py:update_spatial_components (line 
 
 from __future__ import annotations
 
+import math
 import warnings
 
 import numpy as np
@@ -19,6 +20,19 @@ import scipy.ndimage as ndi
 import scipy.sparse as sp
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model._cd_fast import enet_coordinate_descent_gram
+
+# Optional numba acceleration for the parallel (n_jobs>1) per-pixel CD. The
+# Python per-pixel loop is GIL-bound, so joblib threads can't parallelise it on
+# a many-core box; a numba njit(parallel=True) prange kernel runs the CD in
+# compiled nogil code and uses every core regardless of the GIL or loky nesting.
+# Graceful fallback to the threaded path if numba is absent (pip-only dep).
+try:  # pragma: no cover - exercised by the env that has numba
+    import numba
+    from numba import njit, prange
+
+    _HAS_NUMBA = True
+except Exception:  # pragma: no cover
+    _HAS_NUMBA = False
 
 # Cyclic CD doesn't need randomness, but the Cython entry point still wants
 # a RandomState object. Build one once at import time and pass it on every
@@ -34,6 +48,184 @@ _CD_RNG = np.random.RandomState(0)
 # ~1 effective core. Capping at a sweet spot saturates the GIL-released
 # fraction without the thrash. Tunable via CNMFeParams.spatial_thread_cap.
 _SPATIAL_THREAD_CAP = 16
+
+
+# ---------------------------------------------------------------------------
+# numba nogil/prange per-pixel CD kernel (GIL-free parallelism)
+# ---------------------------------------------------------------------------
+# Mirrors the math of `_spatial_pixel_batch` exactly: per pixel build the small
+# Gram (C_active @ C_active.T) and q (C_active @ y), then run the non-negative
+# elastic-net coordinate descent that sklearn's `enet_coordinate_descent_gram`
+# implements (L1 alpha = lam*T, L2 beta = ridge*max_energy, positive, cyclic,
+# H = Gram@w maintained incrementally). Because it is compiled nogil code with a
+# prange over pixels, it scales across all cores irrespective of the GIL — which
+# the threaded path cannot, the per-pixel work being mostly GIL-held Python glue.
+if _HAS_NUMBA:
+
+    @njit(parallel=True, cache=True, fastmath=False)
+    def _spatial_cd_kernel(
+        C, Y_block, sn_block, supp_idx, supp_off, T, max_iter, tol, ridge,
+        out_coef, out_iter, out_ran, out_unconv, out_active,
+    ):  # pragma: no cover - compiled
+        n = Y_block.shape[0]
+        for i in prange(n):
+            a0 = supp_off[i]
+            a1 = supp_off[i + 1]
+            na = a1 - a0
+            out_iter[i] = 0
+            out_ran[i] = 0
+            out_unconv[i] = 0
+            out_active[i] = 0
+            if na == 0:
+                continue
+
+            gram = np.zeros((na, na))
+            q = np.zeros(na)
+            for a in range(na):
+                ia = supp_idx[a0 + a]
+                qa = 0.0
+                for t in range(T):
+                    qa += C[ia, t] * Y_block[i, t]
+                q[a] = qa
+                for b in range(a, na):
+                    ib = supp_idx[a0 + b]
+                    g = 0.0
+                    for t in range(T):
+                        g += C[ia, t] * C[ib, t]
+                    gram[a, b] = g
+                    gram[b, a] = g
+
+            max_energy = 0.0
+            for a in range(na):
+                if gram[a, a] > max_energy:
+                    max_energy = gram[a, a]
+            me = max_energy if max_energy > 1e-10 else 1e-10
+            lam = 0.5 * sn_block[i] * math.sqrt(me) / T
+            if lam == 0.0:
+                continue
+            alpha = lam * T
+            beta = ridge * max_energy
+
+            w = np.zeros(na)
+            H = np.zeros(na)  # H = gram @ w, starts at 0 (w = 0)
+            n_iter = 0
+            for it in range(max_iter):
+                w_max = 0.0
+                d_w_max = 0.0
+                for ii in range(na):
+                    Qii = gram[ii, ii]
+                    if Qii == 0.0:
+                        continue
+                    w_ii = w[ii]
+                    if w_ii != 0.0:
+                        for j in range(na):
+                            H[j] -= w_ii * gram[j, ii]
+                    tmp = q[ii] - H[ii]
+                    if tmp < 0.0:
+                        neww = 0.0
+                    else:
+                        neww = tmp - alpha
+                        if neww < 0.0:
+                            neww = 0.0
+                        neww = neww / (Qii + beta)
+                    w[ii] = neww
+                    if neww != 0.0:
+                        for j in range(na):
+                            H[j] += neww * gram[j, ii]
+                    d = abs(neww - w_ii)
+                    if d > d_w_max:
+                        d_w_max = d
+                    aw = abs(neww)
+                    if aw > w_max:
+                        w_max = aw
+                n_iter = it + 1
+                if w_max == 0.0 or (d_w_max / w_max) < tol:
+                    break
+
+            out_iter[i] = n_iter
+            out_ran[i] = 1
+            out_active[i] = na
+            if n_iter >= max_iter:
+                out_unconv[i] = 1
+            for a in range(na):
+                out_coef[a0 + a] = w[a]
+
+
+def _spatial_numba_update(Y_flat, C, support, sn, T, n_pixels, n_jobs,
+                          max_iter, tol, ridge, n_workers):
+    """Run the per-pixel CD via the numba prange kernel (GIL-free).
+
+    Chunks pixels into blocks so a dense slab ``Y_flat[start:end]`` stays
+    bounded in RAM (one block for an in-RAM cutout; several for a streaming
+    full-recording ``BackgroundSubtractor``). Returns ``(all_results, totals)``
+    matching ``_aggregate_spatial_batches`` so the diagnostic print is identical.
+    """
+    numba.set_num_threads(int(n_workers))
+
+    C64 = np.ascontiguousarray(C, dtype=np.float64)   # (K, T), shared read-only
+    # Block size: target ~256 MB per dense slab (block * T * 8 bytes).
+    block_px = max(256, int(256 * 1024 * 1024) // (8 * max(int(T), 1)))
+
+    all_results: list[tuple[int, int, float]] = []
+    total_unconverged = total_ran = total_iter = max_iter_seen = total_active = 0
+
+    for bs in range(0, n_pixels, block_px):
+        be = min(bs + block_px, n_pixels)
+        nb = be - bs
+        Y_block = np.ascontiguousarray(Y_flat[bs:be], dtype=np.float64)
+        sn_block = np.ascontiguousarray(sn[bs:be], dtype=np.float64)
+
+        # Flatten this block's ragged supports CSR-style.
+        supp = support[bs:be]
+        lens = np.fromiter((len(s) for s in supp), dtype=np.int64, count=nb)
+        supp_off = np.zeros(nb + 1, dtype=np.int64)
+        np.cumsum(lens, out=supp_off[1:])
+        tot = int(supp_off[-1])
+        supp_idx = (np.concatenate([np.asarray(s, dtype=np.int64) for s in supp])
+                    if tot > 0 else np.empty(0, dtype=np.int64))
+
+        out_coef = np.zeros(tot, dtype=np.float64)
+        out_iter = np.zeros(nb, dtype=np.int64)
+        out_ran = np.zeros(nb, dtype=np.int64)
+        out_unconv = np.zeros(nb, dtype=np.int64)
+        out_active = np.zeros(nb, dtype=np.int64)
+
+        _spatial_cd_kernel(
+            C64, Y_block, sn_block, supp_idx, supp_off, int(T),
+            int(max_iter), float(tol), float(ridge),
+            out_coef, out_iter, out_ran, out_unconv, out_active,
+        )
+
+        total_unconverged += int(out_unconv.sum())
+        total_ran += int(out_ran.sum())
+        total_iter += int(out_iter.sum())
+        if out_iter.size and int(out_iter.max()) > max_iter_seen:
+            max_iter_seen = int(out_iter.max())
+        total_active += int(out_active.sum())
+
+        for i in range(nb):
+            a0 = int(supp_off[i])
+            a1 = int(supp_off[i + 1])
+            p_global = bs + i
+            for a in range(a0, a1):
+                val = float(out_coef[a])
+                if val > 0.0:
+                    all_results.append((p_global, int(supp_idx[a]), val))
+
+    totals = (total_unconverged, total_ran, total_iter, max_iter_seen, total_active)
+    return all_results, totals
+
+
+def _aggregate_spatial_batches(per_batch):
+    """Flatten per-batch ``(results, stats)`` into ``(all_results, totals)``."""
+    all_results = [item for batch_res, _ in per_batch for item in batch_res]
+    total_unconverged = sum(s[0] for _, s in per_batch)
+    total_ran = sum(s[1] for _, s in per_batch)
+    total_iter = sum(s[2] for _, s in per_batch)
+    max_iter_seen = max((s[3] for _, s in per_batch), default=0)
+    total_active = sum(s[4] for _, s in per_batch)
+    return all_results, (total_unconverged, total_ran, total_iter,
+                         max_iter_seen, total_active)
 
 
 # ---------------------------------------------------------------------------
@@ -421,21 +613,36 @@ def update_spatial(
             )
             for start, end in batches
         ]
+        all_results, totals = _aggregate_spatial_batches(per_batch)
+    elif _HAS_NUMBA:
+        from joblib import effective_n_jobs
+
+        # numba prange kernel: the per-pixel CD runs in compiled nogil code, so
+        # it scales across all cores irrespective of the GIL (the threaded path
+        # below cannot — the per-pixel loop is GIL-bound). numba is not GIL-bound
+        # so the _SPATIAL_THREAD_CAP (a GIL-thrash mitigation) does not apply;
+        # use the full inner budget. set_num_threads bounds it so candidates
+        # nested in loky processes don't oversubscribe (each pranges over its
+        # own inner_jobs share). Clamp to NUMBA_NUM_THREADS (the launchable max,
+        # = cpu_count) — set_num_threads rejects anything larger.
+        n_workers = max(1, min(effective_n_jobs(n_jobs),
+                               int(numba.config.NUMBA_NUM_THREADS)))
+        all_results, totals = _spatial_numba_update(
+            Y_flat, C, support, sn, T, n_pixels, n_jobs,
+            max_iter, tol, spatial_ridge, n_workers,
+        )
     else:
         from joblib import Parallel, delayed, effective_n_jobs
         from threadpoolctl import threadpool_limits
 
-        # Threads, not processes: the object passed as Y_flat is a lazy
-        # BackgroundSubtractor referencing the full sparse W + full movie, so
-        # loky would have to marshal those per task. The Cython CD solver
-        # releases the GIL during its inner loop, so threads get real
-        # concurrency on the solve without any pickling tax.
-        #
-        # Cap the worker count (see _SPATIAL_THREAD_CAP): the per-pixel loop is
-        # GIL-bound, so >~16 threads thrash the GIL rather than help (observed
-        # ~1 effective core at n_jobs=256). With the cap, size batches to ~4x
-        # workers so dispatch overhead is small while a batch's dense slab
-        # (batch_size*T*4 bytes) stays bounded (~64 MB cap).
+        # Threaded fallback (numba unavailable). Threads, not processes: the
+        # object passed as Y_flat is a lazy BackgroundSubtractor referencing the
+        # full sparse W + full movie, so loky would have to marshal those per
+        # task. The Cython CD solver releases the GIL during its inner loop, but
+        # the surrounding per-pixel Python glue does not, so this path is
+        # GIL-bound — cap the worker count (see _SPATIAL_THREAD_CAP): >~16
+        # threads thrash the GIL rather than help. Size batches to ~4x workers so
+        # dispatch overhead is small while a batch's dense slab stays bounded.
         n_workers = max(1, min(effective_n_jobs(n_jobs), int(spatial_thread_cap)))
         batch_size = (n_pixels + 4 * n_workers - 1) // (4 * n_workers)
         batch_size = max(256, batch_size)
@@ -466,15 +673,9 @@ def update_spatial(
                 )
                 for start, end in batches
             )
+        all_results, totals = _aggregate_spatial_batches(per_batch)
 
-    all_results = [item for batch_res, _ in per_batch for item in batch_res]
-
-    # Aggregate per-batch diagnostic counters (see _spatial_pixel_batch stats).
-    total_unconverged = sum(s[0] for _, s in per_batch)
-    total_ran = sum(s[1] for _, s in per_batch)
-    total_iter = sum(s[2] for _, s in per_batch)
-    max_iter_seen = max((s[3] for _, s in per_batch), default=0)
-    total_active = sum(s[4] for _, s in per_batch)
+    total_unconverged, total_ran, total_iter, max_iter_seen, total_active = totals
 
     if total_ran > 0:
         mean_iter = total_iter / total_ran

@@ -96,14 +96,37 @@ class TestUpdateSpatialParallel:
         A_new = update_spatial(Y_flat, C, A, sn, d["dims"], n_jobs=2)
         assert A_new.data.min() >= 0
 
-    def test_thread_cap_applied(self, synth_data, monkeypatch):
-        """A huge n_jobs is capped to spatial_thread_cap for the CD parallel
-        path (the loop is GIL-bound; >cap threads just thrash the GIL), while
-        results stay equivalent to serial."""
+    def test_numba_matches_serial(self, synth_data):
+        """When numba is present, n_jobs>1 takes the prange CD kernel; its
+        result must match the serial sklearn path to <1e-5 (different solver,
+        same convex problem -> same optimum)."""
+        from minicnmfe import spatial as _spatial
+        from minicnmfe.spatial import update_spatial
+        from minicnmfe._utils import make_2d
+        if not _spatial._HAS_NUMBA:
+            import pytest as _pt
+            _pt.skip("numba not installed")
+        d = synth_data
+        Y_flat = make_2d(d["movie"])
+        A = sp.csc_matrix(d["A_true"].astype(np.float32))
+        C = d["C_true"].copy()
+        sn = np.ones(d["dims"][0] * d["dims"][1], dtype=np.float32) * d["sn_true"]
+
+        A1 = update_spatial(Y_flat, C, A, sn, d["dims"], n_jobs=1)      # sklearn
+        A2 = update_spatial(Y_flat, C, A, sn, d["dims"], n_jobs=4)      # numba
+        assert abs(A1 - A2).max() < 1e-5
+        assert A2.data.min() >= 0
+
+    def test_thread_cap_applied_fallback(self, synth_data, monkeypatch):
+        """With numba forced off, the GIL-bound threaded CD caps its workers to
+        spatial_thread_cap (a huge n_jobs must not be passed raw), while results
+        stay equivalent to serial."""
         import joblib
         from minicnmfe import spatial as _spatial
         from minicnmfe.spatial import update_spatial
         from minicnmfe._utils import make_2d
+        # Force the threaded fallback path (the one spatial_thread_cap guards).
+        monkeypatch.setattr(_spatial, "_HAS_NUMBA", False)
         d = synth_data
         Y_flat = make_2d(d["movie"])
         A = sp.csc_matrix(d["A_true"].astype(np.float32))
@@ -124,10 +147,9 @@ class TestUpdateSpatialParallel:
                             n_jobs=1000, spatial_thread_cap=4)
 
         expected = min(joblib.effective_n_jobs(1000), 4)
-        # The per-pixel CD is the FIRST Parallel in update_spatial; it must be
-        # capped to spatial_thread_cap (<=4), not run with the raw 1000. (The
-        # later threshold_footprint Parallel parallelises over K components with
-        # GIL-releasing scipy.ndimage and is intentionally left uncapped.)
+        # The per-pixel CD is the FIRST Parallel; capped to spatial_thread_cap
+        # (<=4), not the raw 1000. (threshold_footprint's later Parallel runs over
+        # K components with GIL-releasing scipy.ndimage and is left uncapped.)
         assert calls[0] == expected
         assert abs(A1 - A2).max() < 1e-5     # still matches serial
 
