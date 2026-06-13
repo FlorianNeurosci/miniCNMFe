@@ -207,6 +207,7 @@ def _local_cn_pnr_box(
     data_filtered_box: np.ndarray,
     noise_pixel_box: np.ndarray,
     thresh_init: float = 3.0,
+    corrpnr_stride: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Refresh CN and PNR on a small residual patch using a cached noise map.
 
@@ -224,14 +225,19 @@ def _local_cn_pnr_box(
         cn_box: (nr2, nc2) local correlation image.
         pnr_box: (nr2, nc2) peak-to-noise ratio.
     """
+    # PNR: peak-to-noise must see the FULL time axis — striding before the max
+    # discards transient peaks and (divided by the cached full-T noise) collapses.
     max_box = data_filtered_box.max(axis=0)
     pnr_box = np.where(
         noise_pixel_box > 0, max_box / noise_pixel_box, 0.0
     ).astype(np.float32)
     pnr_box[pnr_box < 0] = 0.0
 
+    # CN: local_correlations_fft is the per-seed hot spot; subsample time for it
+    # only (correlation tolerates striding far better than a peak max).
+    cn_src = data_filtered_box[::corrpnr_stride] if corrpnr_stride > 1 else data_filtered_box
     thresholded = np.where(
-        data_filtered_box < thresh_init * noise_pixel_box, 0.0, data_filtered_box,
+        cn_src < thresh_init * noise_pixel_box, 0.0, cn_src,
     )
     cn_box = local_correlations_fft(thresholded)
     cn_box[np.isnan(cn_box) | (cn_box < 0)] = 0.0
@@ -348,23 +354,23 @@ def greedy_corr_pnr(
     data_filtered -= data_filtered.mean(axis=0, keepdims=True)
     noise_pixel = estimate_noise(data_filtered, noise_range=(0.25, 0.5))
 
-    # Initial CN/PNR. corrpnr_stride > 1 subsamples time for the initial seed
-    # ranking only; `noise_pixel` stays full-T because the loop body's per-seed
-    # PNR updates index into it.
+    # Initial CN/PNR. PNR is a peak/max statistic over the cached full-T
+    # `noise_pixel`, so its max MUST see the full time axis — striding it
+    # discards transient peaks and collapses PNR (strided-max / full-noise is a
+    # systematic under-estimate), starving seeding to ~0 on long movies.
+    # corrpnr_stride > 1 therefore subsamples time for the CN only (the cost
+    # driver: local_correlations_fft), never for PNR.
     thresh_init = 3.0
+    pnr = np.where(
+        noise_pixel > 0, data_filtered.max(axis=0) / noise_pixel, 0.0
+    ).astype(np.float32)
     if corrpnr_stride > 1:
         df_stride = np.ascontiguousarray(data_filtered[::corrpnr_stride])
         sn_stride = estimate_noise(df_stride, noise_range=(0.25, 0.5))
-        pnr = np.where(
-            sn_stride > 0, df_stride.max(axis=0) / sn_stride, 0.0
-        ).astype(np.float32)
         tmp = np.where(df_stride < thresh_init * sn_stride, 0.0, df_stride)
         cn = local_correlations_fft(tmp)
         del tmp, df_stride
     else:
-        pnr = np.where(
-            noise_pixel > 0, data_filtered.max(axis=0) / noise_pixel, 0.0
-        ).astype(np.float32)
         tmp = np.where(data_filtered < thresh_init * noise_pixel, 0.0, data_filtered)
         cn = local_correlations_fft(tmp)
         del tmp
@@ -502,10 +508,9 @@ def greedy_corr_pnr(
             # (local_correlations_fft ≈ 40% of greedy), so striding cuts it
             # ~corrpnr_stride×. No-op when corrpnr_stride == 1.
             box = data_filtered[:, r2_0:r2_1, c2_0:c2_1]
-            if corrpnr_stride > 1:
-                box = box[::corrpnr_stride]
             cn_box, pnr_box = _local_cn_pnr_box(
-                box, noise_pixel[r2_0:r2_1, c2_0:c2_1], thresh_init=thresh_init,
+                box, noise_pixel[r2_0:r2_1, c2_0:c2_1],
+                thresh_init=thresh_init, corrpnr_stride=corrpnr_stride,
             )
             cn[r2_0:r2_1, c2_0:c2_1] = cn_box
             pnr[r2_0:r2_1, c2_0:c2_1] = pnr_box

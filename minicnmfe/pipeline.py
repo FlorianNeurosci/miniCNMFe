@@ -267,10 +267,11 @@ class CNMFeParams:
     circular_max_dist_factor: float = 2.5     # circular_constraint cutoff = factor * estimated_radius
     # [NON-STANDARD speed] Temporal stride for greedy init (None = auto: max(1, T//5000)).
     init_stride: "int | None" = None
-    # [NON-STANDARD speed] Extra stride applied to the *initial* CORR/PNR sweep inside greedy init.
-    # CORR/PNR are per-pixel reductions, so a strided slice gives a
-    # near-identical seed map at a fraction of the cost. None auto-selects
-    # max(1, T_init // 2000) so the sweep sees ~2000 frames regardless of T.
+    # [NON-STANDARD speed] Extra stride for the CN (correlation) part of the
+    # initial seed sweep inside greedy init. PNR is NEVER strided (it is a
+    # peak/max over the full-T noise — striding it under-estimates PNR and
+    # starves seeding to ~0 on long movies). None -> 1 (no stride): we do not
+    # trade seeds for speed by default. Set > 1 to opt into a faster CN sweep.
     init_corrpnr_stride: "int | None" = None
     # [speed] Patch-based PARALLEL initialization (ON by default). The greedy
     # seed loop is inherently serial, so for a large FOV we tile it into
@@ -1352,13 +1353,15 @@ class CNMFe:
             init_movie = movie_arr
         T_init = int(init_movie.shape[0])
 
-        # Resolve the secondary stride for the initial CORR/PNR sweep.
-        # Independent of init_stride: the greedy extraction loop reads the
-        # full T_init array, but the global CORR/PNR map only needs a
-        # representative slice. Default cap ~2000 frames.
+        # Resolve the secondary stride for the initial CORR/PNR sweep (CN only;
+        # PNR always uses full T — see greedy_corr_pnr). Default is 1 (no stride):
+        # PNR is a peak/max statistic, and even with the CN-only stride the
+        # correlation values shift slightly, so we never sacrifice seeds for
+        # speed by default. Opt into corrpnr_stride > 1 explicitly for a faster
+        # CN sweep on very long movies.
         corrpnr_stride = p.init_corrpnr_stride
         if corrpnr_stride is None:
-            corrpnr_stride = max(1, T_init // 2000)
+            corrpnr_stride = 1
 
         if init_stride > 1 or corrpnr_stride > 1:
             print(

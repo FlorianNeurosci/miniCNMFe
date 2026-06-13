@@ -325,6 +325,44 @@ class TestCNMFePipeline:
                 f"corrpnr_stride=3 poor spatial match on neuron {k_true}: r={r3:.3f}"
             )
 
+    def test_corrpnr_stride_pnr_full_T_does_not_starve_seeding(self):
+        """A large corrpnr_stride must NOT collapse the seed count.
+
+        Regression for the strided-PNR bug: PNR is a peak/``max`` over the
+        cached full-T noise, so subsampling time before the max (as the global
+        AND per-seed CORR/PNR passes used to) under-estimates PNR and starves
+        greedy seeding to ~0 on long movies. The fix keeps PNR full-T and
+        strides only the CN. On this long, sparse-transient movie the broken
+        code found 0 seeds at stride=9 (vs 7 at stride=1); here we assert a
+        large stride recovers the same seeds as no stride.
+
+        Calls ``greedy_corr_pnr`` directly (not a full ``fit``) so the test is
+        fast and isolates init; uses a *realistic* ``min_pnr`` (10), unlike the
+        short/loose ``test_init_corrpnr_stride_recovers_footprints`` above which
+        the bug slipped past.
+        """
+        from minicnmfe.initialization import greedy_corr_pnr
+        from tests.conftest import make_synthetic_movie
+
+        synth = make_synthetic_movie(
+            n_neurons=8, dims=(48, 48), T=6000,
+            noise_std=0.5, ar_decay=0.95, seed=3,
+        )
+        movie = synth["movie"]
+        kw = dict(sigma=3.0, min_corr=0.8, min_pnr=10.0, min_pixel=3,
+                  min_corr_neuron=0.8, max_corr_bg=0.4)
+
+        A1, *_ = greedy_corr_pnr(movie, corrpnr_stride=1, **kw)
+        A9, *_ = greedy_corr_pnr(movie, corrpnr_stride=9, **kw)
+
+        k1 = A1.shape[1]
+        assert k1 >= 6, f"baseline (no stride) under-seeded: K={k1}"
+        # The CN-only stride must not drop seeds relative to no stride.
+        assert A9.shape[1] >= k1 - 1, (
+            f"strided CORR/PNR starved seeding: stride=1 -> {k1}, "
+            f"stride=9 -> {A9.shape[1]} (PNR must stay full-T)"
+        )
+
     def test_fit_accepts_zarr_input(self, synth_small, tmp_path):
         """fit() should accept a zarr.Array directly and produce identical
         results to passing the same data as a numpy array.
