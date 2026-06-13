@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -428,6 +429,7 @@ def _build_template_streaming(
     Memory budget: ~template_max_frames * H * W * 4 + batch_size * H * W * 4 bytes.
     """
     T, H, W = source.shape[0], source.shape[1], source.shape[2]
+    _t0 = time.perf_counter()
     idx = _sample_frame_indices(T, template_max_frames)
     sampled = np.empty((len(idx), H, W), dtype=np.float32)
     fill = 0
@@ -449,7 +451,13 @@ def _build_template_streaming(
             sampled[fill] = frame
             fill += 1
 
-    return caiman_bin_median(sampled[:fill], window=bin_window)
+    template = caiman_bin_median(sampled[:fill], window=bin_window)
+    if verbose:
+        print(
+            f"  template built from {fill} sampled frames in "
+            f"{time.perf_counter() - _t0:.1f}s"
+        )
+    return template
 
 
 def _create_output_zarr(path, shape, chunks, dtype, compression):
@@ -471,6 +479,7 @@ def _run_pass_zarr(
     of source + one batch of corrected output in RAM at a time.
     """
     T = src.shape[0]
+    _t0 = time.perf_counter()
     shifts = np.zeros((T, 2), dtype=np.float32)
     dst_dtype = np.dtype(dst.dtype)
     iter_ = range(0, T, batch_size)
@@ -486,6 +495,11 @@ def _run_pass_zarr(
             corrected_batch = corrected_batch.astype(dst_dtype)
         dst[start:end] = corrected_batch
         shifts[start:end] = shifts_batch
+    if verbose:
+        _dt = max(time.perf_counter() - _t0, 1e-9)
+        print(
+            f"  {desc}: {T} frames (read+MC+write) in {_dt:.1f}s ({T / _dt:.0f} fps)"
+        )
     return shifts
 
 
@@ -598,6 +612,7 @@ def _motion_correction_streaming(
     # If the move fails (cross-fs error, permission, AV lock), make sure both
     # scratch zarrs are removed so we don't accrue 2-3x the movie size on disk
     # across retries.
+    _t0 = time.perf_counter()
     try:
         shutil.move(str(final_scratch), str(output_path))
     finally:
@@ -607,6 +622,11 @@ def _motion_correction_streaming(
                     shutil.rmtree(p)
                 except OSError:
                     pass
+    if verbose:
+        print(
+            f"  final mc.zarr move scratch -> output in "
+            f"{time.perf_counter() - _t0:.1f}s"
+        )
 
     import zarr
     return zarr.open_array(str(output_path), mode="r+"), shifts_total
@@ -672,6 +692,7 @@ def _motion_correction_in_memory(
         # (frames are independent given a fixed template).
         source = movie if iteration == 0 else corrected
         shifts_iter = np.zeros((T, 2), dtype=np.float32)
+        _t0 = time.perf_counter()
         iter_ = range(0, T, batch_size)
         if verbose:
             iter_ = tqdm(iter_)
@@ -683,6 +704,12 @@ def _motion_correction_in_memory(
             )
             corrected[start:end] = corrected_batch
             shifts_iter[start:end] = shifts_batch
+        if verbose:
+            _dt = max(time.perf_counter() - _t0, 1e-9)
+            print(
+                f"  iteration {iteration + 1}/{niter_rig}: {T} frames in "
+                f"{_dt:.1f}s ({T / _dt:.0f} fps, n_jobs={n_jobs})"
+            )
 
         shifts_total += shifts_iter
 
