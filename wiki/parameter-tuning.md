@@ -65,7 +65,7 @@ python run_extract.py mc/mc.zarr -o results/ \
 
 | Mode | What it does | Speed |
 |------|--------------|-------|
-| `heuristic` | Image-based suggestions only — `blob_log` neuron radius, seed-count knee, shift histograms. No extraction. | Fast |
+| `heuristic` | Image-based suggestions only — `blob_log` neuron radius, the 3-method `(min_corr, min_pnr)` proposals, shift histograms. No extraction (the morphology seed is reported). | Fast |
 | `sweep` | Actually runs `fit_extract` across a grid of the key knobs and **scores** each candidate with quality proxies. | Slower |
 | `both` *(default)* | Heuristics seed the grid; the sweep refines and adds the temporal/eval knobs. | Slower |
 
@@ -104,8 +104,15 @@ suggestions, because those need a fitted model to read.
 downsample factors `ssub`/`tsub`.
 
 **Initialisation** (`sigma`, `min_corr`, `min_pnr`, `min_pixel`) — `sigma` from
-`blob_log` on the CORR·PNR image, the thresholds from the *knee* of a seed-count
-surface, `min_pixel` from the footprint-area distribution of a fast greedy init.
+`blob_log` on the CORR·PNR image; `min_pixel` from the footprint-area distribution
+of a fast greedy init. For the thresholds, three methods each propose a
+`(min_corr, min_pnr)` operating point — **morphology** (threshold that maximises the
+cell-like-blob count), **separation** (max Youden's J of CORR/PNR at detected neuron
+centres vs background), and **percentile** (25th-pct of CORR/PNR at neuron centres) —
+and the sweep tests all three as **coupled seeds**, picking the winner by quality
+score (the winning method is named in `report.md`). The CORR/PNR images are computed
+from a 2000-frame, chunk-aligned sample of `mc.zarr` (`n_init_frames`); the
+chunk-aligned read avoids the strided-single-frame I/O blow-up on time-chunked zarrs.
 
 **Sweep grid** (the most-impactful extraction knobs, per the real-recording
 findings in [[usage-guide#Tuning long or dense recordings]]): `sigma`,
@@ -121,14 +128,17 @@ Pass comma-lists, e.g. `--grid-min-pnr 6,10,14 --grid-bg-rank 0,1`.
 
 - **Stage 1** — temporal-std with detected blobs (neuron radius); shift
   histograms (`max_shift`); ssub/tsub rule tables.
-- **Stage 3** — CORR / PNR / CORR·PNR triptych (`sigma`); seed-count heatmap
-  over (`min_corr`, `min_pnr`); footprint-area histogram (`min_pixel`).
+- **Stage 3** — CORR / PNR / CORR·PNR triptych (`sigma`); morphology curves +
+  thresholded CORR/PNR images at the detected `(min_corr, min_pnr)`; footprint-area
+  histogram (`min_pixel`).
 - **Stage 4** — per-component τ and AR-`g` distributions (`decay_time_ms`,
   `g_prior_weight`); pairwise-correlation histogram (`merge_thr_corr`); SNR
   histogram + footprint montage at the threshold boundary (`auto_eval_snr_amp_thr`).
 - **Sweep** — the **density↔purity scatter** (K vs median `corr(C, C+YrA)`,
   point size = accepted fraction, colour = score, best starred); footprints over
-  the **correlation image** (not the mean projection — see [[usage-guide#Tuning
+  the **correlation image thresholded at that candidate's `min_corr`** (sub-threshold
+  background dropped to black so each footprint reads against the cell it covers; the
+  mean projection is a vignette-dominated blob on 1p data — see [[usage-guide#Tuning
   long or dense recordings]]); `C` vs `C+YrA` traces for the best candidate.
 
 ### Component diagnostics (`tuning.report`)
