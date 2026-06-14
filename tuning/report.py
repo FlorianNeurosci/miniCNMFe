@@ -342,11 +342,15 @@ def fig_sweep_scatter(rows, out_path=None):
 
 
 def fig_sweep_footprints(model, cn, out_path=None, region_crop=None, max_img=None):
-    """Footprint contours over the CORR image thresholded at ``min_corr``.
+    """Footprint contours over the CORR image (single panel, CORR only).
 
-    Single panel (CORR only). ``cn`` is full-FOV; ``region_crop`` offsets the
-    crop-local contours onto it. ``max_img`` is accepted-but-ignored (the old
-    max-projection panel was dropped — see body comment: it misleads on 1p data).
+    ``cn`` is full-FOV; ``region_crop`` offsets the crop-local contours onto it.
+    ``max_img`` is accepted-but-ignored (the old max-projection panel was dropped
+    — it misleads on 1p data). The CORR display floor is the **median** of ``cn``,
+    NOT ``min_corr``: thresholding the display at ``min_corr`` hides the dimmer
+    correlation halo around each cell, which makes footprints (correctly covering
+    that halo) look oversized vs the few bright cores. The median floor shows the
+    full structure so footprint extent can be judged fairly.
     """
     import matplotlib.pyplot as plt
 
@@ -375,7 +379,6 @@ def fig_sweep_footprints(model, cn, out_path=None, region_crop=None, max_img=Non
             col = "lime" if (mask is None or (len(mask) == K and mask[k])) else "red"
             ax.contour(xs, ys, fp, levels=[0.3 * fp.max()], colors=col, linewidths=0.7)
 
-    vmin = float(getattr(model.params, "min_corr", 0.0) or 0.0)
     # CORR-only: the max-projection panel was dropped — on 1p data the max/mean
     # projection is dominated by static background/vasculature, not the transient
     # cells, so footprints correctly on cells look "off the bright stuff". CORR
@@ -385,11 +388,13 @@ def fig_sweep_footprints(model, cn, out_path=None, region_crop=None, max_img=Non
 
     if cn is not None:
         cn = np.asarray(cn, dtype=np.float32)
-        cvmax = np.nanpercentile(cn, 99.7) if np.isfinite(cn).any() else None
+        finite = np.isfinite(cn).any()
+        vmin = float(np.nanpercentile(cn, 50)) if finite else 0.0
+        cvmax = np.nanpercentile(cn, 99.7) if finite else None
         if cvmax is not None:
             cvmax = max(cvmax, vmin + 1e-6)
         ax.imshow(cn, cmap="gray", vmin=vmin, vmax=cvmax)
-        ax.set_title(f"footprints over thresholded CORR (vmin={vmin:.2f}) — {K} comps")
+        ax.set_title(f"footprints over CORR (vmin=median={vmin:.2f}) — {K} comps")
     _draw_contours(ax); ax.axis("off")
 
     fig.tight_layout()
