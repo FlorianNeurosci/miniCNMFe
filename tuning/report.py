@@ -341,47 +341,66 @@ def fig_sweep_scatter(rows, out_path=None):
     return _finish(fig, out_path)
 
 
-def fig_sweep_footprints(model, cn, out_path=None, region_crop=None):
+def fig_sweep_footprints(model, cn, out_path=None, region_crop=None, max_img=None):
+    """Footprint contours over the candidate's backdrop(s).
+
+    Backdrop = the CORR image thresholded at the candidate's ``min_corr``. When
+    ``max_img`` (the full-FOV max projection of the data) is given, a second panel
+    overlays the **same** contours on that max projection — the "frame the video saw",
+    where 1p cells pop far better than the mean. ``cn``/``max_img`` are full-FOV and
+    ``region_crop`` offsets the crop-local contours onto them.
+    """
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-    if cn is not None:
-        # Threshold the CORR backdrop at this candidate's min_corr (vmin): the
-        # diffuse sub-threshold background drops to black and only the cell blobs
-        # remain, so the footprint contours are read against the cells they should
-        # cover — not the busy raw correlation speckle. No smoothing (raw cn).
-        cn = np.asarray(cn, dtype=np.float32)
-        vmin = float(getattr(model.params, "min_corr", 0.0) or 0.0)
-        vmax = np.nanpercentile(cn, 99.7) if np.isfinite(cn).any() else None
-        if vmax is not None:
-            vmax = max(vmax, vmin + 1e-6)
-        ax.imshow(cn, cmap="gray", vmin=vmin, vmax=vmax)
     H, W = model.dims
-    # The sweep extracts on a cutout (crop-local coords) but ``cn`` is the full
-    # FOV correlation image. Offset the contours by the crop origin so they land
-    # on the right pixels; without this they are drawn up-and-left of the cells.
+    # The sweep extracts on a cutout (crop-local coords) but ``cn``/``max_img`` are
+    # the full FOV. Offset the contours by the crop origin so they land on the right
+    # pixels; without this they are drawn up-and-left of the cells.
     y0, x0 = 0, 0
     if region_crop is not None:
         (y0, _y1, x0, _x1), _t = region_crop
     xs = np.arange(W) + x0
     ys = np.arange(H) + y0
     # A 0-component candidate (sigma too small etc.) has no footprints — and
-    # ``model.A`` may even be None; draw just the thresholded backdrop so the slot
-    # is never blank.
+    # ``model.A`` may even be None; draw just the backdrop so the slot is never blank.
     K = model.A.shape[1] if model.A is not None else 0
     mask = getattr(model, "accepted_mask", None)
-    if K > 0:
-        A_dense = np.asarray(model.A.todense()).reshape(H, W, K)
+    A_dense = (np.asarray(model.A.todense()).reshape(H, W, K) if K > 0 else None)
+
+    def _draw_contours(ax):
+        if A_dense is None:
+            return
         for k in range(K):
             fp = A_dense[..., k]
             if fp.max() <= 0:
                 continue
             col = "lime" if (mask is None or (len(mask) == K and mask[k])) else "red"
             ax.contour(xs, ys, fp, levels=[0.3 * fp.max()], colors=col, linewidths=0.7)
+
+    vmin = float(getattr(model.params, "min_corr", 0.0) or 0.0)
+    panels = 2 if max_img is not None else 1
+    fig, axes = plt.subplots(1, panels, figsize=(8 * panels, 8))
+    axes = np.atleast_1d(axes)
+
+    # Panel 0: CORR thresholded at min_corr (background below threshold -> black).
     if cn is not None:
-        ax.set_title(f"candidate footprints over thresholded CORR "
-                     f"(vmin={vmin:.2f}) — {K} comps")
-    ax.axis("off")
+        cn = np.asarray(cn, dtype=np.float32)
+        cvmax = np.nanpercentile(cn, 99.7) if np.isfinite(cn).any() else None
+        if cvmax is not None:
+            cvmax = max(cvmax, vmin + 1e-6)
+        axes[0].imshow(cn, cmap="gray", vmin=vmin, vmax=cvmax)
+        axes[0].set_title(f"footprints over thresholded CORR (vmin={vmin:.2f}) — {K} comps")
+    _draw_contours(axes[0]); axes[0].axis("off")
+
+    # Panel 1 (optional): footprints over the max projection ("video frame").
+    if max_img is not None:
+        m = np.asarray(max_img, dtype=np.float32)
+        mvmax = np.nanpercentile(m, 99.5) if np.isfinite(m).any() else None
+        mvmin = np.nanpercentile(m, 2) if np.isfinite(m).any() else None
+        axes[1].imshow(m, cmap="gray", vmin=mvmin, vmax=mvmax)
+        axes[1].set_title("footprints over the max-projection (video)")
+        _draw_contours(axes[1]); axes[1].axis("off")
+
     fig.tight_layout()
     return _finish(fig, out_path)
 
@@ -906,13 +925,15 @@ def _params_json(recommended: dict):
     return CNMFeParams(**filtered), filtered
 
 
-def write_report(run_dir, result, *, best_model=None, cn=None, pnr=None):
+def write_report(run_dir, result, *, best_model=None, cn=None, pnr=None, max_img=None):
     """Write figures + recommended_params.json + downsample.json + report.md.
 
     ``result`` is the dict assembled by ``tuning.tuner.run_tuning``; ``best_model``
     (live) and ``cn`` (correlation image) feed the stage-4 / sweep figures. When
     ``pnr`` (the matching peak-to-noise image) is also given, the sweep gets a
-    seed-coverage figure for the best candidate. Returns the run_dir path.
+    seed-coverage figure for the best candidate. ``max_img`` (full-FOV max
+    projection) adds the "video frame" panel to the footprints figure. Returns the
+    run_dir path.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -940,7 +961,7 @@ def write_report(run_dir, result, *, best_model=None, cn=None, pnr=None):
         if best_model is not None and best_model.A is not None and best_model.A.shape[1] > 0:
             region_crop = sweep.get("region_crop")
             fig_sweep_footprints(best_model, cn, out_path=run_dir / "fig_sweep_footprints.png",
-                                 region_crop=region_crop)
+                                 region_crop=region_crop, max_img=max_img)
             saved["sweep_footprints"] = "fig_sweep_footprints.png"
             # Seed-coverage on the best candidate. The sweep extracts on a cutout
             # (crop-local coords) while cn/pnr are full-FOV, so crop them to the

@@ -180,7 +180,7 @@ def _fit_candidate(params, mc_zarr_path, region_crop, workdir):
     return model
 
 
-def _render_candidate_figs(model, cn, fp_out, tr_out, region_crop=None):
+def _render_candidate_figs(model, cn, fp_out, tr_out, region_crop=None, max_img=None):
     """Render this candidate's footprints + traces PNGs (best-effort).
 
     Reuses the same renderers as the best-candidate report figure: ``cn`` is the
@@ -200,7 +200,8 @@ def _render_candidate_figs(model, cn, fp_out, tr_out, region_crop=None):
         # Always render the footprints figure (the thresholded CORR backdrop), even
         # for a 0-component candidate — otherwise its slot is blank in the GUI; the
         # backdrop alone reads as "this candidate found nothing on this image".
-        fig_sweep_footprints(model, cn, out_path=fp_out, region_crop=region_crop)
+        fig_sweep_footprints(model, cn, out_path=fp_out, region_crop=region_crop,
+                             max_img=max_img)
         out["footprints_fig"] = Path(fp_out).name
         # Traces only exist when there are components.
         if model.A is not None and model.A.shape[1] > 0:
@@ -217,7 +218,8 @@ def _run_one_candidate(args) -> dict:
     A failed candidate returns a row with ``error`` set and a ``-inf`` score
     rather than aborting the whole sweep.
     """
-    idx, params, mc_zarr_path, region_crop, workdir, swept, cn_full, fp_out, tr_out = args
+    (idx, params, mc_zarr_path, region_crop, workdir, swept, cn_full, max_img,
+     fp_out, tr_out) = args
     try:
         from threadpoolctl import threadpool_limits
     except ImportError:
@@ -236,7 +238,7 @@ def _run_one_candidate(args) -> dict:
         row.update(q)
         row["score"] = composite_score(q)
         row.update(_render_candidate_figs(model, cn_full, fp_out, tr_out,
-                                          region_crop=region_crop))
+                                          region_crop=region_crop, max_img=max_img))
         return row
     except Exception as exc:  # noqa: BLE001 — surface, don't abort the batch
         row = {"idx": idx, "error": repr(exc), "wall_s": time.time() - t0,
@@ -248,7 +250,8 @@ def _run_one_candidate(args) -> dict:
 def run_sweep(
     mc_zarr_path: "str | Path", base_params: CNMFeParams, spec: SweepSpec,
     *, region_crop=None, n_jobs: int = 1, workdir: "str | Path",
-    max_candidates: int = 24, cn=None, thr_seeds: "list[dict] | None" = None,
+    max_candidates: int = 24, cn=None, max_img=None,
+    thr_seeds: "list[dict] | None" = None,
 ) -> "tuple[list[dict], CNMFeParams, CNMFe]":
     """Run the sweep and return ``(rows, best_params, best_model)``.
 
@@ -327,7 +330,7 @@ def run_sweep(
 
     tasks = [
         (i, params, str(mc_zarr_path), region_crop, str(workdir / f"cand_{i}"),
-         swept, cn, str(fig_dir / f"fig_cand_{i}_footprints.png"),
+         swept, cn, max_img, str(fig_dir / f"fig_cand_{i}_footprints.png"),
          str(fig_dir / f"fig_cand_{i}_traces.png"))
         for i, (params, swept) in enumerate(candidates)
     ]

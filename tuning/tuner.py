@@ -45,7 +45,7 @@ class TunerConfig:
     n_init_frames: int = 2000
     n_shift_frames: int = 200
     cutout_hw: "tuple[int, int]" = (256, 256)
-    window_t: int = 3000
+    window_t: int = 6000
     # sweep
     sweep: SweepSpec = field(default_factory=SweepSpec)
     max_candidates: int = 24
@@ -156,6 +156,10 @@ def run_tuning(cfg: TunerConfig) -> dict:
     dims = (int(mc.shape[1]), int(mc.shape[2]))
     T = int(mc.shape[0])
     mc_sample, sample_idx = S.load_mc_sample(mc, cfg.n_init_frames)
+    # Max projection over the sample = the "video frame" backdrop for the footprints
+    # figures (1p cells pop in the max far better than in the mean). Full-FOV, so it
+    # aligns with cn and the offset contours.
+    max_img = np.asarray(mc_sample, dtype=np.float32).max(axis=0)
 
     # For a directly-provided zarr there was no raw-AVI sample to measure the
     # neuron radius from (the AVI path sets sigma_native at stage 1). Estimate it
@@ -230,7 +234,8 @@ def run_tuning(cfg: TunerConfig) -> dict:
         rows, best_params, best_model = run_sweep(
             mc_path, base_grid, sweep, region_crop=region_crop,
             n_jobs=cfg.n_jobs, workdir=run_dir / "sweep",
-            max_candidates=cfg.max_candidates, cn=cn, thr_seeds=thr_seeds)
+            max_candidates=cfg.max_candidates, cn=cn, max_img=max_img,
+            thr_seeds=thr_seeds)
         sweep_result = {"rows": rows, "region": cfg.region, "region_crop": region_crop}
         for f in best_swept:
             # global_bg_rank / init_stride are long-recording wins the short sweep
@@ -320,5 +325,6 @@ def run_tuning(cfg: TunerConfig) -> dict:
         "sweep": sweep_result, "mc_quality": mc_quality(mc_shifts),
     }
 
-    R.write_report(run_dir, result, best_model=stage4_model, cn=cn, pnr=pnr)
+    R.write_report(run_dir, result, best_model=stage4_model, cn=cn, pnr=pnr,
+                   max_img=max_img)
     return result
