@@ -89,16 +89,46 @@ def decode_contiguous_clip(avi_paths, n_frames: int, start_frac: float = 0.4) ->
 
 
 def load_mc_sample(mc_zarr, n_frames: int) -> "tuple[np.ndarray, np.ndarray]":
-    """Load a linspace-strided sample of an ``mc.zarr`` into RAM.
+    """Load a chunk-aligned, time-spread sample of an ``mc.zarr`` into RAM.
 
     Returns ``(sample, idx)`` where ``sample`` is ``(n, H, W)`` float32 and
     ``idx`` is the global frame index of each sampled frame (so a temporal
     window can be mapped back to full-T coordinates).
+
+    The frames are read as ``K`` **contiguous, chunk-aligned blocks** spread
+    across the recording rather than as ``n`` linspace-strided single frames.
+    The old strided read defeated zarr chunking: with a time-chunk of e.g. 100
+    frames and a stride > 100, every requested frame lands in a distinct chunk,
+    so reading 400 frames decompressed ~400 full chunks (tens of GB) off the
+    store. Reading whole chunks at ``K = ceil(n / blk)`` evenly-spaced,
+    chunk-snapped starts pulls only the data actually needed (~one chunk per
+    block) while still covering the whole recording in time.
     """
     T = int(mc_zarr.shape[0])
-    idx = np.linspace(0, T - 1, min(T, n_frames)).astype(int)
-    sample = np.stack([np.asarray(mc_zarr[int(i)]) for i in idx]).astype(np.float32)
-    return sample, idx
+    n = int(min(T, max(1, n_frames)))
+    # Time-chunk size (frames per chunk); fall back to a sane block if unchunked.
+    chunks = getattr(mc_zarr, "chunks", None)
+    blk = int(chunks[0]) if chunks else min(T, 256)
+    blk = max(1, min(blk, T))
+    k = max(1, -(-n // blk))  # ceil(n / blk) blocks
+    if k * blk >= T:
+        # Few/large blocks cover the whole movie — just take a strided view.
+        idx = np.linspace(0, T - 1, n).astype(int)
+        sample = np.asarray(mc_zarr[:], dtype=np.float32)[idx]
+        return sample, idx
+    # Evenly-spaced, chunk-aligned block starts across [0, T - blk].
+    starts = np.unique(((np.linspace(0, T - blk, k)).astype(int) // blk) * blk)
+    parts, idxs = [], []
+    for s in starts:
+        s = int(s)
+        parts.append(np.asarray(mc_zarr[s:s + blk], dtype=np.float32))
+        idxs.append(np.arange(s, s + blk))
+    sample = np.concatenate(parts, axis=0)
+    idx = np.concatenate(idxs)
+    if len(sample) > n:  # trim evenly to exactly n frames
+        keep = np.linspace(0, len(sample) - 1, n).astype(int)
+        sample, idx = sample[keep], idx[keep]
+    return sample, idx.astype(int)
 
 
 def pick_cutout(

@@ -249,6 +249,115 @@ def suggest_corr_pnr(
     return min_corr, min_pnr, evidence
 
 
+def _neuron_bg_values(cn, pnr, sigma, *, bg_radius_factor=2.0, max_bg=5000):
+    """Split CORR/PNR pixels into neuron-centre values and background values.
+
+    Detects neuron blobs on the CORR·PNR product (the shared
+    :func:`tuning.metrics.detect_product_blobs`); background = pixels at least
+    ``bg_radius_factor*sigma`` px from every neuron. Returns
+    ``(rc, corr_neuron, pnr_neuron, corr_bg, pnr_bg)`` with a deterministically
+    strided background subsample for cheap thresholding.
+    """
+    from scipy.ndimage import binary_dilation
+    from skimage.morphology import disk
+
+    from tuning.metrics import detect_product_blobs
+
+    cn = np.asarray(cn, dtype=np.float64)
+    pnr = np.asarray(pnr, dtype=np.float64)
+    blobs = detect_product_blobs(cn, pnr, sigma)
+    rc = blobs.astype(int) if len(blobs) else np.zeros((0, 2), int)
+    centre_mask = np.zeros(cn.shape, dtype=bool)
+    if len(rc):
+        centre_mask[rc[:, 0], rc[:, 1]] = True
+    radius = max(1, int(round(bg_radius_factor * sigma)))
+    bg_mask = ~binary_dilation(centre_mask, structure=disk(radius))
+    corr_neuron = cn[rc[:, 0], rc[:, 1]] if len(rc) else np.empty(0)
+    pnr_neuron = pnr[rc[:, 0], rc[:, 1]] if len(rc) else np.empty(0)
+    corr_bg, pnr_bg = cn[bg_mask], pnr[bg_mask]
+    if corr_bg.size > max_bg:
+        step = corr_bg.size // max_bg
+        corr_bg, pnr_bg = corr_bg[::step], pnr_bg[::step]
+    return rc, corr_neuron, pnr_neuron, corr_bg, pnr_bg
+
+
+def _separating_threshold(neuron_vals, bg_vals, thr_axis):
+    """Threshold on ``thr_axis`` maximising Youden's J = TPR - FPR.
+
+    TPR = fraction of neuron-centre values kept (``>= t``); FPR = fraction of
+    background leaked. "Keep most neurons, filter background best." Returns
+    ``(thr, j_curve)``.
+    """
+    nv = np.asarray(neuron_vals, dtype=np.float64)
+    bv = np.asarray(bg_vals, dtype=np.float64)
+    tpr = (nv[None, :] >= thr_axis[:, None]).mean(axis=1)
+    fpr = (bv[None, :] >= thr_axis[:, None]).mean(axis=1)
+    j = tpr - fpr
+    return float(thr_axis[int(np.argmax(j))]), j
+
+
+def suggest_corr_pnr_separation(
+    cn: np.ndarray, pnr: np.ndarray, sigma: float, *,
+    corr_floor: float = 0.4, pnr_floor: float = 2.0, n_thr: int = 60,
+    min_blobs: int = 5,
+) -> "tuple[float, float, dict]":
+    """``min_corr`` / ``min_pnr`` from neuron-vs-background separation (Youden's J).
+
+    Detects neuron blobs on the CORR·PNR image and, for the CORR and PNR images
+    independently, picks the threshold that best separates the values at neuron
+    centres from the background (max Youden's J). Falls back to safe defaults when
+    too few neurons are detected. Returns ``(min_corr, min_pnr, evidence)``.
+    """
+    cn = np.asarray(cn, dtype=np.float64)
+    pnr = np.asarray(pnr, dtype=np.float64)
+    rc, corr_neuron, pnr_neuron, corr_bg, pnr_bg = _neuron_bg_values(cn, pnr, sigma)
+    corr_axis = np.linspace(corr_floor, 0.95, n_thr)
+    pnr_hi = float(np.percentile(pnr, 99.5))
+    pnr_axis = np.linspace(pnr_floor, max(pnr_floor + 1.0, pnr_hi), n_thr)
+    if len(rc) >= min_blobs and corr_bg.size and pnr_bg.size:
+        min_corr, j_corr = _separating_threshold(corr_neuron, corr_bg, corr_axis)
+        min_pnr, j_pnr = _separating_threshold(pnr_neuron, pnr_bg, pnr_axis)
+        min_corr = float(max(corr_floor, min_corr))
+        min_pnr = float(max(pnr_floor, min_pnr))
+    else:
+        min_corr, min_pnr = 0.8, 10.0
+        j_corr = j_pnr = np.zeros(n_thr)
+    evidence = {"cn": cn, "pnr": pnr, "sigma": float(sigma), "blob_rc": rc,
+                "n_blobs": int(len(rc)), "corr_neuron": corr_neuron,
+                "pnr_neuron": pnr_neuron, "corr_bg": corr_bg, "pnr_bg": pnr_bg,
+                "thr_axis_corr": corr_axis, "thr_axis_pnr": pnr_axis,
+                "j_corr": j_corr, "j_pnr": j_pnr,
+                "min_corr": min_corr, "min_pnr": min_pnr}
+    return min_corr, min_pnr, evidence
+
+
+def suggest_corr_pnr_percentile(
+    cn: np.ndarray, pnr: np.ndarray, sigma: float, *,
+    pct: float = 25.0, corr_floor: float = 0.4, pnr_floor: float = 2.0,
+    min_blobs: int = 5,
+) -> "tuple[float, float, dict]":
+    """``min_corr`` / ``min_pnr`` = the ``pct``-th percentile of CORR/PNR **at
+    detected neuron-blob centres**.
+
+    A simple, robust operating point: keep ~``(100-pct)%`` of detected neurons.
+    Falls back to safe defaults when too few neurons are detected. Returns
+    ``(min_corr, min_pnr, evidence)``.
+    """
+    cn = np.asarray(cn, dtype=np.float64)
+    pnr = np.asarray(pnr, dtype=np.float64)
+    rc, corr_neuron, pnr_neuron, _, _ = _neuron_bg_values(cn, pnr, sigma)
+    if len(rc) >= min_blobs:
+        min_corr = float(max(corr_floor, np.percentile(corr_neuron, pct)))
+        min_pnr = float(max(pnr_floor, np.percentile(pnr_neuron, pct)))
+    else:
+        min_corr, min_pnr = 0.8, 10.0
+    evidence = {"cn": cn, "pnr": pnr, "sigma": float(sigma), "blob_rc": rc,
+                "n_blobs": int(len(rc)), "corr_neuron": corr_neuron,
+                "pnr_neuron": pnr_neuron, "pct": float(pct),
+                "min_corr": min_corr, "min_pnr": min_pnr}
+    return min_corr, min_pnr, evidence
+
+
 def suggest_min_pixel(
     mc_sample: np.ndarray, sigma: float, min_corr: float, min_pnr: float,
     dims: "tuple[int, int]", *, max_neurons: int = 200, n_jobs: int = 1,

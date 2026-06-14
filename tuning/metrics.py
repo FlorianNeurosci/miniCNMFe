@@ -263,18 +263,18 @@ QUALITY_THRESHOLDS = {
 }
 
 
-def detect_cell_blobs(cn: np.ndarray, pnr: np.ndarray, sigma: float, *,
-                      min_corr: float, min_pnr: float,
-                      threshold: float = 0.05) -> np.ndarray:
-    """``(N, 2)`` cell-like blob centres ``(row, col)`` on the CORR·PNR image.
+def detect_product_blobs(cn: np.ndarray, pnr: np.ndarray, sigma: float, *,
+                         threshold: float = 0.05) -> np.ndarray:
+    """``(N, 2)`` blob centres ``(row, col)`` on the normalised CORR·PNR image.
 
     Uses ``skimage.feature.blob_log`` on the normalised ``cn * pnr`` product —
     the same detector :func:`tuning.heuristics.suggest_sigma_extraction` uses to
     size neurons — so a "blob" is a visually-distinct cell, not the dense local
     maxima ``detect_seeds`` returns (which over-counts relative to the cells the
-    eye picks out). Blobs are kept only where ``cn >= min_corr`` and
-    ``pnr >= min_pnr`` at the centre, matching the thresholded CORR / min-corr
-    image the user inspects. Blob radius scales with ``sigma``.
+    eye picks out). Blob radius scales with ``sigma``. This is the unfiltered
+    neuron set; :func:`detect_cell_blobs` applies the corr/pnr keep-filter on top,
+    and the threshold-seed heuristics in :mod:`tuning.heuristics` read the
+    corr/pnr values at these centres to *derive* those thresholds.
     """
     from skimage.feature import blob_log
 
@@ -291,9 +291,26 @@ def detect_cell_blobs(cn: np.ndarray, pnr: np.ndarray, sigma: float, *,
                      num_sigma=10, threshold=threshold)
     if len(blobs) == 0:
         return np.zeros((0, 2), dtype=float)
-    rc = blobs[:, :2].astype(int)
+    return blobs[:, :2].astype(float)
+
+
+def detect_cell_blobs(cn: np.ndarray, pnr: np.ndarray, sigma: float, *,
+                      min_corr: float, min_pnr: float,
+                      threshold: float = 0.05) -> np.ndarray:
+    """``(N, 2)`` cell-like blob centres ``(row, col)`` on the CORR·PNR image.
+
+    :func:`detect_product_blobs` finds the neuron blobs; here they are kept only
+    where ``cn >= min_corr`` and ``pnr >= min_pnr`` at the centre, matching the
+    thresholded CORR / min-corr image the user inspects.
+    """
+    blobs = detect_product_blobs(cn, pnr, sigma, threshold=threshold)
+    if len(blobs) == 0:
+        return blobs
+    cn = np.asarray(cn, dtype=np.float64)
+    pnr = np.asarray(pnr, dtype=np.float64)
+    rc = blobs.astype(int)
     keep = (cn[rc[:, 0], rc[:, 1]] >= min_corr) & (pnr[rc[:, 0], rc[:, 1]] >= min_pnr)
-    return blobs[keep, :2].astype(float)
+    return blobs[keep]
 
 
 def _footprint_peaks(model, *, accepted_only: bool = True) -> np.ndarray:

@@ -189,9 +189,10 @@ def fig_seed_heatmap(ev, out_path=None):
     twb.set_ylabel("largest-CC frac", color="C3")
     ax[0, 1].set_title(f"PNR morphology  ->  min_pnr={mp:.1f}")
 
-    ax[1, 0].imshow(cn, cmap="viridis", vmin=mc, vmax=float(cn.max()))
+    ax[1, 0].imshow(cn, cmap="viridis", vmin=mc, vmax=max(float(cn.max()), mc + 1e-6))
     ax[1, 0].set_title(f"CORR thresholded (vmin={mc:.2f})"); ax[1, 0].axis("off")
-    ax[1, 1].imshow(pnr, cmap="magma", vmin=mp, vmax=float(np.percentile(pnr, 99.5)))
+    ax[1, 1].imshow(pnr, cmap="magma", vmin=mp,
+                    vmax=max(float(np.percentile(pnr, 99.5)), mp + 1e-6))
     ax[1, 1].set_title(f"PNR thresholded (vmin={mp:.1f})"); ax[1, 1].axis("off")
     fig.suptitle(f"cell-area window {ev['a_min']}–{ev['a_max']} px (from σ={ev['sigma']:.1f})",
                  y=1.0, fontsize=10)
@@ -763,6 +764,10 @@ def fig_blob_coverage(model, cn, pnr, sigma, *, min_corr, min_pnr,
     fig, ax = plt.subplots(figsize=(8, 8))
     cn_s = gaussian_filter(cn, sigma=float(sigma)) if sigma and sigma > 0 else cn
     vmax = np.nanpercentile(cn_s, 99.5) if np.isfinite(cn_s).any() else None
+    # Guard vmin > vmax: a high min_corr can exceed the image's 99.5th percentile
+    # (e.g. a strict threshold on a low-contrast cn), which matplotlib rejects.
+    if vmax is not None:
+        vmax = max(vmax, float(min_corr) + 1e-6)
     ax.imshow(cn_s, cmap="gray", vmin=float(min_corr), vmax=vmax)
 
     # A footprint contours (the "compare to A" overlay) — cyan accepted / gray rejected.

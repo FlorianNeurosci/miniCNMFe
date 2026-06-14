@@ -112,39 +112,57 @@ def resolve_sigma_grid(spec_sigma, sigma_ds: float) -> "list[float]":
 
 def build_candidates(
     base_params: CNMFeParams, spec: SweepSpec, max_candidates: int = 24,
+    thr_seeds: "list[dict] | None" = None,
 ) -> "list[tuple[CNMFeParams, dict]]":
-    """Expand ``spec`` into ``(params, swept_values)`` candidates.
+    """Expand ``spec`` (and optional ``thr_seeds``) into ``(params, swept)`` candidates.
 
-    If the full Cartesian product fits within ``max_candidates``, use it.
-    Otherwise fall back to a **one-knob-at-a-time** design around the base
-    params (linear in the number of values), so cost stays bounded. The base
-    params themselves are always included as the first candidate.
+    The non-seed knobs in ``spec`` form a base set of combos: the full Cartesian
+    product if it fits the budget, else a **one-knob-at-a-time** design around the
+    base params (linear in the number of values), so cost stays bounded.
+
+    ``thr_seeds`` is an optional list of **coupled** ``{"min_corr", "min_pnr",
+    "thr_method"}`` dicts — each a candidate operating point from a different
+    threshold-selection method. When given, candidates are
+    ``thr_seeds × base_combos`` (each seed sets ``min_corr`` *and* ``min_pnr``
+    **together**, not as an independent-grid cross-product), so the sweep can
+    score the methods against each other. ``thr_method`` is carried into the
+    swept snapshot. The per-seed budget is ``max_candidates // len(thr_seeds)``.
     """
     active = spec.active()
+    seeds = list(thr_seeds) if thr_seeds else [None]
+    per_seed_budget = max(1, max_candidates // len(seeds))
+
     if not active:
-        snap = {f: getattr(base_params, f) for f in SWEPT_FIELDS}
-        return [(replace(base_params), snap)]
-
-    fields_ = list(active)
-    grid_size = int(np.prod([len(active[f]) for f in fields_]))
-
-    combos: "list[dict]" = []
-    if grid_size <= max_candidates:
-        for values in itertools.product(*(active[f] for f in fields_)):
-            combos.append(dict(zip(fields_, values)))
+        base_combos: "list[dict]" = [{}]
     else:
-        combos.append({})  # base
-        for f in fields_:
-            base_v = getattr(base_params, f)
-            for v in active[f]:
-                if v != base_v:
-                    combos.append({f: v})
+        fields_ = list(active)
+        grid_size = int(np.prod([len(active[f]) for f in fields_]))
+        base_combos = []
+        if grid_size <= per_seed_budget:
+            for values in itertools.product(*(active[f] for f in fields_)):
+                base_combos.append(dict(zip(fields_, values)))
+        else:
+            base_combos.append({})  # base
+            for f in fields_:
+                base_v = getattr(base_params, f)
+                for v in active[f]:
+                    if v != base_v:
+                        base_combos.append({f: v})
 
     candidates = []
-    for combo in combos:
-        p = replace(base_params, **combo)
-        snap = {f: getattr(p, f) for f in SWEPT_FIELDS}
-        candidates.append((p, snap))
+    for seed in seeds:
+        for combo in base_combos:
+            full = dict(combo)
+            label = None
+            if seed is not None:
+                full["min_corr"] = float(seed["min_corr"])
+                full["min_pnr"] = float(seed["min_pnr"])
+                label = seed.get("thr_method")
+            p = replace(base_params, **full)
+            snap = {f: getattr(p, f) for f in SWEPT_FIELDS}
+            if label is not None:
+                snap["thr_method"] = label
+            candidates.append((p, snap))
     return candidates
 
 
@@ -223,7 +241,7 @@ def _run_one_candidate(args) -> dict:
 def run_sweep(
     mc_zarr_path: "str | Path", base_params: CNMFeParams, spec: SweepSpec,
     *, region_crop=None, n_jobs: int = 1, workdir: "str | Path",
-    max_candidates: int = 24, cn=None,
+    max_candidates: int = 24, cn=None, thr_seeds: "list[dict] | None" = None,
 ) -> "tuple[list[dict], CNMFeParams, CNMFe]":
     """Run the sweep and return ``(rows, best_params, best_model)``.
 
@@ -244,7 +262,7 @@ def run_sweep(
 
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
-    candidates = build_candidates(base_params, spec, max_candidates)
+    candidates = build_candidates(base_params, spec, max_candidates, thr_seeds=thr_seeds)
 
     # Print the candidate grid up front (in the parent, before dispatch) so each
     # sweep logs exactly which parameter combinations it is about to extract.
@@ -255,6 +273,8 @@ def run_sweep(
             f"{f}={swept[f]:g}" if isinstance(swept.get(f), float) else f"{f}={swept[f]}"
             for f in SWEPT_FIELDS if swept.get(f) is not None
         )
+        if swept.get("thr_method"):
+            vals = f"[{swept['thr_method']}] " + vals
         print(f"[sweep]   cand {i}: {vals}", flush=True)
 
     # Split the `n_jobs` core budget across the two parallelism levels so their

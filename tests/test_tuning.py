@@ -353,6 +353,72 @@ def test_build_candidates_caps():
     assert len(capped) < len(full)  # one-knob-at-a-time fallback
 
 
+def test_build_candidates_thr_seeds_coupled():
+    """3 method seeds × sigma grid; each candidate sets min_corr AND min_pnr together."""
+    from collections import Counter
+
+    base = CNMFeParams()
+    spec = SweepSpec(sigma=[2, 3, 4])
+    seeds = [{"min_corr": 0.90, "min_pnr": 16.0, "thr_method": "morphology"},
+             {"min_corr": 0.80, "min_pnr": 6.0, "thr_method": "separation"},
+             {"min_corr": 0.85, "min_pnr": 9.0, "thr_method": "percentile"}]
+    cands = build_candidates(base, spec, max_candidates=24, thr_seeds=seeds)
+    assert len(cands) == 9  # 3 seeds × 3 sigma
+    seed_pairs = {(s["min_corr"], s["min_pnr"]) for s in seeds}
+    for p, snap in cands:
+        # coupled: the (min_corr, min_pnr) pair is always one whole seed, never a
+        # cross-product of independent grids.
+        assert (p.min_corr, p.min_pnr) in seed_pairs
+        assert snap["thr_method"] in {"morphology", "separation", "percentile"}
+    assert Counter(s["thr_method"] for _, s in cands) == \
+        {"morphology": 3, "separation": 3, "percentile": 3}
+
+
+def test_suggest_corr_pnr_methods_blobby_image():
+    """separation + percentile recover a sane threshold on a blobby CORR/PNR image."""
+    from scipy.ndimage import gaussian_filter
+
+    rng = np.random.default_rng(2)
+    H_ = W_ = 120
+    cells = np.zeros((H_, W_), np.float32)
+    for _ in range(20):
+        y, x = rng.integers(15, H_ - 15), rng.integers(15, W_ - 15)
+        cells[y, x] = 1.0
+    cells = gaussian_filter(cells, 3.0); cells /= cells.max()
+    cn_img = np.clip(cells, 0, 1).astype(np.float32)
+    pnr_img = (2 + 18 * cn_img).astype(np.float32)
+    for fn in (H.suggest_corr_pnr_separation, H.suggest_corr_pnr_percentile):
+        mc, mp, ev = fn(cn_img, pnr_img, sigma=3.0)
+        assert 0.3 <= mc <= 0.98 and mp >= 2.0
+        assert ev["n_blobs"] >= 3
+
+
+def test_suggest_corr_pnr_methods_fallback_on_flat():
+    """Too few blobs -> safe defaults (0.8, 10) instead of collapsing to the floor."""
+    flat = np.full((40, 40), 0.5, np.float32)
+    for fn in (H.suggest_corr_pnr_separation, H.suggest_corr_pnr_percentile):
+        mc, mp, _ = fn(flat, flat, sigma=3.0)
+        assert mc == 0.8 and mp == 10.0
+
+
+def test_load_mc_sample_chunk_aligned(sim_zarr):
+    """Chunk-aligned sampler returns the right frame count with valid global indices."""
+    import zarr
+
+    from tuning.io_sample import load_mc_sample
+
+    arr = zarr.open(str(sim_zarr), mode="r")
+    T = arr.shape[0]
+    sample, idx = load_mc_sample(arr, 40)
+    assert sample.shape[0] == len(idx) <= 40
+    assert sample.shape[1:] == arr.shape[1:]
+    assert idx.min() >= 0 and idx.max() < T
+    assert np.all(np.diff(idx) >= 0)  # sorted global indices
+    # sampled frames match the movie at those indices (correct idx bookkeeping)
+    assert np.allclose(sample[0], np.asarray(arr[int(idx[0])], dtype=np.float32))
+    assert np.allclose(sample[-1], np.asarray(arr[int(idx[-1])], dtype=np.float32))
+
+
 def test_sweep_runs_and_ranks(sim_zarr, sim_movie):
     base = CNMFeParams(sigma=3.0, min_corr=0.7, min_pnr=6.0, n_iter_main=1,
                        frame_rate_hz=20.0, decay_time_ms=180.0)

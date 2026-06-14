@@ -20,7 +20,7 @@ from minicnmfe.pipeline import CNMFe, CNMFeParams
 from tuning import heuristics as H
 from tuning import io_sample as S
 from tuning.metrics import mc_quality
-from tuning.sweep import SweepSpec, resolve_offset_grid, resolve_sigma_grid, run_sweep
+from tuning.sweep import SweepSpec, resolve_sigma_grid, run_sweep
 from tuning.validate import good_defaults
 
 
@@ -42,7 +42,7 @@ class TunerConfig:
     # subset sizes
     n_template_avis: int = 8
     stride_within_avi: int = 50
-    n_init_frames: int = 400
+    n_init_frames: int = 2000
     n_shift_frames: int = 200
     cutout_hw: "tuple[int, int]" = (256, 256)
     window_t: int = 3000
@@ -172,6 +172,16 @@ def run_tuning(cfg: TunerConfig) -> dict:
     stages["sigma"] = ev
     min_corr, min_pnr, ev = H.suggest_corr_pnr(cn, pnr, sigma_ds)
     stages["corr_pnr"] = ev
+    # Three threshold-selection methods, each a candidate (min_corr, min_pnr)
+    # operating point. Rather than commit to one a priori, the sweep tests all
+    # three as coupled seeds and its quality score picks the winner (see below).
+    thr_methods = {
+        "morphology": (float(min_corr), float(min_pnr)),
+        "separation": tuple(map(float, H.suggest_corr_pnr_separation(cn, pnr, sigma_ds)[:2])),
+        "percentile": tuple(map(float, H.suggest_corr_pnr_percentile(cn, pnr, sigma_ds)[:2])),
+    }
+    # morphology is the reference pair for the (single) min_pixel estimate and the
+    # heuristic-only recommendation when the sweep is skipped.
     min_pixel_ds, ev = H.suggest_min_pixel(mc_sample, sigma_ds, min_corr, min_pnr,
                                            dims, n_jobs=cfg.n_jobs)
     stages["min_pixel"] = ev
@@ -198,22 +208,29 @@ def run_tuning(cfg: TunerConfig) -> dict:
             region_crop = S.pick_cutout(cn, T=T, cutout_hw=cfg.cutout_hw,
                                         window_t=cfg.window_t, sample=mc_sample,
                                         sample_idx=sample_idx)
-        # Resolve the (possibly heuristic-relative) grids against the measured
-        # heuristics before the spec is expanded, so each data-driven value is
-        # always a candidate (see tuning.sweep.resolve_offset_grid). Omitted
-        # min_corr/min_pnr collapse to the single detected value (no sweep).
+        # Resolve the heuristic-relative sigma grid against the measured radius so
+        # the data-driven value is always a candidate (tuning.sweep.resolve_sigma_grid).
         sweep = cfg.sweep or SweepSpec()
         sigma_grid = resolve_sigma_grid(sweep.sigma, sigma_ds)
-        corr_grid = resolve_offset_grid(sweep.min_corr, min_corr, floor=0.3, clip_max=0.98)
-        pnr_grid = resolve_offset_grid(sweep.min_pnr, min_pnr, floor=2.0)
-        sweep = replace(sweep, sigma=sigma_grid, min_corr=corr_grid, min_pnr=pnr_grid)
+        # Threshold candidates come from the 3 methods as COUPLED (min_corr, min_pnr)
+        # seeds (deduped), not independent grids — the sweep scores them head-to-head.
+        thr_seeds = []
+        seen = set()
+        for name, (mc_, mp_) in thr_methods.items():
+            key_ = (round(mc_, 3), round(mp_, 2))
+            if key_ in seen:
+                continue
+            seen.add(key_)
+            thr_seeds.append({"min_corr": mc_, "min_pnr": mp_, "thr_method": name})
+        # min_corr/min_pnr are supplied by the coupled seeds, not the per-knob grids.
+        sweep = replace(sweep, sigma=sigma_grid, min_corr=None, min_pnr=None)
         stages["sigma_grid"] = {"values": sigma_grid, "heuristic": float(sigma_ds)}
-        stages["thr_grid"] = {"min_corr": corr_grid, "min_pnr": pnr_grid,
-                              "detected": (float(min_corr), float(min_pnr))}
+        stages["thr_grid"] = {"seeds": thr_seeds,
+                              "morphology": (float(min_corr), float(min_pnr))}
         rows, best_params, best_model = run_sweep(
             mc_path, base_grid, sweep, region_crop=region_crop,
             n_jobs=cfg.n_jobs, workdir=run_dir / "sweep",
-            max_candidates=cfg.max_candidates, cn=cn)
+            max_candidates=cfg.max_candidates, cn=cn, thr_seeds=thr_seeds)
         sweep_result = {"rows": rows, "region": cfg.region, "region_crop": region_crop}
         for f in best_swept:
             # global_bg_rank / init_stride are long-recording wins the short sweep
@@ -271,8 +288,16 @@ def run_tuning(cfg: TunerConfig) -> dict:
         recommended["init_stride"] = int(best_swept["init_stride"])
     sources["min_pixel"] = "heuristic"
     rationale["sigma"] = "blob_log on CORR·PNR (×ssub → native)"
-    rationale["min_corr"] = rationale["min_pnr"] = (
-        "image-threshold morphology (max # cell-like blobs)")
+    # When the sweep ran, the winning candidate carries the thr_method that seeded
+    # its (min_corr, min_pnr); surface it so the report shows which method won.
+    _winner = (sweep_result["rows"][0].get("thr_method")
+               if sweep_result and sweep_result.get("rows") else None)
+    if _winner:
+        rationale["min_corr"] = rationale["min_pnr"] = (
+            f"best of 3 method seeds (morphology / separation / percentile) → {_winner}")
+    else:
+        rationale["min_corr"] = rationale["min_pnr"] = (
+            "image-threshold morphology (max # cell-like blobs)")
     rationale["min_pixel"] = "25th-pct footprint area (×ssub² → native)"
 
     # One merged CNMFeParams: the long-recording base with the tuner's data-driven
