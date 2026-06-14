@@ -46,7 +46,7 @@ class TunerConfig:
     n_init_frames: int = 2000
     n_shift_frames: int = 200
     cutout_hw: "tuple[int, int]" = (256, 256)
-    window_t: int = 6000
+    window_t: int = 3000
     # sweep
     sweep: SweepSpec = field(default_factory=SweepSpec)
     max_candidates: int = 24
@@ -289,6 +289,18 @@ def run_tuning(cfg: TunerConfig) -> dict:
         rationale["auto_eval_snr_amp_thr"] = "largest gap in the low-SNR (ghost) region"
 
     # -- Fold swept/stage values into native-unit recommended params --
+    # Prefer min_pixel from the winning candidate's REALIZED footprint area (25th
+    # pct), which reflects the actual (nrg-thresholded) BCD footprints, over the
+    # greedy-init heuristic (suggest_min_pixel) — greedy-init footprints don't see
+    # the thresholding method, so with nrg they over-estimate min_pixel and the
+    # auto-eval would reject the (now smaller) footprints. Falls back to the
+    # heuristic when the sweep didn't run or the winner has no footprints.
+    min_pixel_source = "heuristic"
+    if sweep_result and sweep_result.get("rows"):
+        _p25 = sweep_result["rows"][0].get("npix_p25")
+        if _p25 and _p25 > 0:
+            min_pixel_ds = _p25
+            min_pixel_source = "data"
     recommended["sigma"] = float(best_swept["sigma"]) * ssub
     recommended["min_pixel"] = max(1, int(min_pixel_ds) * ssub * ssub)
     recommended["min_corr"] = float(best_swept["min_corr"])
@@ -297,7 +309,7 @@ def run_tuning(cfg: TunerConfig) -> dict:
     recommended["global_bg_rank"] = int(best_swept["global_bg_rank"])
     if best_swept["init_stride"] is not None:
         recommended["init_stride"] = int(best_swept["init_stride"])
-    sources["min_pixel"] = "heuristic"
+    sources["min_pixel"] = min_pixel_source
     rationale["sigma"] = "blob_log on CORR·PNR (×ssub → native)"
     # When the sweep ran, the winning candidate carries the thr_method that seeded
     # its (min_corr, min_pnr); surface it so the report shows which method won.
@@ -309,7 +321,9 @@ def run_tuning(cfg: TunerConfig) -> dict:
     else:
         rationale["min_corr"] = rationale["min_pnr"] = (
             "image-threshold morphology (max # cell-like blobs)")
-    rationale["min_pixel"] = "25th-pct footprint area (×ssub² → native)"
+    rationale["min_pixel"] = (
+        "25th-pct realized footprint area (×ssub² → native)" if min_pixel_source == "data"
+        else "25th-pct greedy-init footprint area (×ssub² → native)")
 
     # One merged CNMFeParams: the long-recording base with the tuner's data-driven
     # native-unit fields layered on. This is the single source of truth — it is

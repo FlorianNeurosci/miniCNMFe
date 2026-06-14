@@ -350,6 +350,106 @@ shrinkage (set `0.0` for pure LASSO). `spatial_max_iter` default lowered 10000�
 (now just a backstop). `update_spatial` prints a one-line `update_spatial stats:`
 diagnostic (mean/max CD iters, % hitting the cap, mean active-set size).
 
+### Footprint-size knobs for dense FOVs (`spatial_lambda_scale`, `spatial_max_radius_factor`)
+On dense / long FOVs footprints sprawl into their neighbours (see the dense-FOV
+caveats in *Two trace flavours* + *Real-recording tuning*). Footprint size is
+set in two places in `update_spatial`: the per-pixel LASSO threshold `λ_p` (which
+pixels turn on), then the post-hoc `threshold_footprint` cleanup
+(`spatial_max_thr`, `spatial_circular_max_dist_factor`). Two **opt-in** knobs were
+added (June 2026) to tighten footprints *before* relying only on post-hoc
+thresholding:
+
+- **`spatial_lambda_scale`** (default `1.0` = unchanged): multiplies the per-pixel
+  penalty, `λ_p = spatial_lambda_scale · 0.5 · sn_p · √(max_energy) / T`. `>1`
+  raises the bar a pixel's `C_k·y` must clear to be nonzero → tighter footprints
+  **at the regression source**, not just chopped after the fact. Threaded through
+  all three CD paths (serial, numba kernel, threaded). ~1.5 is a good start.
+- **`spatial_max_radius_factor`** (default `0.0` = off): caps the circular
+  constraint's clip radius at `spatial_max_radius_factor · sigma` px. The default
+  `circular_constraint` (`initialization.py`) derives its radius from the
+  footprint's **own area**, so once a footprint sprawls its radius grows too and
+  the constraint stops biting — self-defeating exactly when needed. This adds an
+  absolute physical-radius cap (`circular_constraint(..., max_radius=…)`) that
+  still clips bloated footprints. ~2.0 recommended for dense/long recordings.
+
+Both default to no-op, so the bit-for-bit `n_jobs=1` path (`test_stage_split.py`)
+is unchanged. `spatial_ridge` is **not** a size knob (it's L2 conditioning, does
+not promote sparsity). Regression:
+`tests/test_spatial_size.py::test_knobs_shrink_footprints_without_losing_cells`
+(dense simulator: turning both on drops median footprint npix without losing
+ground-truth cells).
+
+**Empirical real-data result (June 2026, PICAST 5k-frame snippet, full 492×566
+FOV, `sigma=3`, `global_bg_rank=1`, `n_iter_main=2`).** Three settings vs the
+tuned recommended params:
+- defaults: K=160, npix median **280**, `corr(C,C+YrA)` 0.862
+- `+lambda_scale=1.5`: K=160, npix median **277**, corr 0.863 — **λ is nearly
+  inert.** On real data the post-hoc `threshold_footprint` already bounds size
+  *below* the LASSO support, so tightening λ only trims pixels that were going to
+  be discarded anyway. λ would need to be pushed much higher (3–5×) to bite, at
+  which point dim-cell-death risk climbs. (Mirrors CaImAn: the **size prior**
+  does the work, the sparsity penalty is secondary.) **Prefer the radius cap over
+  λ for footprint size.**
+- `+lambda_scale=1.5, max_radius_factor=2.0`: npix median **280→109** (−61%),
+  corr **0.862→0.875** (tighter footprints → cleaner demixing → higher purity),
+  K even rose 160→173 (less overlap → fewer merges). The npix IQR collapsed to
+  ≈π·(2·sigma)² — i.e. nearly *every* footprint exceeded `2·sigma` and was
+  clamped (the whole field was sprawled).
+
+**Energy (nrg) thresholding — `spatial_thr_method` / `spatial_nrg_thr`.** A third,
+shape-aware size mechanism (CaImAn's `thr_method='nrg'`). `threshold_footprint`
+step 2 normally zeroes pixels below `spatial_max_thr · peak` (**peak-relative** —
+blind to concentration, so it keeps a sprawled footprint's broad low-contrast
+skirt). `spatial_thr_method="nrg"` instead keeps the brightest pixels whose summed
+`a²` reaches `spatial_nrg_thr` of the total; squaring discounts dim skirts, so they
+drop cleanly. Complementary to the other levers: **λ** gates LASSO pixels
+(sparsity), **nrg** trims dim skirts (intensity), the **radius cap** trims far
+pixels (geometry). nrg *adapts* pixel count per footprint instead of pinning a
+fixed circle, and (because footprints shrink) needs `min_pixel` to track the
+smaller scale.
+
+**nrg is now the package DEFAULT** (June 2026): `CNMFeParams.spatial_thr_method="nrg"`,
+`spatial_nrg_thr=0.95` (the validated sweet spot). The `threshold_footprint()`
+**function** default stays `thr_method="max"`, so direct callers / the
+`tests/test_spatial.py` unit tests are unaffected — only the `CNMFeParams` field
+default moved. Set `spatial_thr_method="max"` to restore legacy peak-relative
+thresholding. Because the default flip shrinks footprints, the **tuner now derives
+`min_pixel` from the winning sweep candidate's realized footprint 25th-pct
+(`tuning/metrics.py:npix_p25` → `tuning/tuner.py`)** — measured on the actual nrg
+footprints, not greedy-init footprints (which don't see the thresholding method
+and would over-estimate `min_pixel`, causing the auto-eval to reject the smaller
+footprints). No extra tuner runtime (reuses the sweep fits; `spatial_nrg_thr` is
+fixed at 0.95, not swept). Synthetic recovery tests that need the old behaviour
+pin `spatial_thr_method="max"` explicitly. Regression:
+`tests/test_spatial_size.py::test_nrg_thresholding_tightens_vs_max_and_is_optin`.
+
+**Empirical sweep (June 2026, PICAST 5k-frame snippet, full FOV, `sigma=3`,
+`min_pixel=70` so the acceptance floor tracks the smaller footprints; K≈177
+throughout). Decision metric = `corr(C, C+YrA)` mean/top30 (purity proxy) at
+matched K:** `max@0.1` 0.850/0.890 (npix 288) · `nrg@0.99` 0.860/0.894 (243) ·
+**`nrg@0.95` 0.871/0.899 (159) ← top30-purity peak** · `nrg@0.90` 0.875/0.897
+(112) · `nrg@0.8` 0.873/0.875 (68) · `nrg@0.7` 0.868/0.885 (43) · `nrg@0.6`
+0.862/0.882 (28). Conclusions: **nrg beats max** (smaller footprints AND higher
+purity, no cell loss); the purity curve **peaks at nrg≈0.95** then declines
+(below ~0.90 you over-tighten — footprints clip real signal, fall below
+`min_pixel`, get rejected — accepted count collapsed 163→85→15→0 over
+0.95→0.8→0.7→0.6); 0.95–0.90 brackets the physical soma area (≈π·(2σ)²≈113 px at
+σ=3); and **nrg > the radius cap** (adaptive per-footprint IQR spread vs the
+cap's pinned ≈[102,112], and higher purity). Recommended dense-FOV config:
+`spatial_thr_method="nrg"`, `spatial_nrg_thr=0.95`, `min_pixel` retuned down.
+Reproduce: `live_runs/nrg_compare.py [levels...]` (incremental panels +
+side-by-side).
+
+⚠️ **GOTCHA — `spatial_max_radius_factor` collides with `min_pixel`.** In that
+run `K_accepted` went **116 → 0**: shrinking footprints to a 109-px median put
+every one below `min_pixel=211` (which the tuner had calibrated for the *sprawled*
+~280-px footprints), so the auto-eval rejected all of them. **If you enable the
+radius cap, retune `min_pixel` down accordingly** (here ~60–90). This is an
+expected interaction, not a bug — the acceptance floor must track the new
+footprint scale. `max_radius_factor=2.0` is aggressive (binds on essentially all
+footprints at `sigma=3`); try 2.5–3.0 to clip only the sprawled ones.
+Reproduce: `live_runs/spatial_size_snippet_check.py`.
+
 ### Streaming `Y.T @ A` projections are threaded (`n_jobs`)
 The two zarr/streaming projection loops — `BackgroundSubtractor.project_onto`
 (final `YrA`) and the strided-init full-T trace recovery in `pipeline.fit_extract`

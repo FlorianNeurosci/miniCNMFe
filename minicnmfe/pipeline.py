@@ -367,6 +367,40 @@ class CNMFeParams:
     # Set ``0.0`` to disable (recovers pre-change behaviour, e.g. for
     # dendritic imaging where non-circular footprints are expected).
     spatial_circular_max_dist_factor: float = 1.5
+    # [NON-STANDARD; dense-FOV footprint tightening] Multiplier on the per-pixel
+    # LASSO penalty in update_spatial: lam = spatial_lambda_scale * 0.5 * sn_p *
+    # sqrt(max_energy) / T. ``1.0`` (default) = standard CNMF-E. ``>1`` raises
+    # the threshold a pixel's C_k·y must clear to be nonzero, so footprints come
+    # out tighter **at the regression source** rather than only via the post-hoc
+    # ``spatial_max_thr`` zeroing — the principled knob for dense FOVs where
+    # footprints sprawl into neighbours (~1.5 a good starting point). 1.0 leaves
+    # results bit-for-bit unchanged.
+    spatial_lambda_scale: float = 1.0
+    # [NON-STANDARD; dense-FOV footprint tightening] Cap the circular-constraint
+    # clip radius (in threshold_footprint) at ``spatial_max_radius_factor *
+    # sigma`` px. The default circular constraint derives its radius from the
+    # footprint's own area, so once a footprint sprawls its radius grows too and
+    # the constraint stops biting; this adds an absolute physical-radius cap that
+    # still clips bloated footprints. ``0.0`` (default) = off (area-derived only,
+    # bit-for-bit). ~2.0 recommended for dense/long recordings.
+    spatial_max_radius_factor: float = 0.0
+    # [CaImAn thr_method] How threshold_footprint zeroes faint pixels.
+    # ``"nrg"`` (DEFAULT) = energy thresholding: keep the brightest pixels whose
+    # summed a² reaches ``spatial_nrg_thr`` of the total. ``"max"`` = peak-relative
+    # (drop below spatial_max_thr * peak, the legacy behaviour). Energy
+    # thresholding drops dim skirts more cleanly (squaring discounts them), so it
+    # tightens low-contrast / sprawled footprints that "max" keeps — the
+    # shape-aware footprint-size control. Validated on a real dense FOV: at matched
+    # K it gives smaller, better-separated footprints AND higher trace purity than
+    # "max" (corr(C,C+YrA) 0.850->0.871), optimum ~0.95 (live_runs/nrg_compare.py).
+    # NOTE the threshold_footprint() *function* default stays "max" (only this
+    # CNMFeParams field defaults to nrg) — direct callers/tests are unaffected.
+    spatial_thr_method: str = "nrg"
+    # Energy fraction retained when spatial_thr_method="nrg". ``0.95`` (default) is
+    # the validated sweet spot; higher (->0.9999, CaImAn's loose value) keeps more
+    # of the skirt, lower (~0.90) tightens further but past ~0.90 over-tightens
+    # (footprints clip real signal and fall below min_pixel). Ignored for "max".
+    spatial_nrg_thr: float = 0.95
 
     # --- Temporal update / deconvolution ---
     ar_order: int = 1
@@ -1659,6 +1693,11 @@ class CNMFe:
                 circular_max_dist_factor=p.spatial_circular_max_dist_factor,
                 spatial_ridge=p.spatial_ridge,
                 spatial_thread_cap=p.spatial_thread_cap,
+                lambda_scale=p.spatial_lambda_scale,
+                sigma=p.sigma,
+                max_radius_factor=p.spatial_max_radius_factor,
+                thr_method=p.spatial_thr_method,
+                nrg_thr=p.spatial_nrg_thr,
             )
             timer.add("update_spatial", time.perf_counter() - _t)
 

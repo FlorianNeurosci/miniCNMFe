@@ -35,12 +35,23 @@ if TYPE_CHECKING:
 # Spatial constraint helpers
 # ---------------------------------------------------------------------------
 
-def circular_constraint(ai: np.ndarray, max_dist_factor: float = 2.5) -> np.ndarray:
+def circular_constraint(
+    ai: np.ndarray,
+    max_dist_factor: float = 2.5,
+    max_radius: float | None = None,
+) -> np.ndarray:
     """Zero pixels far from the component's centre of mass.
 
     Enforces a roughly circular shape by removing pixels that are more than
     `max_dist_factor * radius` from the centroid, where radius is estimated
     from the component area.
+
+    `max_radius` (optional, in pixels) adds an **absolute** cap on the clip
+    distance: the cutoff becomes `min(max_dist_factor * radius, max_radius)`.
+    The area-derived radius grows with a sprawled footprint, so on its own the
+    constraint barely clips an already-bloated footprint; capping the cutoff at
+    a physical neuron radius (e.g. `factor * sigma`) breaks that feedback loop.
+    `None` (default) keeps the pure area-derived behaviour (bit-for-bit).
     """
     ai = ai.copy()
     total = ai.sum()
@@ -53,8 +64,12 @@ def circular_constraint(ai: np.ndarray, max_dist_factor: float = 2.5) -> np.ndar
     area = (ai > 0).sum()
     radius = np.sqrt(area / np.pi)
 
+    cutoff = radius * max_dist_factor
+    if max_radius is not None:
+        cutoff = min(cutoff, float(max_radius))
+
     dist = np.sqrt((rows - cy) ** 2 + (cols - cx) ** 2)
-    ai[dist > radius * max_dist_factor] = 0.0
+    ai[dist > cutoff] = 0.0
     return ai
 
 

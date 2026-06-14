@@ -66,7 +66,7 @@ if _HAS_NUMBA:
     @njit(parallel=True, cache=True, fastmath=False)
     def _spatial_cd_kernel(
         C, Y_block, sn_block, supp_idx, supp_off, T, max_iter, tol, ridge,
-        out_coef, out_iter, out_ran, out_unconv, out_active,
+        lambda_scale, out_coef, out_iter, out_ran, out_unconv, out_active,
     ):  # pragma: no cover - compiled
         n = Y_block.shape[0]
         for i in prange(n):
@@ -101,7 +101,7 @@ if _HAS_NUMBA:
                 if gram[a, a] > max_energy:
                     max_energy = gram[a, a]
             me = max_energy if max_energy > 1e-10 else 1e-10
-            lam = 0.5 * sn_block[i] * math.sqrt(me) / T
+            lam = lambda_scale * 0.5 * sn_block[i] * math.sqrt(me) / T
             if lam == 0.0:
                 continue
             alpha = lam * T
@@ -165,7 +165,7 @@ def _materialize_slab(Y_flat, sn, bs, be):
 
 
 def _spatial_numba_update(Y_flat, C, support, sn, T, n_pixels, n_jobs,
-                          max_iter, tol, ridge, n_workers):
+                          max_iter, tol, ridge, n_workers, lambda_scale=1.0):
     """Per-pixel CD via the numba kernel, with THREADED slab materialization.
 
     The dominant cost on real (mean_active~2) data is not the CD but the
@@ -224,7 +224,7 @@ def _spatial_numba_update(Y_flat, C, support, sn, T, n_pixels, n_jobs,
 
             _spatial_cd_kernel(
                 C64, Y_block, sn_block, supp_idx, supp_off, int(T),
-                int(max_iter), float(tol), float(ridge),
+                int(max_iter), float(tol), float(ridge), float(lambda_scale),
                 out_coef, out_iter, out_ran, out_unconv, out_active,
             )
 
@@ -277,6 +277,7 @@ def _spatial_pixel_batch(
     max_iter: int = 1000,
     tol: float = 1e-4,
     ridge: float = 1e-2,
+    lambda_scale: float = 1.0,
 ) -> tuple[list[tuple[int, int, float]], tuple[int, int, int, int, int]]:
     """Process one contiguous batch of pixels.
 
@@ -300,6 +301,13 @@ def _spatial_pixel_batch(
             iterations and may hit ``max_iter``. The coefficient shrinkage it
             introduces is ~``ridge`` (≈1% at the default), negligible and
             confined to the degenerate components it stabilises.
+        lambda_scale: Multiplier on the per-pixel L1 penalty
+            ``lam = lambda_scale * 0.5 * sn_p * sqrt(max_energy) / T``. ``1.0``
+            (default) is standard CNMF-E. ``>1`` raises the threshold a pixel's
+            ``C_k·y`` must clear to be nonzero, so footprints come out tighter at
+            the regression source (rather than only via post-hoc ``max_thr``
+            zeroing) — useful for dense FOVs where footprints sprawl into
+            neighbours.
 
     Returns:
         Tuple of (results, stats):
@@ -356,7 +364,7 @@ def _spatial_pixel_batch(
             # Xy / coef arrays, n_active typically 1-5).
             gram = np.ascontiguousarray(C_active @ C_active.T, dtype=np.float64)
             max_energy = float(np.max(np.diag(gram))) if gram.size > 0 else 1.0
-            lam = 0.5 * sn_p * np.sqrt(max(max_energy, 1e-10)) / T
+            lam = lambda_scale * 0.5 * sn_p * np.sqrt(max(max_energy, 1e-10)) / T
             if lam == 0:
                 continue
 
@@ -446,6 +454,10 @@ def threshold_footprint(
     max_thr: float = 0.1,
     closing_radius: int = 1,
     circular_max_dist_factor: float = 1.5,
+    sigma: float | None = None,
+    max_radius_factor: float = 0.0,
+    thr_method: str = "max",
+    nrg_thr: float = 0.9999,
 ) -> np.ndarray:
     """Post-process a single spatial footprint to enforce compactness.
 
@@ -476,6 +488,23 @@ def threshold_footprint(
             ``1.5`` (default) is tighter than the greedy-init factor
             because post-BCD-refinement the footprint shape is known
             better — a generous factor lets thin tendrils survive.
+        sigma: Estimated neuron radius (px). Only used together with
+            ``max_radius_factor`` to set the absolute circular-constraint cap.
+        max_radius_factor: NON-STANDARD. When ``> 0`` (and ``sigma`` is given),
+            cap the circular-constraint clip distance at
+            ``max_radius_factor * sigma`` px — an absolute physical bound on
+            footprint radius that, unlike the area-derived radius, still bites
+            once a footprint has sprawled. ``0`` (default) disables (bit-for-bit).
+        thr_method: How step 2 zeroes faint pixels. ``"max"`` (default) =
+            peak-relative (drop below ``max_thr * peak``, the original
+            behaviour). ``"nrg"`` = energy thresholding (CaImAn
+            ``thr_method='nrg'``): keep the brightest pixels whose summed
+            ``a²`` reaches ``nrg_thr`` of the total. Energy thresholding drops
+            dim skirts more cleanly (squaring discounts them), so it tightens
+            low-contrast / sprawled footprints that ``"max"`` keeps.
+        nrg_thr: Fraction of total footprint energy to retain when
+            ``thr_method='nrg'``. ``0.9999`` (default, CaImAn's loose value)
+            drops only the faintest pixels; tightening lives at ~0.90–0.97.
 
     Returns:
         Cleaned footprint, same shape as ai.
@@ -489,7 +518,25 @@ def threshold_footprint(
     if ai2d.max() == 0:
         return np.zeros(H * W, dtype=np.float32)
 
-    ai2d[ai2d < max_thr * ai2d.max()] = 0.0
+    if thr_method == "nrg":
+        # Energy thresholding (CaImAn thr_method='nrg'): keep the smallest set of
+        # brightest pixels whose summed L2 energy (Σ a²) reaches nrg_thr of the
+        # total, zero the rest. Squaring discounts the dim skirt, so it is
+        # dropped cleanly — unlike the peak-relative ``max_thr`` step, which
+        # keeps a low-contrast (sprawled) footprint's broad skirt.
+        flat = ai2d.ravel().copy()
+        order = np.argsort(flat)[::-1]
+        csum = np.cumsum(flat[order] ** 2)
+        total = float(csum[-1])
+        if total > 0:
+            cutoff = int(np.searchsorted(csum, nrg_thr * total))
+            cutoff = min(cutoff, flat.size - 1)
+            keep = np.zeros(flat.size, dtype=bool)
+            keep[order[: cutoff + 1]] = True
+            flat[~keep] = 0.0
+            ai2d = flat.reshape(H, W)
+    else:
+        ai2d[ai2d < max_thr * ai2d.max()] = 0.0
 
     if closing_radius > 0:
         # Run the largest-CC selection against the *closed* binary mask, so
@@ -519,8 +566,19 @@ def threshold_footprint(
     if circular_max_dist_factor > 0 and (ai2d > 0).any():
         # Imported locally to avoid an import cycle with `initialization`.
         from minicnmfe.initialization import circular_constraint
+        # Absolute radius cap (in px) from the physical neuron-size prior. The
+        # area-derived radius grows with a sprawled footprint, so without this
+        # cap the constraint barely clips already-bloated footprints in dense
+        # FOVs; `factor * sigma` bounds the clip distance to a fixed physical
+        # radius. None = off (pure area-derived, bit-for-bit).
+        max_radius = (
+            float(max_radius_factor) * float(sigma)
+            if (max_radius_factor > 0 and sigma)
+            else None
+        )
         ai2d = circular_constraint(
             ai2d, max_dist_factor=float(circular_max_dist_factor),
+            max_radius=max_radius,
         )
 
     return ai2d.ravel().astype(np.float32)
@@ -535,6 +593,10 @@ def _threshold_one_component(
     max_thr: float,
     closing_radius: int,
     circular_max_dist_factor: float,
+    sigma: float | None = None,
+    max_radius_factor: float = 0.0,
+    thr_method: str = "max",
+    nrg_thr: float = 0.9999,
 ) -> tuple[int, np.ndarray, np.ndarray]:
     """Build + clean one component's footprint. Module-level for joblib.
 
@@ -547,6 +609,8 @@ def _threshold_one_component(
     ai_flat = threshold_footprint(
         ai_flat, dims, max_thr=max_thr, closing_radius=closing_radius,
         circular_max_dist_factor=circular_max_dist_factor,
+        sigma=sigma, max_radius_factor=max_radius_factor,
+        thr_method=thr_method, nrg_thr=nrg_thr,
     )
     nz = np.where(ai_flat > 0)[0]
     return k, nz, ai_flat[nz]
@@ -571,6 +635,11 @@ def update_spatial(
     circular_max_dist_factor: float = 1.5,
     spatial_ridge: float = 1e-2,
     spatial_thread_cap: int = _SPATIAL_THREAD_CAP,
+    lambda_scale: float = 1.0,
+    sigma: float | None = None,
+    max_radius_factor: float = 0.0,
+    thr_method: str = "max",
+    nrg_thr: float = 0.9999,
 ) -> sp.csc_matrix:
     """Refine spatial footprints by per-pixel non-negative LASSO regression.
 
@@ -615,6 +684,20 @@ def update_spatial(
             the GIL instead of helping (observed ~1 effective core at
             ``n_jobs=256``). The effective worker count is
             ``min(n_jobs, spatial_thread_cap)``. Does not affect the serial path.
+        lambda_scale: Multiplier on the per-pixel LASSO penalty (forwarded to
+            the CD). ``1.0`` (default) = standard; ``>1`` yields tighter
+            footprints at the regression source. See ``_spatial_pixel_batch``.
+        sigma: Estimated neuron radius (px); forwarded to ``threshold_footprint``
+            for the absolute circular-constraint cap (only used with
+            ``max_radius_factor``).
+        max_radius_factor: When ``> 0`` (and ``sigma`` given), cap each
+            footprint's circular-constraint radius at ``max_radius_factor *
+            sigma`` px. ``0`` (default) disables. Helps dense/long FOVs where
+            footprints sprawl past their area-derived radius.
+        thr_method: ``"max"`` (default, peak-relative) or ``"nrg"`` (energy
+            thresholding); forwarded to ``threshold_footprint``.
+        nrg_thr: Energy fraction retained when ``thr_method='nrg'`` (default
+            ``0.9999``). See ``threshold_footprint``.
 
     Returns:
         A_new: Updated sparse (H*W, K) footprints.
@@ -646,6 +729,7 @@ def update_spatial(
                 max_iter,
                 tol,
                 spatial_ridge,
+                lambda_scale,
             )
             for start, end in batches
         ]
@@ -666,7 +750,7 @@ def update_spatial(
         spatial_path = f"numba x{n_workers} (slab-parallel)"
         all_results, totals = _spatial_numba_update(
             Y_flat, C, support, sn, T, n_pixels, n_jobs,
-            max_iter, tol, spatial_ridge, n_workers,
+            max_iter, tol, spatial_ridge, n_workers, lambda_scale,
         )
     else:
         from joblib import Parallel, delayed, effective_n_jobs
@@ -708,6 +792,7 @@ def update_spatial(
                     max_iter,
                     tol,
                     spatial_ridge,
+                    lambda_scale,
                 )
                 for start, end in batches
             )
@@ -758,6 +843,7 @@ def update_spatial(
             _threshold_one_component(
                 k, pixel_ids[k], values[k], n_pixels, dims,
                 max_thr, closing_radius, circular_max_dist_factor,
+                sigma, max_radius_factor, thr_method, nrg_thr,
             )
             for k in ks
         ]
@@ -770,6 +856,7 @@ def update_spatial(
                 delayed(_threshold_one_component)(
                     k, pixel_ids[k], values[k], n_pixels, dims,
                     max_thr, closing_radius, circular_max_dist_factor,
+                    sigma, max_radius_factor, thr_method, nrg_thr,
                 )
                 for k in ks
             )

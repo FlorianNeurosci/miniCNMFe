@@ -85,7 +85,7 @@ def model_quality(model) -> dict:
     if K == 0:
         q.update(K_accepted=0, accepted_frac=0.0,
                  cprojcorr_mean=float("nan"), cprojcorr_median=float("nan"),
-                 npix_median=0.0, npix_iqr=0.0,
+                 npix_median=0.0, npix_iqr=0.0, npix_p25=0.0,
                  multipeak_frac=float("nan"), npix_oversize=float("nan"),
                  snr_mean=float("nan"), snr_median=float("nan"),
                  trace_corr_median=float("nan"))
@@ -132,6 +132,10 @@ def model_quality(model) -> dict:
     npix = np.diff(A_csc.indptr)
     q["npix_median"] = float(np.median(npix))
     q["npix_iqr"] = float(np.percentile(npix, 75) - np.percentile(npix, 25))
+    # 25th-pct realized footprint area — the tuner uses this as min_pixel (a floor
+    # that flags the smallest ~quarter of footprints), now measured on the actual
+    # (nrg-thresholded) BCD footprints rather than greedy-init footprints.
+    q["npix_p25"] = float(np.percentile(npix, 25))
 
     # Over-merge signals. ``multipeak_frac`` (fraction of accepted footprints
     # with >=2 distinct soma-scale peaks) is the direct signature of sigma too
