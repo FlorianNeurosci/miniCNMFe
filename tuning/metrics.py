@@ -71,13 +71,63 @@ def _per_cell_corr(C: np.ndarray, Cproj: np.ndarray) -> np.ndarray:
     return out
 
 
-def model_quality(model) -> dict:
+def per_cell_spatial_corr(A, cn: np.ndarray, dims, pad: int = 4) -> np.ndarray:
+    """Per-component cn-patch proxy for spatial fidelity.
+
+    For each footprint, Pearson r between the footprint values and the local
+    correlation image, over a bounding box (footprint extent + ``pad`` surround).
+    The surround is what gives a clean single-cell footprint a high score (its
+    "bright blob on dark edge" matches the local CORR hotspot) while a merged /
+    sprawled footprint spanning several CORR spots scores low. Cheap (no movie) —
+    the per-candidate proxy for the faithful ``evaluate.spatial_r_values``.
+
+    Args:
+        A: (H*W, K) sparse/dense footprints (pixel order h*W + w).
+        cn: (H, W) correlation image, SAME coords as ``A`` (crop it to the
+            candidate's region first if A is crop-local).
+        dims: (H, W).
+        pad: surround in px added around each footprint's bbox.
+
+    Returns: (K,) float r in [-1, 1] (0 if degenerate / empty footprint).
+    """
+    A_csc = A.tocsc() if sp.issparse(A) else sp.csc_matrix(A)
+    H, W = dims
+    K = A_csc.shape[1]
+    cn = np.nan_to_num(np.asarray(cn, dtype=np.float64))
+    r = np.full(K, np.nan)
+    for k in range(K):
+        s, e = A_csc.indptr[k], A_csc.indptr[k + 1]
+        if s == e:
+            continue
+        rows = A_csc.indices[s:e]
+        vals = A_csc.data[s:e].astype(np.float64)
+        ys, xs = rows // W, rows % W
+        y0, y1 = max(0, int(ys.min()) - pad), min(H, int(ys.max()) + 1 + pad)
+        x0, x1 = max(0, int(xs.min()) - pad), min(W, int(xs.max()) + 1 + pad)
+        fp = np.zeros((y1 - y0, x1 - x0), dtype=np.float64)
+        fp[ys - y0, xs - x0] = vals
+        cbox = cn[y0:y1, x0:x1].ravel()
+        fpv = fp.ravel()
+        if fpv.std() > 0 and cbox.std() > 0:
+            r[k] = float(np.corrcoef(fpv, cbox)[0, 1])
+        else:
+            r[k] = 0.0
+    return r
+
+
+def model_quality(model, cn: "np.ndarray | None" = None) -> dict:
     """Flat dict of quality proxies for a fitted ``CNMFe`` model.
 
     Keys: ``K``, ``K_accepted``, ``accepted_frac``, ``cprojcorr_mean``,
     ``cprojcorr_median``, ``npix_median``, ``npix_iqr``, ``multipeak_frac``,
-    ``npix_oversize``, ``snr_mean``, ``snr_median``. Guards the K==0 / unfitted
-    cases (returns 0 / NaN).
+    ``npix_oversize``, ``snr_mean``, ``snr_median``, ``spatialcorr_median``.
+    Guards the K==0 / unfitted cases (returns 0 / NaN).
+
+    ``cn`` (optional, SAME coords as ``model.A``) enables the spatial-fidelity
+    proxy ``spatialcorr_median`` (median footprint↔local-CORR correlation; see
+    ``per_cell_spatial_corr``) — the term that lets the sweep prefer compact
+    single-cell footprints over merged large-sigma blobs (which the temporal
+    ``cprojcorr`` cannot distinguish). ``None`` → ``spatialcorr_median`` is NaN.
     """
     A = model.A
     K = int(A.shape[1]) if A is not None else 0
@@ -88,7 +138,7 @@ def model_quality(model) -> dict:
                  npix_median=0.0, npix_iqr=0.0, npix_p25=0.0,
                  multipeak_frac=float("nan"), npix_oversize=float("nan"),
                  snr_mean=float("nan"), snr_median=float("nan"),
-                 trace_corr_median=float("nan"))
+                 trace_corr_median=float("nan"), spatialcorr_median=float("nan"))
         return q
 
     # Accepted fraction (auto-eval; may be unset).
@@ -161,6 +211,14 @@ def model_quality(model) -> dict:
         q["snr_median"] = float(np.median(snr))
     else:
         q["snr_mean"] = q["snr_median"] = float("nan")
+
+    # Spatial-fidelity proxy (footprint vs local CORR) — drives the ranking so a
+    # merged large-sigma footprint (spanning several CORR spots) is penalised.
+    if cn is not None and dims is not None:
+        sc = per_cell_spatial_corr(A, cn, dims)
+        q["spatialcorr_median"] = float(np.nanmedian(sc)) if sc.size else float("nan")
+    else:
+        q["spatialcorr_median"] = float("nan")
     return q
 
 
@@ -466,28 +524,35 @@ def session_quality_verdict(q: dict, coverage: dict,
 def composite_score(q: dict, weights: "dict | None" = None) -> float:
     """Transparent per-candidate ranking score (NOT an absolute quality claim).
 
-    ``score = w_corr · cprojcorr_median + w_acc · accepted_frac
+    ``score = w_corr · cprojcorr_median + w_spatial · spatialcorr_median
+              + w_acc · accepted_frac
               − w_tight · (npix_iqr / npix_median) − w_merge · multipeak_frac``
 
     K==0 candidates score ``-inf`` (nothing extracted). The default weights
-    favour per-trace purity and a clean accepted set while penalising
-    inconsistent footprint sizes and over-merged (multi-peak) footprints — the
-    latter stops the ranking preferring an over-large ``sigma`` that fuses
-    neighbours into fewer, bigger, deceptively "clean" components. Fully
-    re-derivable from the printed table, so the user can re-rank with their own
-    weights.
+    favour per-trace purity (``cprojcorr``) AND per-footprint spatial fidelity
+    (``spatialcorr`` — footprint vs local CORR) and a clean accepted set, while
+    penalising inconsistent footprint sizes and over-merged (multi-peak)
+    footprints. The spatial term is load-bearing: the temporal ``cprojcorr`` is
+    nearly blind to an over-large ``sigma`` that fuses neighbours into bigger
+    "clean"-looking blobs (validated: cprojcorr ≈ equal at sigma 3 vs 4 while
+    spatialcorr / r_value roughly double), so without it the ranking over-picks
+    the merged large-sigma candidate. ``spatialcorr_median`` is NaN when no
+    ``cn`` was supplied to ``model_quality`` → the term contributes 0 (legacy
+    behaviour). Fully re-derivable from the printed table.
     """
-    w = {"corr": 1.0, "acc": 0.5, "tight": 0.25, "merge": 0.5}
+    w = {"corr": 1.0, "spatial": 1.0, "acc": 0.5, "tight": 0.25, "merge": 0.5}
     if weights:
         w.update(weights)
     if q.get("K", 0) == 0:
         return float("-inf")
     corr = q.get("cprojcorr_median", 0.0)
     corr = 0.0 if (corr is None or np.isnan(corr)) else corr
+    spatial = q.get("spatialcorr_median", 0.0)
+    spatial = 0.0 if (spatial is None or np.isnan(spatial)) else spatial
     acc = q.get("accepted_frac", 0.0) or 0.0
     npix_med = q.get("npix_median", 0.0) or 0.0
     tight = (q.get("npix_iqr", 0.0) or 0.0) / npix_med if npix_med > 0 else 0.0
     multipeak = q.get("multipeak_frac", 0.0)
     multipeak = 0.0 if (multipeak is None or np.isnan(multipeak)) else multipeak
-    return float(w["corr"] * corr + w["acc"] * acc
+    return float(w["corr"] * corr + w["spatial"] * spatial + w["acc"] * acc
                  - w["tight"] * tight - w["merge"] * multipeak)

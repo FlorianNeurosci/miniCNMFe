@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
+from minicnmfe.evaluate import spatial_r_values
 from minicnmfe.io import open_zarr, open_zarr_pixel_major, transpose_zarr_to_pixel_major
 from minicnmfe.pipeline import CNMFe, CNMFeParams
 from minicnmfe.preprocess import correlation_pnr
@@ -193,7 +194,7 @@ def tune_then_validate(cfg, *, validate: bool = True, lowthr: bool = True,
 
 
 def _diagnostics(model, cn, sample, run_dir, *, with_shifts=True,
-                 pnr=None, sigma=None, min_corr=None, min_pnr=None):
+                 pnr=None, sigma=None, min_corr=None, min_pnr=None, r_values=None):
     """Write the standard diagnostic figure set for one fitted model."""
     figs = run_dir / "figs"
     figs.mkdir(parents=True, exist_ok=True)
@@ -201,6 +202,8 @@ def _diagnostics(model, cn, sample, run_dir, *, with_shifts=True,
         R.fig_sweep_footprints(model, cn, out_path=figs / "footprints_on_corr.png")
         R.fig_sweep_traces(model, out_path=figs / "traces.png", n=12)
         R.fig_npix_accepted(model, out_path=figs / "npix_dist.png")
+        R.fig_cell_consistency(model, cn, r_values=r_values,
+                               out_path=figs / "cell_consistency.png")
         if pnr is not None and sigma is not None:
             R.fig_blob_coverage(model, cn, pnr, sigma, min_corr=min_corr,
                                 min_pnr=min_pnr, out_path=figs / "blob_coverage.png")
@@ -291,9 +294,17 @@ def validate_session(
             model.shifts = shifts
         run_dir = out_dir / f"run_{label}"
         model.save(run_dir)
+        # Faithful per-cell spatial fidelity on the FULL extraction (gold-standard
+        # CaImAn-style r_value: footprint vs the data at the cell's peak frames).
+        rvals = None
+        if model.A is not None and model.A.shape[1] > 0:
+            rvals = spatial_r_values(model.A, np.asarray(model.C), yf, model.dims)
+            np.save(run_dir / "r_values.npy", rvals)
         _diagnostics(model, cn, sample, run_dir, pnr=pnr, sigma=grid.sigma,
-                     min_corr=mcorr, min_pnr=mpnr)
-        q = model_quality(model)
+                     min_corr=mcorr, min_pnr=mpnr, r_values=rvals)
+        q = model_quality(model, cn=cn)
+        if rvals is not None and rvals.size:
+            q["rvalue_median"] = float(np.nanmedian(rvals))
         cov = blob_coverage(model, cn, pnr, grid.sigma,
                             min_corr=mcorr, min_pnr=mpnr)
         verdict = session_quality_verdict(q, cov)
@@ -306,6 +317,8 @@ def validate_session(
             f"{label}: min_corr={mcorr} min_pnr={mpnr}\n"
             f"K={q['K']} accepted={q['K_accepted']} ({q['accepted_frac']:.2f})\n"
             f"cprojcorr median={q['cprojcorr_median']:.3f}  "
+            f"spatialcorr median={q.get('spatialcorr_median', float('nan')):.3f}  "
+            f"r_value median={q.get('rvalue_median', float('nan')):.3f}\n"
             f"trace_corr median={q['trace_corr_median']:.3f}  "
             f"npix median/IQR={q['npix_median']:.0f}/{q['npix_iqr']:.0f}  "
             f"SNR median={q['snr_median']:.1f}\n"
@@ -324,7 +337,8 @@ def validate_session(
 
     # --- comparison table ---
     cols = ["label", "min_corr", "min_pnr", "K", "K_accepted", "accepted_frac",
-            "cprojcorr_median", "trace_corr_median", "blob_recall",
+            "cprojcorr_median", "spatialcorr_median", "rvalue_median",
+            "trace_corr_median", "blob_recall",
             "footprint_precision", "npix_median", "npix_iqr", "snr_median",
             "status", "wall_s"]
     lines = ["# Full-recording validation — threshold comparison", "",

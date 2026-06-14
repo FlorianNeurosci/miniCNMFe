@@ -3,7 +3,7 @@
 import numpy as np
 import scipy.sparse as sp
 
-from minicnmfe.evaluate import auto_evaluate_components
+from minicnmfe.evaluate import auto_evaluate_components, spatial_r_values
 
 
 def _disk_footprint(H: int, W: int, cy: int, cx: int,
@@ -95,3 +95,33 @@ class TestAutoEvaluateComponents:
             # SNR statistic should be ~constant across scales
             np.testing.assert_allclose(info["snr_amp"][0], (1.0 / 0.3) ** 2, rtol=1e-4)
             assert keep.tolist() == [True]
+
+
+class TestSpatialRValues:
+    def test_real_cell_high_noise_cell_low(self):
+        """A footprint whose pixels co-fluctuate with its trace scores high r;
+        a footprint over noise (uncorrelated with its trace) scores ~0."""
+        H = W = 24
+        T = 400
+        rng = np.random.default_rng(0)
+        yy, xx = np.indices((H, W))
+        g = np.exp(-(((yy - 12) ** 2 + (xx - 12) ** 2) / (2 * 3.0 ** 2))).ravel()
+        trace = np.clip(rng.standard_normal(T), 0, None)
+        trace[::20] += 5.0  # transients
+        movie = np.outer(g, trace) + 0.1 * rng.standard_normal((H * W, T))
+        noise_fp = (rng.random(H * W) < 0.02).astype(np.float32)
+        A = sp.csc_matrix(np.stack([g.astype(np.float32), noise_fp], axis=1))
+        C = np.stack([trace, rng.standard_normal(T)])
+
+        r = spatial_r_values(A, C, movie, (H, W))
+        assert r[0] > 0.5
+        assert r[0] > r[1]
+        assert abs(r[1]) < 0.3
+
+    def test_empty_footprint_is_nan(self):
+        H = W = 16
+        A = sp.csc_matrix((H * W, 1), dtype=np.float32)  # no pixels
+        C = np.ones((1, 50), dtype=np.float32)
+        movie = np.zeros((H * W, 50), dtype=np.float32)
+        r = spatial_r_values(A, C, movie, (H, W))
+        assert np.isnan(r[0])

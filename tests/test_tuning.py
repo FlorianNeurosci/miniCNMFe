@@ -633,3 +633,32 @@ def test_tune_cli_batch_dry_run(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert "per-session plan" in proc.stdout
     assert "--validate" in proc.stdout               # consolidated tune+validate call
+
+
+def test_per_cell_spatial_corr_and_score():
+    """cn-proxy: a footprint matching the local CORR scores high, a footprint over
+    flat/background CORR scores low; and composite_score rewards higher spatialcorr."""
+    import scipy.sparse as sp
+    from tuning.metrics import per_cell_spatial_corr, composite_score
+
+    H = W = 24
+    yy, xx = np.indices((H, W))
+    g = np.exp(-(((yy - 12) ** 2 + (xx - 12) ** 2) / (2 * 3.0 ** 2)))
+    cn = g.astype(np.float32)  # CORR hotspot exactly where the cell is
+    # cell 0: footprint == the hotspot; cell 1: footprint off in a flat corner
+    fp0 = (g > 0.2).astype(np.float32).ravel() * g.ravel()
+    fp1 = np.zeros(H * W, np.float32)
+    fp1[:9] = 1.0  # 3x3 block at (0,0) where cn≈0
+    A = sp.csc_matrix(np.stack([fp0, fp1], axis=1))
+    sc = per_cell_spatial_corr(A, cn, (H, W))
+    assert sc[0] > 0.5 and sc[0] > sc[1]
+
+    # composite_score: same q but higher spatialcorr_median -> higher score
+    base = dict(K=10, cprojcorr_median=0.8, accepted_frac=0.7,
+                npix_median=100.0, npix_iqr=20.0, multipeak_frac=0.3)
+    hi = composite_score({**base, "spatialcorr_median": 0.6})
+    lo = composite_score({**base, "spatialcorr_median": 0.2})
+    assert hi > lo
+    # missing spatialcorr (NaN) contributes 0 (legacy behaviour), not a crash
+    none = composite_score({**base, "spatialcorr_median": float("nan")})
+    assert none == composite_score({**base})

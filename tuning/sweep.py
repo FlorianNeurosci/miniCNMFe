@@ -234,7 +234,13 @@ def _run_one_candidate(args) -> dict:
                 model = _fit_candidate(params, mc_zarr_path, region_crop, workdir)
         else:
             model = _fit_candidate(params, mc_zarr_path, region_crop, workdir)
-        q = model_quality(model)
+        # cn restricted to the candidate's (crop-local) coords so the spatial
+        # fidelity proxy aligns with the cutout-fit footprints.
+        cn_local = cn_full
+        if cn_full is not None and region_crop is not None:
+            (cy0, cy1, cx0, cx1), _t = region_crop
+            cn_local = cn_full[cy0:cy1, cx0:cx1]
+        q = model_quality(model, cn=cn_local)
         row = {"idx": idx, "error": None, "wall_s": time.time() - t0}
         row.update(swept)
         row.update(q)

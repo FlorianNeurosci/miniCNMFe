@@ -342,13 +342,11 @@ def fig_sweep_scatter(rows, out_path=None):
 
 
 def fig_sweep_footprints(model, cn, out_path=None, region_crop=None, max_img=None):
-    """Footprint contours over the candidate's backdrop(s).
+    """Footprint contours over the CORR image thresholded at ``min_corr``.
 
-    Backdrop = the CORR image thresholded at the candidate's ``min_corr``. When
-    ``max_img`` (the full-FOV max projection of the data) is given, a second panel
-    overlays the **same** contours on that max projection — the "frame the video saw",
-    where 1p cells pop far better than the mean. ``cn``/``max_img`` are full-FOV and
-    ``region_crop`` offsets the crop-local contours onto them.
+    Single panel (CORR only). ``cn`` is full-FOV; ``region_crop`` offsets the
+    crop-local contours onto it. ``max_img`` is accepted-but-ignored (the old
+    max-projection panel was dropped — see body comment: it misleads on 1p data).
     """
     import matplotlib.pyplot as plt
 
@@ -378,28 +376,21 @@ def fig_sweep_footprints(model, cn, out_path=None, region_crop=None, max_img=Non
             ax.contour(xs, ys, fp, levels=[0.3 * fp.max()], colors=col, linewidths=0.7)
 
     vmin = float(getattr(model.params, "min_corr", 0.0) or 0.0)
-    panels = 2 if max_img is not None else 1
-    fig, axes = plt.subplots(1, panels, figsize=(8 * panels, 8))
-    axes = np.atleast_1d(axes)
+    # CORR-only: the max-projection panel was dropped — on 1p data the max/mean
+    # projection is dominated by static background/vasculature, not the transient
+    # cells, so footprints correctly on cells look "off the bright stuff". CORR
+    # (pixels temporally correlated with neighbours) is where cells actually are.
+    # ``max_img`` is accepted-but-ignored for caller back-compat.
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
 
-    # Panel 0: CORR thresholded at min_corr (background below threshold -> black).
     if cn is not None:
         cn = np.asarray(cn, dtype=np.float32)
         cvmax = np.nanpercentile(cn, 99.7) if np.isfinite(cn).any() else None
         if cvmax is not None:
             cvmax = max(cvmax, vmin + 1e-6)
-        axes[0].imshow(cn, cmap="gray", vmin=vmin, vmax=cvmax)
-        axes[0].set_title(f"footprints over thresholded CORR (vmin={vmin:.2f}) — {K} comps")
-    _draw_contours(axes[0]); axes[0].axis("off")
-
-    # Panel 1 (optional): footprints over the max projection ("video frame").
-    if max_img is not None:
-        m = np.asarray(max_img, dtype=np.float32)
-        mvmax = np.nanpercentile(m, 99.5) if np.isfinite(m).any() else None
-        mvmin = np.nanpercentile(m, 2) if np.isfinite(m).any() else None
-        axes[1].imshow(m, cmap="gray", vmin=mvmin, vmax=mvmax)
-        axes[1].set_title("footprints over the max-projection (video)")
-        _draw_contours(axes[1]); axes[1].axis("off")
+        ax.imshow(cn, cmap="gray", vmin=vmin, vmax=cvmax)
+        ax.set_title(f"footprints over thresholded CORR (vmin={vmin:.2f}) — {K} comps")
+    _draw_contours(ax); ax.axis("off")
 
     fig.tight_layout()
     return _finish(fig, out_path)
@@ -511,6 +502,77 @@ def fig_mc_shifts(shifts, out_path=None):
     ax[1].hist(np.linalg.norm(sh, axis=1), bins=60, color="C0", edgecolor="k")
     ax[1].set_xlabel("|shift| (px)"); ax[1].set_ylabel("frames")
     fig.tight_layout()
+    return _finish(fig, out_path)
+
+
+def fig_cell_consistency(model, cn, *, region_crop=None, r_values=None,
+                         n: int = 12, out_path=None):
+    """Per-cell spatial+temporal sanity montage — the real "is this a cell?" view.
+
+    One row per selected component (a mix of best + worst by combined
+    spatial×temporal score): **[footprint contour over a LOCAL CORR crop | its
+    trace C vs C+YrA]**, titled with the cn-proxy spatial r, the true ``r_value``
+    (when supplied — ``evaluate.spatial_r_values``), and the temporal
+    corr(C, C+YrA). Judges footprint↔activity alignment cell-by-cell instead of a
+    misleading full-FOV static overlay.
+    """
+    import matplotlib.pyplot as plt
+    import scipy.sparse as sp
+    from tuning.metrics import per_cell_spatial_corr, _per_cell_corr
+
+    A = model.A
+    K = A.shape[1] if A is not None else 0
+    if K == 0 or cn is None:
+        fig, ax = plt.subplots(figsize=(6, 2)); ax.axis("off")
+        ax.set_title("no components / no CORR image"); return _finish(fig, out_path)
+
+    H, W = model.dims
+    A_csc = A.tocsc() if sp.issparse(A) else sp.csc_matrix(A)
+    cn = np.nan_to_num(np.asarray(cn, dtype=np.float32))
+    y_off, x_off = 0, 0
+    if region_crop is not None:
+        (y_off, _y1, x_off, _x1), _t = region_crop
+    cn_loc = cn[y_off:y_off + H, x_off:x_off + W]  # align to crop-local footprints
+
+    sc = per_cell_spatial_corr(A_csc, cn_loc, (H, W))
+    C = np.asarray(model.C); YrA = np.asarray(model.YrA)
+    tc = _per_cell_corr(C, C + YrA)
+    rv = None if r_values is None else np.asarray(r_values, dtype=float)
+
+    # combined rank; show the best half + worst half so problems are visible.
+    combined = np.nan_to_num(sc) + np.nan_to_num(tc) + (0 if rv is None else np.nan_to_num(rv))
+    order = np.argsort(-combined)
+    half = max(1, n // 2)
+    pick = list(order[:half]) + list(order[-half:])
+    pick = list(dict.fromkeys(int(k) for k in pick))[:n]
+
+    fig, ax = plt.subplots(len(pick), 2, figsize=(11, 1.9 * len(pick)),
+                           gridspec_kw={"width_ratios": [1, 3]})
+    ax = np.atleast_2d(ax)
+    cvmin, cvmax = np.nanpercentile(cn_loc, 50), np.nanpercentile(cn_loc, 99.7)
+    for i, k in enumerate(pick):
+        col = np.asarray(A_csc.getcol(k).todense()).ravel().reshape(H, W)
+        ys, xs = np.where(col > 0)
+        cy, cx = (int(ys.mean()), int(xs.mean())) if ys.size else (H // 2, W // 2)
+        rr = 20
+        y0, y1 = max(0, cy - rr), min(H, cy + rr)
+        x0, x1 = max(0, cx - rr), min(W, cx + rr)
+        a0 = ax[i, 0]
+        a0.imshow(cn_loc, cmap="gray", vmin=cvmin, vmax=cvmax)
+        if col.max() > 0:
+            a0.contour(np.arange(W), np.arange(H), col,
+                       levels=[0.3 * col.max()], colors="lime", linewidths=1.0)
+        a0.set_xlim(x0, x1); a0.set_ylim(y1, y0); a0.axis("off")
+        rtxt = "" if rv is None else f" r={rv[k]:.2f}"
+        a0.set_title(f"k={k} npix={int((col>0).sum())} cn={sc[k]:.2f}{rtxt} "
+                     f"tcorr={tc[k]:.2f}", fontsize=8)
+        a1 = ax[i, 1]
+        a1.plot(C[k] + YrA[k], color="0.6", lw=0.5)
+        a1.plot(C[k], color="tab:blue", lw=0.6)
+        a1.axis("off")
+    fig.suptitle(f"per-cell consistency — best {half} + worst {half} of {K} "
+                 "(footprint on local CORR | trace)", fontsize=11)
+    fig.tight_layout(rect=[0, 0, 1, 0.99])
     return _finish(fig, out_path)
 
 
@@ -979,6 +1041,28 @@ def write_report(run_dir, result, *, best_model=None, cn=None, pnr=None, max_img
             fig_sweep_traces(best_model, out_path=run_dir / "fig_sweep_traces.png")
             saved["sweep_traces"] = "fig_sweep_traces.png"
 
+            # Per-cell consistency montage. Try the faithful r_value (re-read the
+            # winner's cutout from the source mc.zarr); fall back to the cn-proxy-
+            # only montage if the movie isn't reachable.
+            rvals = None
+            try:
+                src = (result.get("config") or {}).get("input")
+                if src and region_crop is not None and str(src).endswith(".zarr"):
+                    import zarr
+                    from minicnmfe._utils import make_2d
+                    from minicnmfe.evaluate import spatial_r_values
+                    (y0, y1, x0, x1), (t0, t1) = region_crop
+                    z = zarr.open(str(src), mode="r")
+                    cutm = np.asarray(z[t0:t1, y0:y1, x0:x1], dtype=np.float32)
+                    rvals = spatial_r_values(best_model.A, np.asarray(best_model.C),
+                                             make_2d(cutm), best_model.dims)
+            except Exception as exc:  # noqa: BLE001 — montage is best-effort
+                print(f"  (cell-consistency r_value skipped: {exc!r})", flush=True)
+            fig_cell_consistency(best_model, cn, region_crop=region_crop,
+                                 r_values=rvals,
+                                 out_path=run_dir / "fig_cell_consistency.png")
+            saved["cell_consistency"] = "fig_cell_consistency.png"
+
     # recommended_params.json + downsample.json. Serialize the merged CNMFeParams
     # (the long-recording base + the tuner's data-driven fields) so the JSON is a
     # complete param set — and the exact one validated on the full recording.
@@ -1047,8 +1131,8 @@ def _render_md(result, saved, filtered) -> str:
         rows = sweep["rows"]
         cols = ["idx", "sigma", "min_corr", "min_pnr", "merge_thr_corr",
                 "global_bg_rank", "init_stride", "K", "K_accepted",
-                "cprojcorr_median", "npix_median", "multipeak_frac", "npix_oversize",
-                "snr_median", "score", "wall_s"]
+                "cprojcorr_median", "spatialcorr_median", "npix_median",
+                "multipeak_frac", "npix_oversize", "snr_median", "score", "wall_s"]
         L.append("| " + " | ".join(cols) + " |")
         L.append("|" + "|".join("---" for _ in cols) + "|")
         for i, r in enumerate(rows):
@@ -1061,8 +1145,8 @@ def _render_md(result, saved, filtered) -> str:
             line = "| " + " | ".join(cells) + " |"
             L.append(f"**{line}**" if i == 0 else line)
         L.append("")
-        for k in ("sweep_scatter", "sweep_footprints", "sweep_blob_coverage",
-                  "sweep_traces"):
+        for k in ("sweep_scatter", "sweep_footprints", "cell_consistency",
+                  "sweep_blob_coverage", "sweep_traces"):
             if k in saved:
                 L += [f"![]({saved[k]})", ""]
 

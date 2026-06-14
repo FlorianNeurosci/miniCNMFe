@@ -183,9 +183,16 @@ def run_tuning(cfg: TunerConfig) -> dict:
                                            dims, n_jobs=cfg.n_jobs)
     stages["min_pixel"] = ev
 
-    # Grid-unit base params for the sweep / extraction.
+    # Grid-unit base params for the sweep / extraction. min_pixel=1 ON PURPOSE:
+    # during the sweep, accepted_frac (a term in composite_score) must reflect the
+    # scale-INVARIANT SNR discriminator (evaluate.auto_evaluate_components: snr_amp
+    # = ||a||^2/npix over local noise), NOT an absolute pixel floor calibrated at
+    # one sigma — that floor penalises the (correctly tighter) small-sigma
+    # candidates and biased the sweep toward oversized, merged large-sigma
+    # footprints. The final recommended min_pixel is re-derived from the winner's
+    # realized npix_p25 below; min_pixel_ds is kept for the skip-sweep fallback.
     base_grid = replace(base, sigma=float(sigma_ds), min_corr=float(min_corr),
-                        min_pnr=float(min_pnr), min_pixel=int(min_pixel_ds),
+                        min_pnr=float(min_pnr), min_pixel=1,
                         frame_rate_hz=cfg.frame_rate_hz / tsub)
 
     # Defaults (native) from the heuristics; overwritten by sweep-best below.
