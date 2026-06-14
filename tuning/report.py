@@ -346,8 +346,17 @@ def fig_sweep_footprints(model, cn, out_path=None, region_crop=None):
 
     fig, ax = plt.subplots(1, 1, figsize=(8, 8))
     if cn is not None:
-        ax.imshow(cn, cmap="gray")
-        ax.set_title("best-candidate footprints over the CORRELATION image")
+        # Threshold the CORR backdrop at this candidate's min_corr (vmin): the
+        # diffuse sub-threshold background drops to black and only the cell blobs
+        # remain, so the footprint contours are read against the cells they should
+        # cover — not the busy raw correlation speckle. No smoothing (raw cn).
+        cn = np.asarray(cn, dtype=np.float32)
+        vmin = float(getattr(model.params, "min_corr", 0.0) or 0.0)
+        vmax = np.nanpercentile(cn, 99.7) if np.isfinite(cn).any() else None
+        if vmax is not None:
+            vmax = max(vmax, vmin + 1e-6)
+        ax.imshow(cn, cmap="gray", vmin=vmin, vmax=vmax)
+        ax.set_title(f"best-candidate footprints over the thresholded CORR (vmin={vmin:.2f})")
     H, W = model.dims
     # The sweep extracts on a cutout (crop-local coords) but ``cn`` is the full
     # FOV correlation image. Offset the contours by the crop origin so they land
