@@ -120,7 +120,7 @@ class TestDeconvolve:
         bare ``g`` instead of ``g**pool_length``, which over-merged smooth exact-g
         decays and collapsed the trace — a clean AR(1) reconstructed at only
         r~0.4, dropping ``model.C`` vs ground truth from ~0.96 to ~0.58 whenever
-        the ``oasis-deconvolution`` package was absent. This calls the fallback
+        the ``oasis-deconv`` package was absent. This calls the fallback
         directly (so the result is independent of whether the package is
         installed) on a NOISELESS trace, where a correct OASIS returns the input
         almost exactly.

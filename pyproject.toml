@@ -21,14 +21,22 @@ dependencies = [
     "matplotlib >= 3.7",
     "tqdm >= 4.0",
     "opencv-python >= 4.5",
+    # Compiled OASIS AR deconvolution. Without it `minicnmfe/temporal.py` falls
+    # back to a pure-Python PAVA AR(1) solver that is far slower AND gets no
+    # parallelism from the threaded temporal path (the GIL is never released),
+    # so deconvolution runs effectively serial across all K components. Kept in
+    # core deps so a plain `pip install -e .` gets the fast path. Ships as a
+    # prebuilt wheel (no compiler needed).
+    "oasis-deconv",
 ]
 
 [project.optional-dependencies]
 test = ["pytest >= 7.0", "pytest-cov"]
 tutorial = ["jupyter", "matplotlib >= 3.7", "ipywidgets"]
-# Faster OASIS deconvolution. Without it `minicnmfe/temporal.py` falls back to
-# a pure-Python PAVA AR(1) solver (same algorithm, slower for long traces).
-oasis = ["oasis-deconvolution"]
+# Faster OASIS deconvolution (also in core deps; kept as an extra for back-compat).
+# Without it `minicnmfe/temporal.py` falls back to a pure-Python PAVA AR(1) solver
+# (same algorithm, slower for long traces).
+oasis = ["oasis-deconv"]
 # Install cupy matching your CUDA version, e.g.:
 #   pip install cupy-cuda12x   (CUDA 12.x)
 #   pip install cupy-cuda11x   (CUDA 11.x)

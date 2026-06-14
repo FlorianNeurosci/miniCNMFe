@@ -87,7 +87,7 @@ change standard behaviour unless explicitly enabled.
 | Concern | Choice | Notes |
 |---------|--------|-------|
 | Movie storage | zarr v3 | Time-chunked, lazy, random-access |
-| Deconvolution | `oasis-deconvolution` package | Pure-Python PAVA AR(1) fallback if not installed |
+| Deconvolution | `oasis-deconv` package | Pure-Python PAVA AR(1) fallback if not installed |
 | CPU parallelism | `joblib` / `loky` | All parallel workers defined at module level (pickling requirement) |
 | GPU | `cupy` (optional) | `get_xp(device)` in `_utils.py` returns numpy or cupy |
 | Spatial LASSO | `sklearn.linear_model.LassoLars` | CPU-only, no GPU equivalent |
@@ -542,7 +542,7 @@ this is a labeling choice, not a change to the extracted signal.
   strong-cell `corr(C, C+YrA)` from **0.48 → 0.77** (≈ the low-K value) and shrank
   footprint npix median 79→36, at ~30% more runtime; each lever alone gives ~0.70.
 - **Historical caveat (fixed May 2026):** `C` alone used to correlate only ~0.6
-  when the `oasis-deconvolution` package was **not installed** — a bug in the
+  when the `oasis-deconv` package was **not installed** — a bug in the
   pure-Python PAVA fallback (see *Bugs already fixed*), not an inherent OASIS
   limitation. If you see `C` ≈ 0.6 while `C + YrA` ≈ 0.96, you are on old code or
   a regressed fallback.
@@ -907,7 +907,7 @@ after merging.
 
 ### Pure-Python OASIS (PAVA) fallback merge condition
 `temporal.py:_oasis_pava_run` is the deconvolution used when the
-`oasis-deconvolution` package is **not** installed. Its pool-merge test was
+`oasis-deconv` package is **not** installed. Its pool-merge test was
 `pool_val[i] * g > pool_val[i+1]`, but the OASIS boundary constraint
 `c[t] >= g·c[t-1]` requires `pool_val[i] * g**pool_length[i] > pool_val[i+1]`.
 Using bare `g` (correct only for length-1 pools) over-merged smooth exact-`g`
@@ -1042,7 +1042,7 @@ CaImAn-main/                   Reference source only — never import from here 
 pip install -e .
 
 # Optional extras
-pip install oasis-deconvolution          # faster deconvolution
+pip install oasis-deconv          # faster deconvolution
 pip install cupy-cuda12x                 # GPU support (match your CUDA version)
 
 # Tests

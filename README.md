@@ -294,7 +294,7 @@ All algorithms are reimplemented from scratch. The CaImAn repository is used as 
 | GreedyCorr init | `initialization.py:1380` | reimplemented, sequential greedy loop |
 | Spatial update | `spatial.py:29` | `sklearn.linear_model.LassoLars` |
 | Temporal update | `temporal.py:64` | coordinate descent + OASIS package |
-| Deconvolution | `deconvolution.py:16` | `oasis-deconvolution` + pure-Python AR(1) fallback |
+| Deconvolution | `deconvolution.py:16` | `oasis-deconv` + pure-Python AR(1) fallback |
 | Merging | `merging.py:19` | `scipy.sparse` graph connected components |
 | Component eval | `estimates.evaluate_components` | pixel-count + amplitude-SNR filter (`evaluate.py`) |
 
@@ -315,7 +315,7 @@ All algorithms are reimplemented from scratch. The CaImAn repository is used as 
 | `imageio` / `imageio-ffmpeg` | AVI/MP4 reading and writing |
 | `matplotlib` | Plotting (tutorial notebooks) |
 | `tqdm` | Progress bars |
-| `oasis-deconvolution` *(`[oasis]` extra)* | Fast compiled OASIS AR deconvolution |
+| `oasis-deconv` *(`[oasis]` extra)* | Fast compiled OASIS AR deconvolution |
 | `cupy` *(`[gpu]` extra)* | GPU acceleration |
 | `pytest`, `pytest-cov` *(`[test]` extra)* | Test runner |
 | `jupyter`, `ipywidgets` *(`[tutorial]` extra)* | Demo notebooks |

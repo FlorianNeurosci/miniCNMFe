@@ -16,7 +16,7 @@ pip install -e ".[test]"
 
 Requires Python ≥ 3.10. Key dependencies: `numpy`, `scipy`, `scikit-image`, `scikit-learn`, `zarr >= 3.0`, `joblib`, `tqdm`, `imageio-ffmpeg`.
 
-Optional but recommended: `oasis-deconvolution` (faster AR deconvolution). Without it the pure-Python AR(1) PAVA fallback is used automatically.
+Optional but recommended: `oasis-deconv` (faster AR deconvolution). Without it the pure-Python AR(1) PAVA fallback is used automatically.
 
 ---
 

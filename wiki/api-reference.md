@@ -946,7 +946,7 @@ Block coordinate descent temporal refinement. **Returns** `(C, S, g_per_k, sn_pe
 def deconvolve(trace: np.ndarray, g: np.ndarray, sn: float) -> tuple[np.ndarray, np.ndarray, float]
 ```
 
-Deconvolve one fluorescence trace with OASIS (uses `oasis-deconvolution` package if installed, falls back to pure-Python PAVA for AR(1)).
+Deconvolve one fluorescence trace with OASIS (uses `oasis-deconv` package if installed, falls back to pure-Python PAVA for AR(1)).
 
 **Returns:** `(c, s, bl)` — denoised trace, spike train, baseline offset.
 

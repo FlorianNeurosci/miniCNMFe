@@ -50,7 +50,7 @@ CaImAn look worse than it is until corrected:
    (ring-`W` recomputation, the analogue of our per-iteration `b0` refresh) runs
    **only in the patch path**. *Fix:* run CaImAn in patches (`rf`/`stride`) on a
    FOV large enough for a real patch grid (≥128 px); 64×64 is below its regime.
-4. **(ours) PAVA deconvolution fallback bug.** When the `oasis-deconvolution`
+4. **(ours) PAVA deconvolution fallback bug.** When the `oasis-deconv`
    package is absent, we fell back to a pure-Python PAVA whose pool-merge test
    used bare `g` instead of `g**pool_length` — collapsing smooth decays. This
    dropped our **deconvolved `C`** vs truth to ~0.58 while CaImAn's was ~0.98,
@@ -128,7 +128,7 @@ shifts it can pick a too-high `min_pnr` and hurt CaImAn's recall.)
 | aspect | this CNMFe | CaImAn CNMF-E |
 |---|---|---|
 | Background | ring + per-iteration `b0` refresh (+ optional rank-1 `b_f·f`) | ring (`compute_W`), refined in the patch path |
-| Deconvolution | OASIS via `oasis-deconvolution`; pure-Python PAVA fallback | OASIS (`constrained_foopsi`) |
+| Deconvolution | OASIS via `oasis-deconv`; pure-Python PAVA fallback | OASIS (`constrained_foopsi`) |
 | AR `g` | estimated **once** from `C_raw`, cached (global or per-neuron); optional Bayesian `decay_time`/`fps` prior | per-neuron, per-iteration |
 | Spatial solve | per-pixel non-neg LASSO on **raw** traces | LASSO on `StandardScaler`-normalised traces |
 | Quality filter | non-destructive SNR-amplitude auto-eval (`accepted_mask`) | CNN + SNR + spatial-corr `evaluate_components` |

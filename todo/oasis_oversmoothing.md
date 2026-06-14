@@ -28,7 +28,7 @@ green `C` collapses most of the data into one event + smooth AR tail.
 
 OASIS in this codebase has two implementations behind a common API:
 
-- `oasis-deconvolution` package, called with `penalty=1, g=(g_k,), sn=sn_k`
+- `oasis-deconv` package, called with `penalty=1, g=(g_k,), sn=sn_k`
   (`minicnmfe/temporal.py:248-265`). Penalty=1 ⇒ L1-spike + noise-budget;
   `g` and baseline are **fixed** (no `optimize_g`, no `optimize_b`).
 - Pure-Python fallback `_oasis_ar1_pava` (`minicnmfe/temporal.py:159-221`),

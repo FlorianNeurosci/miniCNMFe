@@ -6,7 +6,7 @@ where S is the (non-negative) spike train and g is the AR decay constant.
 
 Deconvolution uses OASIS (Online Active Set method to Infer Spikes):
     - Fast, exact solution for AR(1) and AR(2) models.
-    - Implemented via the `oasis-deconvolution` PyPI package if available,
+    - Implemented via the `oasis-deconv` PyPI package if available,
       with a pure-Python AR(1) fallback (PAVA algorithm).
 
 Reference (algorithmic only): CaImAn temporal.py:update_temporal_components (line 64)
@@ -231,7 +231,7 @@ def _oasis_ar1_pava(y: np.ndarray, g: float, sn: float) -> tuple[np.ndarray, np.
     where ``lam`` is chosen by bisection to satisfy the noise constraint
     ``‖y − c‖² ≈ T·sn²``. This is the constrained-foopsi form from
     Friedrich et al. 2017 §2.1, implemented in pure Python so the
-    fallback doesn't silently degrade when the Cython `oasis-deconvolution`
+    fallback doesn't silently degrade when the Cython `oasis-deconv`
     package isn't installed.
 
     Args:
@@ -293,7 +293,7 @@ def deconvolve(
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Deconvolve a fluorescence trace to infer the spike train.
 
-    Uses the `oasis-deconvolution` package (constrained OASIS).
+    Uses the `oasis-deconv` package (constrained OASIS).
     Falls back to pure-Python PAVA for AR(1) if oasis is not installed.
 
     Args:
@@ -510,7 +510,7 @@ def update_temporal(
                 from threadpoolctl import threadpool_limits
 
                 # Threads avoid loky's per-call pickling. OASIS's C extension
-                # (from oasis-deconvolution) releases the GIL during deconv;
+                # (from oasis-deconv) releases the GIL during deconv;
                 # users on the pure-Python fallback get no parallelism either
                 # way -- the threads path doesn't make that worse.
                 # threadpool_limits caps inner BLAS to 1 so n_jobs worker

@@ -94,12 +94,12 @@ Relevant functions:
 
 **Estimated saving: 10–15% of OASIS-related time**
 
-The `oasis-deconvolution` package is pure Python PAVA. CaImAn's `constrained_foopsi`
+The `oasis-deconv` package is pure Python PAVA. CaImAn's `constrained_foopsi`
 is Cython-compiled. For K=10 neurons at T=6500 this is a few seconds.
 
 Options (in order of effort):
-1. **Already have**: `oasis-deconvolution` is faster than the pure-Python PAVA fallback
-   in `temporal.py`. Ensure the package is installed (`pip install oasis-deconvolution`).
+1. **Already have**: `oasis-deconv` is faster than the pure-Python PAVA fallback
+   in `temporal.py`. Ensure the package is installed (`pip install oasis-deconv`).
 2. **Future**: Wrap CaImAn's Cython solver as an optional backend — but this would
    introduce a CaImAn dependency, which violates the project's "no CaImAn import" rule.
 3. **Not recommended**: Write a Cython/Numba PAVA — high effort, marginal gain for K≤50.
