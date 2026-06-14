@@ -28,7 +28,7 @@ _FIG_GROUPS = [
     ]),
     ("Stage 3 — Initialisation", [
         ("fig_sigma.png", "CORR / PNR / CORR·PNR + top blobs → extraction sigma"),
-        ("fig_corr_pnr.png", "CORR/PNR neuron-vs-background separation → thresholds"),
+        ("fig_corr_pnr.png", "Seed-count surface over (min_corr, min_pnr) → thresholds"),
         ("fig_min_pixel.png", "Footprint-area distribution → min_pixel"),
     ]),
     ("Stage 4 — Temporal / merge / evaluation", [
