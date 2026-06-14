@@ -180,13 +180,15 @@ def _fit_candidate(params, mc_zarr_path, region_crop, workdir):
     return model
 
 
-def _render_candidate_figs(model, cn, fp_out, tr_out):
+def _render_candidate_figs(model, cn, fp_out, tr_out, region_crop=None):
     """Render this candidate's footprints + traces PNGs (best-effort).
 
-    Reuses the same renderers as the best-candidate report figures. The model and
-    the (already cutout-sliced) ``cn`` are both in crop-local coords, so no offset
-    (``region_crop=None``). A plotting failure must NOT fail the candidate, so all
-    errors are swallowed and simply leave the fig fields unset.
+    Reuses the same renderers as the best-candidate report figure: ``cn`` is the
+    **full-FOV** correlation image and ``region_crop`` offsets the candidate's
+    crop-local footprint contours onto it, so each per-candidate figure matches the
+    best-candidate figure (full FOV, thresholded backdrop) instead of the zoomed
+    cutout. A plotting failure must NOT fail the candidate, so all errors are
+    swallowed and simply leave the fig fields unset.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -196,7 +198,7 @@ def _render_candidate_figs(model, cn, fp_out, tr_out):
     try:
         if model.A is not None and model.A.shape[1] > 0:
             Path(fp_out).parent.mkdir(parents=True, exist_ok=True)
-            fig_sweep_footprints(model, cn, out_path=fp_out, region_crop=None)
+            fig_sweep_footprints(model, cn, out_path=fp_out, region_crop=region_crop)
             out["footprints_fig"] = Path(fp_out).name
             fig_sweep_traces(model, out_path=tr_out)
             out["traces_fig"] = Path(tr_out).name
@@ -211,7 +213,7 @@ def _run_one_candidate(args) -> dict:
     A failed candidate returns a row with ``error`` set and a ``-inf`` score
     rather than aborting the whole sweep.
     """
-    idx, params, mc_zarr_path, region_crop, workdir, swept, cn_fig, fp_out, tr_out = args
+    idx, params, mc_zarr_path, region_crop, workdir, swept, cn_full, fp_out, tr_out = args
     try:
         from threadpoolctl import threadpool_limits
     except ImportError:
@@ -229,7 +231,8 @@ def _run_one_candidate(args) -> dict:
         row.update(swept)
         row.update(q)
         row["score"] = composite_score(q)
-        row.update(_render_candidate_figs(model, cn_fig, fp_out, tr_out))
+        row.update(_render_candidate_figs(model, cn_full, fp_out, tr_out,
+                                          region_crop=region_crop))
         return row
     except Exception as exc:  # noqa: BLE001 — surface, don't abort the batch
         row = {"idx": idx, "error": repr(exc), "wall_s": time.time() - t0,
@@ -310,20 +313,17 @@ def run_sweep(
                            init_patches=cand_init_patches), swept)
                   for params, swept in candidates]
 
-    # candidate figures use a crop-local correlation image; slice the FOV cn to
-    # the cutout so contours land on the right pixels (region_crop=None at render).
-    if cn is not None and region_crop is not None:
-        (y0, y1, x0, x1), _t = region_crop
-        cn_fig = cn[y0:y1, x0:x1]
-    else:
-        cn_fig = cn
+    # Each candidate figure is rendered on the FULL-FOV cn with region_crop, so the
+    # crop-local footprint contours are offset onto the full image — matching the
+    # best-candidate figure (full FOV, thresholded backdrop) rather than the zoomed
+    # cutout. Passing the full cn per candidate is cheap (~1 MB).
     # figs go at the top level of the tuner output dir so the DB durable-copy
     # mirrors them into 2_processed alongside the other report figures.
     fig_dir = workdir.parent
 
     tasks = [
         (i, params, str(mc_zarr_path), region_crop, str(workdir / f"cand_{i}"),
-         swept, cn_fig, str(fig_dir / f"fig_cand_{i}_footprints.png"),
+         swept, cn, str(fig_dir / f"fig_cand_{i}_footprints.png"),
          str(fig_dir / f"fig_cand_{i}_traces.png"))
         for i, (params, swept) in enumerate(candidates)
     ]
