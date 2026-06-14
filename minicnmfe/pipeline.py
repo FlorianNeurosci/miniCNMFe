@@ -1492,9 +1492,9 @@ class CNMFe:
                 g_prior_weight=p.g_prior_weight,
             )
         timer.add("greedy init", time.perf_counter() - _t)
-        # Free the strided init movie before allocating C_raw at full T.
-        if init_stride > 1:
-            del init_movie
+        # NOTE: the strided init movie is freed below, after it is reused to
+        # bootstrap a background-aware init projection (see the init_stride>1
+        # branch). Freeing it here would force the contaminated raw projection.
         print(f"  Found {A.shape[1]} initial components.")
 
         if A.shape[1] == 0:
@@ -1527,41 +1527,53 @@ class CNMFe:
         # the strided projection ONLY when stride>1 (where greedy returned
         # T_init traces, not full T); for stride==1 use greedy's traces
         # directly.
+        # Ring radius (used both for the init-projection bootstrap below and
+        # for the first full ring background fit further down).
+        ring_radius = p.ring_size_factor * (2 * p.sigma + 1)
+
         AA_init = (A.T @ A).toarray()
         nA_init = np.maximum(np.diag(AA_init), 1e-10).astype(np.float32)
         if init_stride > 1:
-            # Strided init returned T_init-length traces; we need full T,
-            # so re-project from the full-resolution movie.
-            if isinstance(Y_flat, np.ndarray):
-                YA_init = np.asarray(Y_flat.T @ A, dtype=np.float32)      # (T, K)
-            else:
-                # Streaming Y_flat.T @ A: sum pixel-batched contributions.
-                A_csr = A.tocsr()
-                proj_batch = 4096
-                if p.n_jobs == 1:
-                    YA_init = np.zeros((T, A.shape[1]), dtype=np.float32)
-                    for s in range(0, H * W, proj_batch):
-                        e = min(s + proj_batch, H * W)
-                        Y_chunk = np.asarray(Y_flat[s:e], dtype=np.float32)
-                        YA_init += np.asarray(Y_chunk.T @ A_csr[s:e], dtype=np.float32)
-                else:
-                    from joblib import Parallel, delayed
-                    from threadpoolctl import threadpool_limits
-
-                    with threadpool_limits(limits=1, user_api="blas"):
-                        parts = Parallel(n_jobs=p.n_jobs, prefer="threads")(
-                            delayed(_yflat_proj_batch)(
-                                Y_flat, A_csr, s, min(s + proj_batch, H * W)
-                            )
-                            for s in range(0, H * W, proj_batch)
-                        )
-                    YA_init = np.add.reduce(parts)
+            # Strided init returned T_init-length traces; we need full T.
+            #
+            # A naive full-T projection ``C = (Y.T @ A) / ‖A‖²`` re-introduces
+            # the broad 1p background into ``A·C`` from frame 0. That then
+            # BLINDS the first ``compute_W`` (fit on the residual
+            # ``X = Y − A·C − b0``): the shared background it can no longer see
+            # in ``X`` leaks into every neuron trace for the rest of the BCD,
+            # a stable bad fixed point. Empirically (PICAST cutout) this made
+            # the deconvolved traces share an ~81 %-variance PC1 that is ≈ the
+            # global background, median pairwise |r| ~0.45 — and more BCD
+            # iterations did NOT escape it (see live_runs/bg_leak_diag.py).
+            #
+            # Fix: bootstrap a ring background from the *clean* strided greedy
+            # traces (``C_init`` comes from the center-surround-filtered movie,
+            # so ``A·C_init`` carries little background), then project the
+            # full-T init traces through it. This mirrors what the stride==1
+            # path gets for free (its first ``compute_W`` sees clean traces),
+            # so the first full ``compute_W`` below is no longer blinded.
+            W0, b0_0 = compute_W(
+                make_2d(init_movie), A, C_init, dims, ring_radius,
+                lambda_reg=p.ring_lambda, n_jobs=p.n_jobs, device=p.device,
+                tsub=1, constrain_sum=p.ring_constrain_sum,
+            )
+            # project_onto handles numpy and zarr Y_flat (streaming) and
+            # returns the background-subtracted projection Y_bg.T @ A → (T, K).
+            YA_init = BackgroundSubtractor(Y_flat, W0, b0_0).project_onto(
+                A, n_jobs=p.n_jobs
+            )
+            del W0, b0_0
             C_raw = (YA_init / nA_init[None, :]).T.astype(np.float32)     # (K, T)
             C = C_raw.copy()
         else:
             # stride==1: greedy already produced full-T per-pixel-OLS traces.
             C_raw = C_raw_init.astype(np.float32)
             C = C_init.astype(np.float32)
+
+        # The strided init movie is no longer needed once its traces are
+        # re-projected at full T.
+        if init_stride > 1:
+            del init_movie
 
         # Estimate the AR coefficient `g` ONCE from the pooled raw traces.
         #
@@ -1619,7 +1631,7 @@ class CNMFe:
                 sn_per_k[k] = _sn_from_footprint(A[:, k], sn_flat)
 
         # --- Step 5: Initial ring background ---
-        ring_radius = p.ring_size_factor * (2 * p.sigma + 1)
+        # ring_radius computed above (reused by the init-projection bootstrap).
         print(f"Fitting ring-model background (radius={ring_radius:.1f}px, tsub={p.bg_tsub})...")
         _t = time.perf_counter()
         W_mat, b0 = compute_W(

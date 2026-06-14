@@ -230,6 +230,89 @@ class TestCNMFePipeline:
         # post-init projection. Check shape.
         assert m3.C.shape == (m3.A.shape[1], movie.shape[0])
 
+    def test_strided_init_does_not_leak_shared_background(self):
+        """Strided init (init_stride>1) must NOT leak a shared background into
+        every trace.
+
+        Regression for the background-leak fix: a naive full-T projection
+        ``C = (Y.T @ A)/‖A‖²`` for the strided-init path re-introduced the
+        broad 1p background into ``A·C`` from frame 0, which blinded the first
+        ``compute_W`` (fit on ``Y − A·C``) — the background then leaked into
+        every neuron trace for the whole BCD (a stable bad fixed point). On a
+        movie with a strong *event-like* shared background this made the
+        extracted traces nearly identical (median pairwise |r| ≈ 0.9, and each
+        trace ≈ the shared background). The fix bootstraps a ring background
+        from the clean strided greedy traces and projects the init traces
+        through it. See live_runs/bg_leak_diag.py for the real-data version.
+        """
+        import scipy.ndimage as ndi
+
+        rng = np.random.default_rng(0)
+        H, W, T, K = 64, 64, 900, 8
+        yy, xx = np.mgrid[0:H, 0:W]
+        border = 14
+        centers: list[tuple[int, int]] = []
+        while len(centers) < K:
+            r = int(rng.integers(border, H - border))
+            c = int(rng.integers(border, W - border))
+            if all(abs(r - r2) + abs(c - c2) >= 11 for r2, c2 in centers):
+                centers.append((r, c))
+        A_true = np.zeros((H * W, K), np.float32)
+        for k, (r, c) in enumerate(centers):
+            b = np.exp(-((yy - r) ** 2 + (xx - c) ** 2) / (2 * 9.0))
+            A_true[:, k] = (b / b.max()).ravel()
+
+        def ar(rate):
+            s = (rng.random(T) < rate).astype(np.float32)
+            s[0] = 0.0
+            c = np.zeros(T, np.float32)
+            for t in range(1, T):
+                c[t] = 0.9 * c[t - 1] + s[t]
+            return c
+
+        C_true = np.stack([ar(0.05) for _ in range(K)])
+        # Event-like shared "neuropil": broad spatial profile × an AR(1) event
+        # trace (NOT slow drift — this survives deconvolution, so a leak shows
+        # up in the deconvolved C, not just in C+YrA).
+        bg_sp = ndi.gaussian_filter(rng.standard_normal((H, W)).astype(np.float32), sigma=12)
+        bg_sp = (bg_sp - bg_sp.min()) / (bg_sp.max() - bg_sp.min() + 1e-10) + 0.5
+        shared = ar(0.08)
+        Yf = A_true @ C_true + 3.0 * np.outer(bg_sp.ravel(), shared)
+        Yf += rng.standard_normal(Yf.shape).astype(np.float32) * 0.4
+        movie = Yf.T.reshape(T, H, W).astype(np.float32)
+
+        common = dict(sigma=3.0, min_corr=0.6, min_pnr=4.0, n_iter_main=2,
+                      n_iter_temporal=2, global_bg_rank=1, n_jobs=1)
+
+        def med_pair(C):
+            cc = np.corrcoef(C)
+            iu = np.triu_indices(C.shape[0], 1)
+            v = np.abs(cc[iu]); v = v[np.isfinite(v)]
+            return float(np.median(v)) if v.size else float("nan")
+
+        results = {}
+        for st in (1, 3):
+            m = CNMFe(CNMFeParams(**common, init_stride=st))
+            m.fit_extract(movie, evaluate=True)
+            mask = (m.accepted_mask if m.accepted_mask is not None
+                    else np.ones(m.A.shape[1], bool))
+            C_acc = np.asarray(m.C)[mask]
+            assert C_acc.shape[0] >= 2, f"stride={st} found <2 accepted cells"
+            sc = np.array([abs(np.corrcoef(t, shared)[0, 1])
+                           for t in C_acc if t.std() > 0])
+            results[st] = (med_pair(C_acc), float(np.median(sc)))
+
+        mp1, sc1 = results[1]
+        mp3, sc3 = results[3]
+        # Strided init must stay decorrelated — pre-fix this was ~0.9.
+        assert mp3 < 0.3, f"strided-init traces over-correlated: median |r|={mp3:.3f}"
+        # And must not track the shared background — pre-fix this was ~0.84.
+        assert sc3 < 0.3, f"strided-init traces track shared bg: med |corr|={sc3:.3f}"
+        # Strided init should be ~as clean as non-strided (not dramatically worse).
+        assert mp3 < mp1 + 0.15, (
+            f"strided init much more correlated than stride=1: {mp3:.3f} vs {mp1:.3f}"
+        )
+
     def test_patched_init_recovers_same_neurons_as_global(self):
         """Patch-parallel init (opt-in) recovers the same neurons as global init.
 

@@ -929,6 +929,30 @@ with shape `(T, T, H)` and failing with a broadcast error when the first chunk w
 **Fix** (in `minicnmfe/io.py`): check whether `_s[0] == T` and extract H, W from `_s[1:]` if so,
 otherwise fall back to `_s[0:2]`. The same fix applies to `concat_avis_to_zarr.py`.
 
+### Strided-init (`init_stride > 1`) leaked the 1p background into every trace
+With `init_stride > 1`, `fit_extract` re-projected the full-T initial traces as a
+**raw** footprint projection `C = (Y.T @ A) / ‖A‖²` (no background removal). That
+injected the broad 1p background into `A·C` from frame 0, which then **blinded the
+first `compute_W`** (ring is fit on the residual `X = Y − A·C − b0` — anything
+already in `A·C` is invisible to it). The shared background then leaked into every
+neuron trace for the whole BCD, a stable bad fixed point: the OASIS-deconvolved
+traces shared an ~81 %-variance PC1 that was ≈ the global background (PICAST
+cutout: median pairwise |r| ≈ 0.45, `corr(PC1, model.f)` ≈ 0.96), and **more BCD
+iterations did NOT escape it** — only a clean init does. The `init_stride == 1`
+path was fine because its first traces come from the center-surround-**filtered**
+movie (`extract_spatial_temporal` uses `data_filtered`), so its first `compute_W`
+saw clean traces. Since the tuner sets `init_stride = 2` by default (`good_defaults`),
+this hit every long-recording run. **Fix** (`pipeline.py`, init re-projection):
+for `init_stride > 1`, bootstrap a ring background (`compute_W`) from the clean
+strided greedy traces (`C_init`) on the strided sample, then project the full-T
+init traces through a `BackgroundSubtractor` so the first full `compute_W` is no
+longer blinded. Verified on the PICAST cutout: median pairwise |r| 0.45 → 0.12,
+PC1 var 81 % → 21 % (and *more* real cells, since cleaner traces clear the SNR
+gate). Diagnostic: `live_runs/bg_leak_diag.py`. Regression:
+`tests/test_pipeline.py::test_strided_init_does_not_leak_shared_background`
+(event-like shared bg; pre-fix stride=3 median |r| ≈ 0.9, post-fix ≈ 0.06; the
+bit-for-bit `init_stride == 1` path is untouched).
+
 ---
 
 ## File structure
