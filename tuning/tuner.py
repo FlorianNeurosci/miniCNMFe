@@ -17,6 +17,7 @@ import numpy as np
 
 from minicnmfe.io import open_zarr
 from minicnmfe.pipeline import CNMFe, CNMFeParams
+from minicnmfe.preprocess import correlation_pnr
 from tuning import heuristics as H
 from tuning import io_sample as S
 from tuning.metrics import mc_quality
@@ -176,14 +177,6 @@ def run_tuning(cfg: TunerConfig) -> dict:
     stages["sigma"] = ev
     min_corr, min_pnr, ev = H.suggest_corr_pnr(cn, pnr, sigma_ds)
     stages["corr_pnr"] = ev
-    # Three threshold-selection methods, each a candidate (min_corr, min_pnr)
-    # operating point. Rather than commit to one a priori, the sweep tests all
-    # three as coupled seeds and its quality score picks the winner (see below).
-    thr_methods = {
-        "morphology": (float(min_corr), float(min_pnr)),
-        "separation": tuple(map(float, H.suggest_corr_pnr_separation(cn, pnr, sigma_ds)[:2])),
-        "percentile": tuple(map(float, H.suggest_corr_pnr_percentile(cn, pnr, sigma_ds)[:2])),
-    }
     # morphology is the reference pair for the (single) min_pixel estimate and the
     # heuristic-only recommendation when the sweep is skipped.
     min_pixel_ds, ev = H.suggest_min_pixel(mc_sample, sigma_ds, min_corr, min_pnr,
@@ -216,18 +209,31 @@ def run_tuning(cfg: TunerConfig) -> dict:
         # the data-driven value is always a candidate (tuning.sweep.resolve_sigma_grid).
         sweep = cfg.sweep or SweepSpec()
         sigma_grid = resolve_sigma_grid(sweep.sigma, sigma_ds)
-        # Threshold candidates come from the 3 methods as COUPLED (min_corr, min_pnr)
-        # seeds (deduped), not independent grids — the sweep scores them head-to-head.
+        # Derive (min_corr, min_pnr) PER sigma. The CORR/PNR images are a function of
+        # sigma (the center-surround PSF width), so a threshold estimated at one sigma
+        # under-/over-seeds at another. For each sigma we recompute CORR/PNR and run the
+        # 3 methods; each (sigma, method) is a self-consistent COUPLED candidate seed
+        # (carrying its own sigma). The sweep scores them head-to-head — a method that
+        # collapses to the floor at some sigma just scores poorly and is dropped.
         thr_seeds = []
         seen = set()
-        for name, (mc_, mp_) in thr_methods.items():
-            key_ = (round(mc_, 3), round(mp_, 2))
-            if key_ in seen:
-                continue
-            seen.add(key_)
-            thr_seeds.append({"min_corr": mc_, "min_pnr": mp_, "thr_method": name})
-        # min_corr/min_pnr are supplied by the coupled seeds, not the per-knob grids.
-        sweep = replace(sweep, sigma=sigma_grid, min_corr=None, min_pnr=None)
+        for s in sigma_grid:
+            cn_s, pnr_s = correlation_pnr(np.ascontiguousarray(mc_sample),
+                                          sigma=float(s), n_jobs=cfg.n_jobs)
+            methods_s = {
+                "morphology": H.suggest_corr_pnr(cn_s, pnr_s, float(s))[:2],
+                "separation": H.suggest_corr_pnr_separation(cn_s, pnr_s, float(s))[:2],
+                "percentile": H.suggest_corr_pnr_percentile(cn_s, pnr_s, float(s))[:2],
+            }
+            for name, (mc_, mp_) in methods_s.items():
+                key_ = (round(float(s), 3), round(float(mc_), 3), round(float(mp_), 2))
+                if key_ in seen:
+                    continue
+                seen.add(key_)
+                thr_seeds.append({"sigma": float(s), "min_corr": float(mc_),
+                                  "min_pnr": float(mp_), "thr_method": name})
+        # sigma + thresholds are carried by the seeds now (no separate sigma grid).
+        sweep = replace(sweep, sigma=None, min_corr=None, min_pnr=None)
         stages["sigma_grid"] = {"values": sigma_grid, "heuristic": float(sigma_ds)}
         stages["thr_grid"] = {"seeds": thr_seeds,
                               "morphology": (float(min_corr), float(min_pnr))}

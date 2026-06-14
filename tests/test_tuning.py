@@ -374,6 +374,23 @@ def test_build_candidates_thr_seeds_coupled():
         {"morphology": 3, "separation": 3, "percentile": 3}
 
 
+def test_build_candidates_per_sigma_seeds():
+    """Seeds that carry their own sigma set (sigma, min_corr, min_pnr) together."""
+    base = CNMFeParams()
+    # 2 sigmas x 2 methods, each seed a full (sigma, min_corr, min_pnr) triple.
+    seeds = [
+        {"sigma": 3.0, "min_corr": 0.90, "min_pnr": 16.0, "thr_method": "morphology"},
+        {"sigma": 3.0, "min_corr": 0.80, "min_pnr": 6.0, "thr_method": "separation"},
+        {"sigma": 2.0, "min_corr": 0.70, "min_pnr": 5.0, "thr_method": "morphology"},
+        {"sigma": 2.0, "min_corr": 0.60, "min_pnr": 4.0, "thr_method": "separation"},
+    ]
+    # sigma not in the spec grid (None) — it comes from the seeds.
+    cands = build_candidates(base, SweepSpec(), max_candidates=24, thr_seeds=seeds)
+    assert len(cands) == 4
+    got = {(p.sigma, p.min_corr, p.min_pnr) for p, _ in cands}
+    assert got == {(s["sigma"], s["min_corr"], s["min_pnr"]) for s in seeds}
+
+
 def test_suggest_corr_pnr_methods_blobby_image():
     """separation + percentile recover a sane threshold on a blobby CORR/PNR image."""
     from scipy.ndimage import gaussian_filter

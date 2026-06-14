@@ -157,6 +157,8 @@ def build_candidates(
             if seed is not None:
                 full["min_corr"] = float(seed["min_corr"])
                 full["min_pnr"] = float(seed["min_pnr"])
+                if seed.get("sigma") is not None:
+                    full["sigma"] = float(seed["sigma"])  # per-sigma seed
                 label = seed.get("thr_method")
             p = replace(base_params, **full)
             snap = {f: getattr(p, f) for f in SWEPT_FIELDS}
