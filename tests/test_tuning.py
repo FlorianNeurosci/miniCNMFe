@@ -419,6 +419,21 @@ def test_load_mc_sample_chunk_aligned(sim_zarr):
     assert np.allclose(sample[-1], np.asarray(arr[int(idx[-1])], dtype=np.float32))
 
 
+def test_fig_sweep_footprints_zero_components(corr_image, tmp_path):
+    """A 0-component candidate (model.A is None) still writes a backdrop PNG, no crash."""
+    import types
+
+    from tuning.report import fig_sweep_footprints
+
+    cn, _ = corr_image
+    model = types.SimpleNamespace(
+        dims=cn.shape, A=None, accepted_mask=None,
+        params=types.SimpleNamespace(min_corr=0.8))
+    out = tmp_path / "cand_empty_footprints.png"
+    fig_sweep_footprints(model, cn, out_path=str(out), region_crop=None)
+    assert out.exists() and out.stat().st_size > 0
+
+
 def test_sweep_runs_and_ranks(sim_zarr, sim_movie):
     base = CNMFeParams(sigma=3.0, min_corr=0.7, min_pnr=6.0, n_iter_main=1,
                        frame_rate_hz=20.0, decay_time_ms=180.0)

@@ -196,10 +196,14 @@ def _render_candidate_figs(model, cn, fp_out, tr_out, region_crop=None):
 
     out = {}
     try:
+        Path(fp_out).parent.mkdir(parents=True, exist_ok=True)
+        # Always render the footprints figure (the thresholded CORR backdrop), even
+        # for a 0-component candidate — otherwise its slot is blank in the GUI; the
+        # backdrop alone reads as "this candidate found nothing on this image".
+        fig_sweep_footprints(model, cn, out_path=fp_out, region_crop=region_crop)
+        out["footprints_fig"] = Path(fp_out).name
+        # Traces only exist when there are components.
         if model.A is not None and model.A.shape[1] > 0:
-            Path(fp_out).parent.mkdir(parents=True, exist_ok=True)
-            fig_sweep_footprints(model, cn, out_path=fp_out, region_crop=region_crop)
-            out["footprints_fig"] = Path(fp_out).name
             fig_sweep_traces(model, out_path=tr_out)
             out["traces_fig"] = Path(tr_out).name
     except Exception:  # noqa: BLE001 — figures are optional, never abort

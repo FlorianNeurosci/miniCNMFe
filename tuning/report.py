@@ -356,7 +356,6 @@ def fig_sweep_footprints(model, cn, out_path=None, region_crop=None):
         if vmax is not None:
             vmax = max(vmax, vmin + 1e-6)
         ax.imshow(cn, cmap="gray", vmin=vmin, vmax=vmax)
-        ax.set_title(f"best-candidate footprints over the thresholded CORR (vmin={vmin:.2f})")
     H, W = model.dims
     # The sweep extracts on a cutout (crop-local coords) but ``cn`` is the full
     # FOV correlation image. Offset the contours by the crop origin so they land
@@ -366,15 +365,22 @@ def fig_sweep_footprints(model, cn, out_path=None, region_crop=None):
         (y0, _y1, x0, _x1), _t = region_crop
     xs = np.arange(W) + x0
     ys = np.arange(H) + y0
-    K = model.A.shape[1]
+    # A 0-component candidate (sigma too small etc.) has no footprints — and
+    # ``model.A`` may even be None; draw just the thresholded backdrop so the slot
+    # is never blank.
+    K = model.A.shape[1] if model.A is not None else 0
     mask = getattr(model, "accepted_mask", None)
-    A_dense = np.asarray(model.A.todense()).reshape(H, W, K)
-    for k in range(K):
-        fp = A_dense[..., k]
-        if fp.max() <= 0:
-            continue
-        col = "lime" if (mask is None or (len(mask) == K and mask[k])) else "red"
-        ax.contour(xs, ys, fp, levels=[0.3 * fp.max()], colors=col, linewidths=0.7)
+    if K > 0:
+        A_dense = np.asarray(model.A.todense()).reshape(H, W, K)
+        for k in range(K):
+            fp = A_dense[..., k]
+            if fp.max() <= 0:
+                continue
+            col = "lime" if (mask is None or (len(mask) == K and mask[k])) else "red"
+            ax.contour(xs, ys, fp, levels=[0.3 * fp.max()], colors=col, linewidths=0.7)
+    if cn is not None:
+        ax.set_title(f"candidate footprints over thresholded CORR "
+                     f"(vmin={vmin:.2f}) — {K} comps")
     ax.axis("off")
     fig.tight_layout()
     return _finish(fig, out_path)
