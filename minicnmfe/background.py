@@ -704,6 +704,45 @@ class BackgroundSubtractor:
             out -= self.bf[start:end, None] * self.f[None, :]
         return out
 
+    def slice_rows(self, rows: np.ndarray) -> np.ndarray:
+        """Return ``Y_bg`` for an arbitrary set of pixel rows -> ``(len(rows), T)``.
+
+        Same identity as ``slice`` but for a (non-contiguous) index array rather
+        than a ``start:end`` range. Used by ``update_spatial`` to
+        background-subtract only the pixels that have component support, skipping
+        the ~70% with empty support that contribute nothing to the footprint
+        update (their CD is a no-op, so their slab is pure waste). The output
+        rows equal ``slice``'s rows bit-for-bit, so the footprint update is
+        unchanged.
+        """
+        rows = np.asarray(rows)
+        W_chunk = self.W[rows]
+        Y_chunk = np.asarray(self.Y_flat[rows], dtype=np.float32)
+
+        # As in ``slice``: gather only the ring-neighbour rows (the union of
+        # nonzero columns of W_chunk) and remap the sparse column indices to
+        # that small C-contiguous buffer, so the matmul stays cache-friendly
+        # regardless of Y_flat's layout (numpy F-contiguous or zarr).
+        indices = W_chunk.indices
+        if indices.size == 0:
+            W_Y = np.zeros_like(Y_chunk)
+        else:
+            needed = np.unique(indices)
+            Y_needed = np.asarray(self.Y_flat[needed], dtype=np.float32)
+            remap = np.searchsorted(needed, indices)
+            W_chunk_remapped = sp.csr_matrix(
+                (W_chunk.data, remap, W_chunk.indptr),
+                shape=(W_chunk.shape[0], needed.size),
+            )
+            W_Y = np.asarray(W_chunk_remapped @ Y_needed, dtype=np.float32)
+
+        W_b0 = np.asarray(W_chunk @ self.b0, dtype=np.float32)
+        out = Y_chunk - self.b0[rows, None] - W_Y
+        out += W_b0[:, None]
+        if self.bf is not None:
+            out -= self.bf[rows, None] * self.f[None, :]
+        return out
+
     def __getitem__(self, key) -> np.ndarray:
         if isinstance(key, slice):
             start = 0 if key.start is None else int(key.start)

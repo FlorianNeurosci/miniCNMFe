@@ -152,15 +152,21 @@ if _HAS_NUMBA:
                 out_coef[a0 + a] = w[a]
 
 
-def _materialize_slab(Y_flat, sn, bs, be):
-    """Materialize one (end-start, T) background-subtracted slab + its sn.
+def _materialize_slab(Y_flat, sn, rows):
+    """Materialize one (len(rows), T) background-subtracted slab + its sn.
 
-    This is the expensive bit of update_spatial on real data: Y_flat[bs:be]
-    triggers BackgroundSubtractor.slice -> a GIL-releasing sparse W@Y matmul
+    This is the expensive bit of update_spatial on real data: reading the slab
+    triggers BackgroundSubtractor.slice_rows -> a GIL-releasing sparse W@Y matmul
     (the ring-background subtraction). Run under joblib threads it parallelises.
+
+    ``rows`` is the array of *global* pixel indices for this block — only pixels
+    with non-empty support (the ones that will run CD) are passed, so the
+    background subtraction is never wasted on the ~70% of empty-support pixels.
+    Falls back to fancy indexing for a plain-ndarray Y_flat (used in tests).
     """
-    Y_block = np.ascontiguousarray(Y_flat[bs:be], dtype=np.float64)
-    sn_block = np.ascontiguousarray(sn[bs:be], dtype=np.float64)
+    sub = Y_flat.slice_rows(rows) if hasattr(Y_flat, "slice_rows") else Y_flat[rows]
+    Y_block = np.ascontiguousarray(sub, dtype=np.float64)
+    sn_block = np.ascontiguousarray(sn[rows], dtype=np.float64)
     return Y_block, sn_block
 
 
@@ -184,31 +190,50 @@ def _spatial_numba_update(Y_flat, C, support, sn, T, n_pixels, n_jobs,
     numba.set_num_threads(n_workers)
 
     C64 = np.ascontiguousarray(C, dtype=np.float64)   # (K, T), shared read-only
-    # Small blocks so a wave of n_workers slabs stays bounded (~n_workers*32 MB).
-    block_px = max(256, int(32 * 1024 * 1024) // (8 * max(int(T), 1)))
-    blocks = [(bs, min(bs + block_px, n_pixels))
-              for bs in range(0, n_pixels, block_px)]
+
+    # Only pixels with non-empty support run CD and contribute to A_new; the
+    # other ~70% would have their (expensive) background-subtracted slab
+    # materialised for nothing. Restrict the whole slab/CD loop to those
+    # support pixels -- bit-exact (the skipped pixels produce no footprint
+    # value either way), ~5x less slab work on real data.
+    supp_lens = np.fromiter((len(s) for s in support), dtype=np.int64, count=n_pixels)
+    active_pix = np.flatnonzero(supp_lens > 0)
+    n_active = int(active_pix.size)
 
     all_results: list[tuple[int, int, float]] = []
     total_unconverged = total_ran = total_iter = max_iter_seen = total_active = 0
     slab_wall = cd_wall = 0.0
 
+    if n_active == 0:
+        print(f"  update_spatial timing: slab={slab_wall:.1f}s cd={cd_wall:.1f}s "
+              f"(x{n_workers} threads, 0 blocks)")
+        totals = (total_unconverged, total_ran, total_iter, max_iter_seen, total_active)
+        return all_results, totals
+
+    # Small blocks so a wave of n_workers slabs stays bounded (~n_workers*32 MB).
+    # Blocks index into `active_pix`; each block's *global* pixel rows are
+    # `active_pix[bs:be]`.
+    block_px = max(256, int(32 * 1024 * 1024) // (8 * max(int(T), 1)))
+    blocks = [(bs, min(bs + block_px, n_active))
+              for bs in range(0, n_active, block_px)]
+
     for ws in range(0, len(blocks), n_workers):
         wave = blocks[ws:ws + n_workers]
+        wave_rows = [active_pix[bs:be] for bs, be in wave]
 
         # Phase 1: materialize this wave's slabs in parallel (GIL-released W@Y).
         t0 = time.perf_counter()
         with threadpool_limits(limits=1, user_api="blas"):
             slabs = Parallel(n_jobs=n_workers, prefer="threads")(
-                delayed(_materialize_slab)(Y_flat, sn, bs, be) for bs, be in wave
+                delayed(_materialize_slab)(Y_flat, sn, rows) for rows in wave_rows
             )
         slab_wall += time.perf_counter() - t0
 
         # Phase 2: run the (cheap, or prange-parallel) CD kernel on each slab.
         t1 = time.perf_counter()
-        for (bs, be), (Y_block, sn_block) in zip(wave, slabs):
-            nb = be - bs
-            supp = support[bs:be]
+        for rows, (Y_block, sn_block) in zip(wave_rows, slabs):
+            nb = rows.size
+            supp = [support[p] for p in rows]
             lens = np.fromiter((len(s) for s in supp), dtype=np.int64, count=nb)
             supp_off = np.zeros(nb + 1, dtype=np.int64)
             np.cumsum(lens, out=supp_off[1:])
@@ -238,7 +263,7 @@ def _spatial_numba_update(Y_flat, C, support, sn, T, n_pixels, n_jobs,
             for i in range(nb):
                 a0 = int(supp_off[i])
                 a1 = int(supp_off[i + 1])
-                p_global = bs + i
+                p_global = int(rows[i])
                 for a in range(a0, a1):
                     val = float(out_coef[a])
                     if val > 0.0:
