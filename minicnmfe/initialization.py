@@ -367,7 +367,7 @@ def greedy_corr_pnr(
     # Mean-center each pixel's time series; this is the global counterpart
     # of `data_filtered -= data_filtered.mean(axis=0)` in CaImAn.
     data_filtered -= data_filtered.mean(axis=0, keepdims=True)
-    noise_pixel = estimate_noise(data_filtered, noise_range=(0.25, 0.5))
+    noise_pixel = estimate_noise(data_filtered, noise_range=(0.25, 0.5), n_jobs=n_jobs)
 
     # Initial CN/PNR. PNR is a peak/max statistic over the cached full-T
     # `noise_pixel`, so its max MUST see the full time axis — striding it
@@ -381,7 +381,7 @@ def greedy_corr_pnr(
     ).astype(np.float32)
     if corrpnr_stride > 1:
         df_stride = np.ascontiguousarray(data_filtered[::corrpnr_stride])
-        sn_stride = estimate_noise(df_stride, noise_range=(0.25, 0.5))
+        sn_stride = estimate_noise(df_stride, noise_range=(0.25, 0.5), n_jobs=n_jobs)
         tmp = np.where(df_stride < thresh_init * sn_stride, 0.0, df_stride)
         cn = local_correlations_fft(tmp)
         del tmp, df_stride

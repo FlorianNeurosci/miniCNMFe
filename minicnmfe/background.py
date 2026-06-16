@@ -597,6 +597,38 @@ def subtract_background(
     return X - W.dot(X)
 
 
+def _gemm_block(Yf: np.ndarray, B: np.ndarray, s: int, e: int) -> np.ndarray:
+    """One time-block of ``Yf.T @ B`` → ``(e-s, K)``. Module-level for joblib."""
+    return np.asarray(Yf[:, s:e].T @ B, dtype=np.float32)
+
+
+def _gemm_threaded(Yf: np.ndarray, B: np.ndarray, n_jobs: int) -> np.ndarray:
+    """``Yf.T @ B`` → ``(T, K)`` tiled over the time axis under joblib threads.
+
+    A single numpy matmul runs on ONE core when BLAS is globally capped to 1
+    thread (the extraction setting: ``OMP/OPENBLAS_NUM_THREADS=1``, which cannot
+    be undone at runtime on the server's scipy-openblas64 build). Tiling the
+    output rows and dispatching with ``prefer="threads"`` lets each block's
+    GIL-releasing matmul run on its own core → fills all cores regardless of the
+    cap. Bit-exact: every output row computes the full ``H*W`` contraction in a
+    single thread (only the output axis is split). ``Yf`` is F-contiguous (from
+    ``make_2d``), so ``Yf[:, s:e]`` is a contiguous column block.
+    """
+    T = int(Yf.shape[1])
+    if n_jobs == 1 or T < 4096:
+        return np.asarray(Yf.T @ B, dtype=np.float32)
+    from joblib import Parallel, delayed, effective_n_jobs
+
+    nw = max(1, effective_n_jobs(n_jobs))
+    edges = np.linspace(0, T, nw + 1).astype(int)
+    spans = [(int(edges[i]), int(edges[i + 1])) for i in range(nw)
+             if edges[i + 1] > edges[i]]
+    parts = Parallel(n_jobs=nw, prefer="threads")(
+        delayed(_gemm_block)(Yf, B, s, e) for s, e in spans
+    )
+    return np.concatenate(parts, axis=0)
+
+
 def _project_onto_batch(
     bg: "BackgroundSubtractor", A_csr, start: int, end: int
 ) -> np.ndarray:
@@ -785,7 +817,9 @@ class BackgroundSubtractor:
             # W.T @ A is sparse × sparse — fast for sparse A.
             WtA = self.W.T @ A_csr
             B = np.asarray((A_csr - WtA).toarray(), dtype=np.float32)  # (H*W, K)
-            YA = np.asarray(self.Y_flat.T @ B, dtype=np.float32)        # (T, K)
+            # Thread-tiled GEMM: a single numpy matmul runs on one core under the
+            # global BLAS thread cap; tiling over time fills all cores. Bit-exact.
+            YA = _gemm_threaded(self.Y_flat, B, n_jobs)                 # (T, K)
             YA -= (self.b0 @ B).astype(np.float32)
             if self.bf is not None:
                 # (bf · f).T @ A = f[:, None] · (bf @ A)[None, :]   — rank-1 in (T, K).

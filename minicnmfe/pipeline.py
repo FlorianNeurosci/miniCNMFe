@@ -1366,7 +1366,7 @@ class CNMFe:
         # --- Step 2: Noise estimation ---
         print("Estimating noise...")
         _t = time.perf_counter()
-        self.sn = estimate_noise(stats_movie)   # (H, W)
+        self.sn = estimate_noise(stats_movie, n_jobs=p.n_jobs)   # (H, W)
         timer.add("noise estimation", time.perf_counter() - _t)
 
         # # --- Step 3: Summary images ---

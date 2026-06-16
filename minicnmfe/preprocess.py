@@ -55,10 +55,28 @@ def make_center_surround_psf(sigma: float, size: int | None = None) -> np.ndarra
     return g
 
 
+def _noise_band(movie, h0, h1, noise_mask, T, method):
+    """Noise variance for one row-band -> ``(h1-h0, W)``. Module-level for joblib.
+
+    The per-pixel rfft along time is independent across pixels; ``np.fft.rfft``
+    (pocketfft) releases the GIL, so dispatching bands with ``prefer="threads"``
+    gives real parallelism even under a global BLAS thread cap.
+    """
+    block = np.asarray(movie[:, h0:h1, :], dtype=np.float32)  # (T, dh, W)
+    Xf = np.fft.rfft(block, axis=0)                  # (T//2+1, dh, W)
+    psd = (np.abs(Xf[noise_mask]) ** 2) / T * 2       # one-sided PSD
+    if method == "mean":
+        return psd.mean(axis=0)
+    elif method == "median":
+        return np.median(psd, axis=0)
+    return np.exp(np.log(psd + 1e-10).mean(axis=0))   # logmexp
+
+
 def estimate_noise(
     movie: "zarr.Array | np.ndarray",
     noise_range: tuple[float, float] = (0.25, 0.5),
     method: str = "logmexp",
+    n_jobs: int = 1,
 ) -> np.ndarray:
     """Estimate per-pixel noise std from the high-frequency power spectrum.
 
@@ -70,6 +88,11 @@ def estimate_noise(
         movie: (T, H, W) array.
         noise_range: Fraction of Nyquist to use for noise estimation.
         method: 'mean', 'median', or 'logmexp' (geometric mean via log).
+        n_jobs: Parallel workers for the row-band rfft loop (-1 = all CPUs,
+            1 = serial). The rfft is pocketfft (single-threaded, never BLAS-
+            threaded), so on a many-core box the serial loop runs on ONE core;
+            ``n_jobs>1`` dispatches bands across joblib threads (GIL released in
+            rfft) for a near-linear speedup. Bit-identical to the serial result.
 
     Returns:
         sn: (H, W) float32 noise std estimate.
@@ -83,27 +106,37 @@ def estimate_noise(
     if method not in ("mean", "median", "logmexp"):
         raise ValueError(f"Unknown noise method: {method!r}")
 
-    # The per-pixel rfft is independent across pixels, so tile the spatial axis
-    # into row-bands and reduce each band to its (H_band, W) noise variance.
-    # This bounds peak RAM to one band's complex128 spectrum (n_freq x dh x W)
-    # instead of materialising the full (T//2+1, H, W) transform -- which is ~2x
-    # the float32 movie -- while producing the identical per-pixel result. Also
-    # avoids reading a zarr movie fully into RAM.
-    band_budget = 512 * 1024 * 1024  # ~512 MB per band's complex slab
+    from joblib import effective_n_jobs
+    nw = 1 if n_jobs == 1 else max(1, effective_n_jobs(n_jobs))
+
+    # Tile the spatial axis into row-bands and reduce each band to its
+    # (H_band, W) noise variance. This bounds peak RAM to the resident complex
+    # slabs (n_freq x dh x W x 16 B) instead of the full (T//2+1, H, W)
+    # transform (~2x the float32 movie), and produces the identical per-pixel
+    # result. Serial: one ~512 MB slab. Parallel: shrink dh so the nw bands held
+    # concurrently stay within ~4 GB total.
+    if nw == 1:
+        band_budget = 512 * 1024 * 1024
+    else:
+        band_budget = max(64 * 1024 * 1024, (4 * 1024 * 1024 * 1024) // nw)
     dh = max(1, band_budget // (max(n_freq, 1) * max(W, 1) * 16))
 
+    bands = [(h0, min(h0 + dh, H)) for h0 in range(0, H, dh)]
     noise_var = np.empty((H, W), dtype=np.float64)
-    for h0 in range(0, H, dh):
-        h1 = min(h0 + dh, H)
-        block = np.asarray(movie[:, h0:h1, :], dtype=np.float32)  # (T, dh, W)
-        Xf = np.fft.rfft(block, axis=0)                  # (T//2+1, dh, W)
-        psd = (np.abs(Xf[noise_mask]) ** 2) / T * 2       # one-sided PSD
-        if method == "mean":
-            noise_var[h0:h1] = psd.mean(axis=0)
-        elif method == "median":
-            noise_var[h0:h1] = np.median(psd, axis=0)
-        else:  # logmexp
-            noise_var[h0:h1] = np.exp(np.log(psd + 1e-10).mean(axis=0))
+
+    if nw == 1 or len(bands) == 1:
+        for h0, h1 in bands:
+            noise_var[h0:h1] = _noise_band(movie, h0, h1, noise_mask, T, method)
+    else:
+        from joblib import Parallel, delayed
+        from threadpoolctl import threadpool_limits
+        with threadpool_limits(limits=1, user_api="blas"):
+            results = Parallel(n_jobs=nw, prefer="threads")(
+                delayed(_noise_band)(movie, h0, h1, noise_mask, T, method)
+                for h0, h1 in bands
+            )
+        for (h0, h1), res in zip(bands, results):
+            noise_var[h0:h1] = res
 
     return np.sqrt(noise_var).astype(np.float32)
 
@@ -264,7 +297,7 @@ def correlation_pnr(
 
     # --- Noise and PNR (always CPU — rfft is fast, result is H×W) ---
     filtered -= filtered.mean(axis=0, keepdims=True)
-    sn = estimate_noise(filtered, noise_range=noise_range)
+    sn = estimate_noise(filtered, noise_range=noise_range, n_jobs=n_jobs)
 
     peak = filtered.max(axis=0)
     pnr = np.where(sn > 0, peak / sn, 0.0).astype(np.float32)
