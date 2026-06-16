@@ -597,6 +597,14 @@ def subtract_background(
     return X - W.dot(X)
 
 
+# Fixed time-block for the threaded projection GEMM. The partition (and hence
+# the float32 summation order) depends ONLY on T via this constant — not on the
+# worker/core count — so a given movie yields an identical projection across any
+# SLURM allocation. Small enough that T~40k gives >=100 blocks to fill a
+# many-core box; large enough that per-block dispatch overhead is negligible.
+_GEMM_TIME_CHUNK = 256
+
+
 def _gemm_block(Yf: np.ndarray, B: np.ndarray, s: int, e: int) -> np.ndarray:
     """One time-block of ``Yf.T @ B`` → ``(e-s, K)``. Module-level for joblib."""
     return np.asarray(Yf[:, s:e].T @ B, dtype=np.float32)
@@ -610,9 +618,17 @@ def _gemm_threaded(Yf: np.ndarray, B: np.ndarray, n_jobs: int) -> np.ndarray:
     be undone at runtime on the server's scipy-openblas64 build). Tiling the
     output rows and dispatching with ``prefer="threads"`` lets each block's
     GIL-releasing matmul run on its own core → fills all cores regardless of the
-    cap. Bit-exact: every output row computes the full ``H*W`` contraction in a
-    single thread (only the output axis is split). ``Yf`` is F-contiguous (from
-    ``make_2d``), so ``Yf[:, s:e]`` is a contiguous column block.
+    cap. ``Yf`` is F-contiguous (from ``make_2d``), so ``Yf[:, s:e]`` is a
+    contiguous column block.
+
+    NOTE: only the *output* (time) axis is split — the ``H*W`` contraction is
+    done in full inside each block — so the result is mathematically the same
+    sum as the monolithic ``Yf.T @ B``. It is NOT bit-identical to it, though:
+    OpenBLAS picks its K-accumulation order from the block's row count, so the
+    tiled result differs at the float32-rounding level (~3e-6 relative, and no
+    less accurate vs a float64 reference). The block partition is fixed by
+    ``_GEMM_TIME_CHUNK`` (a function of T only), so the result is reproducible
+    across any worker/core count — independent of ``n_jobs``.
     """
     T = int(Yf.shape[1])
     if n_jobs == 1 or T < 4096:
@@ -620,9 +636,8 @@ def _gemm_threaded(Yf: np.ndarray, B: np.ndarray, n_jobs: int) -> np.ndarray:
     from joblib import Parallel, delayed, effective_n_jobs
 
     nw = max(1, effective_n_jobs(n_jobs))
-    edges = np.linspace(0, T, nw + 1).astype(int)
-    spans = [(int(edges[i]), int(edges[i + 1])) for i in range(nw)
-             if edges[i + 1] > edges[i]]
+    spans = [(s, min(s + _GEMM_TIME_CHUNK, T))
+             for s in range(0, T, _GEMM_TIME_CHUNK)]
     parts = Parallel(n_jobs=nw, prefer="threads")(
         delayed(_gemm_block)(Yf, B, s, e) for s, e in spans
     )
