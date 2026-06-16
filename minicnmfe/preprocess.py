@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import scipy.ndimage as ndi
 
-from minicnmfe._utils import ensure_float32, get_xp, iter_frames, to_numpy
+from minicnmfe._utils import ensure_float32, get_xp, to_numpy
 
 if TYPE_CHECKING:
     import zarr
@@ -74,33 +74,36 @@ def estimate_noise(
     Returns:
         sn: (H, W) float32 noise std estimate.
     """
-    T = movie.shape[0] if hasattr(movie, "shape") else len(movie)
-    # Load full movie in chunks and accumulate PSD
-    # rfft gives T//2+1 frequency bins; select the noise range
-    n_fft = T
-    freqs = np.fft.rfftfreq(n_fft)
+    T, H, W = int(movie.shape[0]), int(movie.shape[1]), int(movie.shape[2])
+    # rfft gives T//2+1 frequency bins; select the noise range.
+    freqs = np.fft.rfftfreq(T)
     noise_mask = (freqs >= noise_range[0]) & (freqs <= noise_range[1])
+    n_freq = int(noise_mask.size)
 
-    _, first = next(iter_frames(movie, batch_size=T))
-    H, W = first.shape[1], first.shape[2]
-    psd_sum = np.zeros((H, W), dtype=np.float64)
-    count = np.zeros((H, W), dtype=np.float64)
-
-    # Process full time axis in one go (we need all T frames for the FFT)
-    # For very large movies this could be adapted to Welch's method
-    all_frames = np.asarray(movie, dtype=np.float32)  # (T, H, W)
-    Xf = np.fft.rfft(all_frames, axis=0)             # (T//2+1, H, W)
-    psd = (np.abs(Xf[noise_mask]) ** 2) / T * 2       # one-sided PSD
-
-    if method == "mean":
-        noise_var = psd.mean(axis=0)
-    elif method == "median":
-        noise_var = np.median(psd, axis=0)
-    elif method == "logmexp":
-        log_psd = np.log(psd + 1e-10)
-        noise_var = np.exp(log_psd.mean(axis=0))
-    else:
+    if method not in ("mean", "median", "logmexp"):
         raise ValueError(f"Unknown noise method: {method!r}")
+
+    # The per-pixel rfft is independent across pixels, so tile the spatial axis
+    # into row-bands and reduce each band to its (H_band, W) noise variance.
+    # This bounds peak RAM to one band's complex128 spectrum (n_freq x dh x W)
+    # instead of materialising the full (T//2+1, H, W) transform -- which is ~2x
+    # the float32 movie -- while producing the identical per-pixel result. Also
+    # avoids reading a zarr movie fully into RAM.
+    band_budget = 512 * 1024 * 1024  # ~512 MB per band's complex slab
+    dh = max(1, band_budget // (max(n_freq, 1) * max(W, 1) * 16))
+
+    noise_var = np.empty((H, W), dtype=np.float64)
+    for h0 in range(0, H, dh):
+        h1 = min(h0 + dh, H)
+        block = np.asarray(movie[:, h0:h1, :], dtype=np.float32)  # (T, dh, W)
+        Xf = np.fft.rfft(block, axis=0)                  # (T//2+1, dh, W)
+        psd = (np.abs(Xf[noise_mask]) ** 2) / T * 2       # one-sided PSD
+        if method == "mean":
+            noise_var[h0:h1] = psd.mean(axis=0)
+        elif method == "median":
+            noise_var[h0:h1] = np.median(psd, axis=0)
+        else:  # logmexp
+            noise_var[h0:h1] = np.exp(np.log(psd + 1e-10).mean(axis=0))
 
     return np.sqrt(noise_var).astype(np.float32)
 
