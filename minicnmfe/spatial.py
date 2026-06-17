@@ -152,7 +152,7 @@ if _HAS_NUMBA:
                 out_coef[a0 + a] = w[a]
 
 
-def _materialize_slab(Y_flat, sn, rows):
+def _materialize_slab(Y_flat, sn, rows, tsub=1):
     """Materialize one (len(rows), T) background-subtracted slab + its sn.
 
     This is the expensive bit of update_spatial on real data: reading the slab
@@ -164,14 +164,18 @@ def _materialize_slab(Y_flat, sn, rows):
     background subtraction is never wasted on the ~70% of empty-support pixels.
     Falls back to fancy indexing for a plain-ndarray Y_flat (used in tests).
     """
-    sub = Y_flat.slice_rows(rows) if hasattr(Y_flat, "slice_rows") else Y_flat[rows]
+    if hasattr(Y_flat, "slice_rows"):
+        sub = Y_flat.slice_rows(rows, tsub)           # subsample at the source (W@Y over T/tsub)
+    else:
+        sub = Y_flat[rows][:, ::tsub] if tsub > 1 else Y_flat[rows]
     Y_block = np.ascontiguousarray(sub, dtype=np.float64)
     sn_block = np.ascontiguousarray(sn[rows], dtype=np.float64)
     return Y_block, sn_block
 
 
 def _spatial_numba_update(Y_flat, C, support, sn, T, n_pixels, n_jobs,
-                          max_iter, tol, ridge, n_workers, lambda_scale=1.0):
+                          max_iter, tol, ridge, n_workers, lambda_scale=1.0,
+                          tsub=1):
     """Per-pixel CD via the numba kernel, with THREADED slab materialization.
 
     The dominant cost on real (mean_active~2) data is not the CD but the
@@ -189,7 +193,15 @@ def _spatial_numba_update(Y_flat, C, support, sn, T, n_pixels, n_jobs,
     n_workers = max(1, min(int(n_workers), int(numba.config.NUMBA_NUM_THREADS)))
     numba.set_num_threads(n_workers)
 
-    C64 = np.ascontiguousarray(C, dtype=np.float64)   # (K, T), shared read-only
+    # spatial_tsub: solve the per-pixel LASSO on a time-subsample. The kernel's
+    # gram/q/max_energy all scale ~1/tsub but the L1 penalty (alpha) only
+    # ~1/sqrt(tsub), so correct lambda_scale by 1/sqrt(tsub) to keep the same
+    # footprints (validated by live_runs/spatial_tsub_probe.py: coef cos ~0.9999).
+    # Default tsub=1 -> Csub is C, lam_eff is lambda_scale -> bit-for-bit.
+    Csub = C[:, ::tsub] if tsub > 1 else C
+    C64 = np.ascontiguousarray(Csub, dtype=np.float64)   # (K, T_eff), read-only
+    T_eff = C64.shape[1]
+    lam_eff = lambda_scale / (tsub ** 0.5) if tsub > 1 else lambda_scale
 
     # Only pixels with non-empty support run CD and contribute to A_new; the
     # other ~70% would have their (expensive) background-subtracted slab
@@ -225,7 +237,7 @@ def _spatial_numba_update(Y_flat, C, support, sn, T, n_pixels, n_jobs,
         t0 = time.perf_counter()
         with threadpool_limits(limits=1, user_api="blas"):
             slabs = Parallel(n_jobs=n_workers, prefer="threads")(
-                delayed(_materialize_slab)(Y_flat, sn, rows) for rows in wave_rows
+                delayed(_materialize_slab)(Y_flat, sn, rows, tsub) for rows in wave_rows
             )
         slab_wall += time.perf_counter() - t0
 
@@ -247,9 +259,10 @@ def _spatial_numba_update(Y_flat, C, support, sn, T, n_pixels, n_jobs,
             out_unconv = np.zeros(nb, dtype=np.int64)
             out_active = np.zeros(nb, dtype=np.int64)
 
+            # Y_block already comes back at T_eff (subsampled in _materialize_slab).
             _spatial_cd_kernel(
-                C64, Y_block, sn_block, supp_idx, supp_off, int(T),
-                int(max_iter), float(tol), float(ridge), float(lambda_scale),
+                C64, Y_block, sn_block, supp_idx, supp_off, int(T_eff),
+                int(max_iter), float(tol), float(ridge), float(lam_eff),
                 out_coef, out_iter, out_ran, out_unconv, out_active,
             )
 
@@ -665,6 +678,7 @@ def update_spatial(
     max_radius_factor: float = 0.0,
     thr_method: str = "max",
     nrg_thr: float = 0.9999,
+    spatial_tsub: int = 1,
 ) -> sp.csc_matrix:
     """Refine spatial footprints by per-pixel non-negative LASSO regression.
 
@@ -775,7 +789,7 @@ def update_spatial(
         spatial_path = f"numba x{n_workers} (slab-parallel)"
         all_results, totals = _spatial_numba_update(
             Y_flat, C, support, sn, T, n_pixels, n_jobs,
-            max_iter, tol, spatial_ridge, n_workers, lambda_scale,
+            max_iter, tol, spatial_ridge, n_workers, lambda_scale, spatial_tsub,
         )
     else:
         from joblib import Parallel, delayed, effective_n_jobs

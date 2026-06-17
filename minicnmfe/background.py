@@ -751,7 +751,7 @@ class BackgroundSubtractor:
             out -= self.bf[start:end, None] * self.f[None, :]
         return out
 
-    def slice_rows(self, rows: np.ndarray) -> np.ndarray:
+    def slice_rows(self, rows: np.ndarray, tsub: int = 1) -> np.ndarray:
         """Return ``Y_bg`` for an arbitrary set of pixel rows -> ``(len(rows), T)``.
 
         Same identity as ``slice`` but for a (non-contiguous) index array rather
@@ -764,7 +764,17 @@ class BackgroundSubtractor:
         """
         rows = np.asarray(rows)
         W_chunk = self.W[rows]
-        Y_chunk = np.asarray(self.Y_flat[rows], dtype=np.float32)
+        # spatial_tsub: read only every tsub-th time column. The identity
+        # ``(I-W)(Y-b0)`` is independent per time column, so this returns exactly
+        # ``slice_rows(rows)[:, ::tsub]`` — bit-identical to subsampling after. Use a
+        # 2D advanced-index (np.ix_) so ONLY the T/tsub columns are read: chained
+        # ``Y_flat[rows][:, ::tsub]`` would gather the full-T rows first (the
+        # bandwidth bottleneck) and subsample after, saving nothing. tsub=1 -> unchanged.
+        _tidx = np.arange(0, self.Y_flat.shape[1], tsub) if tsub > 1 else None
+        if tsub > 1:
+            Y_chunk = np.asarray(self.Y_flat[np.ix_(rows, _tidx)], dtype=np.float32)
+        else:
+            Y_chunk = np.asarray(self.Y_flat[rows], dtype=np.float32)
 
         # As in ``slice``: gather only the ring-neighbour rows (the union of
         # nonzero columns of W_chunk) and remap the sparse column indices to
@@ -775,7 +785,10 @@ class BackgroundSubtractor:
             W_Y = np.zeros_like(Y_chunk)
         else:
             needed = np.unique(indices)
-            Y_needed = np.asarray(self.Y_flat[needed], dtype=np.float32)
+            if tsub > 1:
+                Y_needed = np.asarray(self.Y_flat[np.ix_(needed, _tidx)], dtype=np.float32)
+            else:
+                Y_needed = np.asarray(self.Y_flat[needed], dtype=np.float32)
             remap = np.searchsorted(needed, indices)
             W_chunk_remapped = sp.csr_matrix(
                 (W_chunk.data, remap, W_chunk.indptr),
@@ -787,7 +800,8 @@ class BackgroundSubtractor:
         out = Y_chunk - self.b0[rows, None] - W_Y
         out += W_b0[:, None]
         if self.bf is not None:
-            out -= self.bf[rows, None] * self.f[None, :]
+            f_eff = self.f[::tsub] if tsub > 1 else self.f
+            out -= self.bf[rows, None] * f_eff[None, :]
         return out
 
     def __getitem__(self, key) -> np.ndarray:

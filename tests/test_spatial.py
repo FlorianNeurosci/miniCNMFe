@@ -97,6 +97,35 @@ class TestUpdateSpatial:
         A_new = update_spatial(Y_flat, C, A, sn, (H, W))
         assert A_new.data.min() >= -1e-6
 
+    def test_spatial_tsub_matches_full(self, synth_small):
+        """spatial_tsub>1 (time-subsampled footprint solve, numba path) recovers
+        ~the same footprints as full-T. The per-pixel LASSO is overdetermined, and
+        the 1/sqrt(tsub) lambda correction keeps the penalty consistent, so the
+        footprints match. (Speedup is from reading Y[:, ::tsub] in slice_rows.)
+        """
+        from minicnmfe.spatial import _HAS_NUMBA
+        if not _HAS_NUMBA:
+            import pytest
+            pytest.skip("spatial_tsub is implemented in the numba path")
+
+        d = synth_small
+        T = d["movie"].shape[0]
+        H, W = d["dims"]
+        Y_flat = d["movie"].reshape(T, H * W).T
+        A = sp.csc_matrix(d["A_true"].astype(np.float32))
+        C = d["C_true"].copy()
+        sn = np.ones(H * W, dtype=np.float32) * d["sn_true"]
+
+        A1 = update_spatial(Y_flat, C, A, sn, (H, W), n_jobs=2, spatial_tsub=1)
+        A2 = update_spatial(Y_flat, C, A, sn, (H, W), n_jobs=2, spatial_tsub=2)
+        assert A1.shape == A2.shape
+        D1 = np.asarray(A1.todense()); D2 = np.asarray(A2.todense())
+        for k in range(D1.shape[1]):
+            a, b = D1[:, k], D2[:, k]
+            denom = np.linalg.norm(a) * np.linalg.norm(b)
+            if denom > 0:
+                assert float(a @ b / denom) > 0.95, f"footprint {k} drifted with spatial_tsub=2"
+
 
 class TestThresholdFootprintClosing:
     """Binary closing inside threshold_footprint.

@@ -410,6 +410,14 @@ class CNMFeParams:
     # of the skirt, lower (~0.90) tightens further but past ~0.90 over-tightens
     # (footprints clip real signal and fall below min_pixel). Ignored for "max".
     spatial_nrg_thr: float = 0.95
+    # Time-subsample factor for the per-pixel footprint LASSO in update_spatial
+    # (analogous to bg_tsub for compute_W). The slab (ring W@Y background
+    # subtraction) is the bandwidth-bound bottleneck (~45% of extraction on a big
+    # FOV) and is unhelpable by threads; subsampling time cuts it ∝ 1/tsub. The
+    # LASSO penalty is auto-corrected by 1/sqrt(tsub) so footprints match full-T
+    # (validated: coef cos ~0.9999 at tsub=2). NUMBA path only. Default 1 = off
+    # (bit-for-bit). Try 2.
+    spatial_tsub: int = 1
 
     # --- Temporal update / deconvolution ---
     ar_order: int = 1
@@ -1814,6 +1822,7 @@ class CNMFe:
                 max_radius_factor=p.spatial_max_radius_factor,
                 thr_method=p.spatial_thr_method,
                 nrg_thr=p.spatial_nrg_thr,
+                spatial_tsub=p.spatial_tsub,
             )
             timer.add("update_spatial", time.perf_counter() - _t)
 
