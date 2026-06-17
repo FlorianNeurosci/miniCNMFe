@@ -354,14 +354,21 @@ def greedy_corr_pnr(
     else:
         from joblib import Parallel, delayed
         from threadpoolctl import threadpool_limits
-        with threadpool_limits(limits=1, user_api="blas"):
-            results = Parallel(n_jobs=n_jobs, prefer="threads")(
-                delayed(cv2.filter2D)(
-                    frame, -1, psf, borderType=cv2.BORDER_REFLECT,
-                )
-                for frame in movie
+        # Preallocate and have the threads write each frame in place (disjoint
+        # rows -> no races), mirroring the n_jobs==1 branch. Avoids holding the
+        # `results` list + np.stack output + an astype copy simultaneously
+        # (three full (T,H,W) arrays -> the one-time greedy-init RAM sub-spike).
+        data_filtered = np.empty_like(movie)
+
+        def _filter_into(t):
+            data_filtered[t] = cv2.filter2D(
+                movie[t], -1, psf, borderType=cv2.BORDER_REFLECT,
             )
-        data_filtered = np.stack(results, axis=0).astype(np.float32)
+
+        with threadpool_limits(limits=1, user_api="blas"):
+            Parallel(n_jobs=n_jobs, prefer="threads")(
+                delayed(_filter_into)(t) for t in range(T)
+            )
     data_raw = movie.copy()
 
     # ----- One-shot global noise + CN/PNR (CaImAn init.py:1480-1489) -----
@@ -383,13 +390,14 @@ def greedy_corr_pnr(
     if corrpnr_stride > 1:
         df_stride = np.ascontiguousarray(data_filtered[::corrpnr_stride])
         sn_stride = estimate_noise(df_stride, noise_range=(0.25, 0.5), n_jobs=n_jobs)
-        tmp = np.where(df_stride < thresh_init * sn_stride, 0.0, df_stride)
-        cn = local_correlations_fft(tmp)
-        del tmp, df_stride
+        # Threshold is fused into local_correlations_fft's owned copy, so no
+        # separate full-size `tmp = np.where(...)` array is materialized.
+        cn = local_correlations_fft(df_stride, threshold=thresh_init * sn_stride)
+        del df_stride
     else:
-        tmp = np.where(data_filtered < thresh_init * noise_pixel, 0.0, data_filtered)
-        cn = local_correlations_fft(tmp)
-        del tmp
+        cn = local_correlations_fft(
+            data_filtered, threshold=thresh_init * noise_pixel
+        )
     pnr[pnr < 0] = 0.0
     cn[np.isnan(cn) | (cn < 0)] = 0.0
 

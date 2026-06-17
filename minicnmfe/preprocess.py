@@ -141,13 +141,14 @@ def estimate_noise(
     return np.sqrt(noise_var).astype(np.float32)
 
 
-def local_correlations_fft(movie: np.ndarray, xp=np) -> np.ndarray:
+def local_correlations_fft(movie: np.ndarray, xp=np, *, threshold=None) -> np.ndarray:
     """Compute local (8-neighbor) correlation image.
 
     Each pixel's value is the mean Pearson correlation with its 8 neighbors
     over time. Spatial-domain integer shifts via interior-slice multiplies —
-    no FFT, no complex64/128 allocations. Memory ≈ size of the input movie
-    (the FFT path used to spike to ~13× that on big movies).
+    no FFT, no complex64/128 allocations. Memory ≈ ~2× the input movie: one
+    owned entry copy (so the in-place recenter/normalize below never write
+    through to the caller) plus the one transient inside ``Y.std``.
 
     Edge pixels are divided by their actual neighbor count (5 at corners,
     8 in the bulk), not always 8.
@@ -161,21 +162,34 @@ def local_correlations_fft(movie: np.ndarray, xp=np) -> np.ndarray:
     Args:
         movie: (T, H, W) float32. No pre-conditions on the time-mean.
         xp: Array module — numpy (default) or cupy for GPU computation.
+        threshold: Optional (H, W) / (1, H, W) array broadcast over time. When
+            given, pixels below it are zeroed on the owned entry copy *before*
+            recentering — equivalent to passing ``np.where(movie < threshold,
+            0, movie)`` but without the caller materializing that extra full
+            (T, H, W) array. Default None leaves the input untouched.
 
     Returns:
         cn: (H, W) float32 correlation image (always numpy).
     """
-    Y = xp.asarray(movie, dtype=xp.float32)
+    # One OWNED copy: every op below is in place, so this must not alias the
+    # caller's array (xp.asarray would return a contiguous-float32 input
+    # unchanged and the in-place writes would corrupt it).
+    Y = xp.array(movie, dtype=xp.float32)
     T, H, W = Y.shape
+
+    if threshold is not None:
+        # Fused thresholding on the owned copy — replaces a caller-side
+        # ``np.where(movie < threshold, 0, movie)`` full (T,H,W) allocation.
+        Y[Y < threshold] = 0.0
 
     # Self-recenter so the formula reduces to Pearson r regardless of caller
     # preprocessing. Without this, thresholded inputs (e.g. the 3*sn step in
-    # correlation_pnr) yield biased products that can exceed 1.
-    Y = Y - Y.mean(axis=0, keepdims=True)
+    # correlation_pnr) yield biased products that can exceed 1. In place.
+    Y -= Y.mean(axis=0, keepdims=True)
 
     std = Y.std(axis=0, keepdims=True)
     std[std == 0] = 1.0
-    Y = Y / std  # (T, H, W), zero-mean unit-std traces
+    Y /= std  # (T, H, W), zero-mean unit-std traces (in place)
 
     cn = xp.zeros((H, W), dtype=xp.float32)
     counts = xp.zeros((H, W), dtype=xp.float32)
