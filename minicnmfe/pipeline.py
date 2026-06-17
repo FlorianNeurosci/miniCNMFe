@@ -1437,7 +1437,10 @@ class CNMFe:
             # In deferred mode movie_arr is a zarr handle; `[::init_stride]`
             # reads the strided sample as a numpy array (the only allocation
             # greedy needs), leaving the full movie on disk until after init.
+            # On a network mount this strided read touches every time-chunk.
+            _t_isr = time.perf_counter()
             init_movie = movie_arr[::init_stride]
+            timer.add("init strided read", time.perf_counter() - _t_isr)
         else:
             if defer_materialize:
                 # stride 1: greedy reads every frame, so deferral saves no peak
@@ -1632,11 +1635,13 @@ class CNMFe:
             # full-T init traces through it. This mirrors what the stride==1
             # path gets for free (its first ``compute_W`` sees clean traces),
             # so the first full ``compute_W`` below is no longer blinded.
+            _t_boot = time.perf_counter()
             W0, b0_0 = compute_W(
                 make_2d(init_movie), A, C_init, dims, ring_radius,
                 lambda_reg=p.ring_lambda, n_jobs=p.n_jobs, device=p.device,
                 tsub=1, constrain_sum=p.ring_constrain_sum,
             )
+            timer.add("init bootstrap compute_W", time.perf_counter() - _t_boot)
             # init_movie is no longer needed: project_onto uses the full Y_flat +
             # W0/b0/A, not the strided sample. Free it BEFORE materialising the
             # full movie (fix #2: never hold the full movie and the strided init
@@ -1648,9 +1653,11 @@ class CNMFe:
                 Y_flat = make_2d(movie_arr)
             # project_onto handles numpy and zarr Y_flat (streaming) and
             # returns the background-subtracted projection Y_bg.T @ A → (T, K).
+            _t_proj = time.perf_counter()
             YA_init = BackgroundSubtractor(Y_flat, W0, b0_0).project_onto(
                 A, n_jobs=p.n_jobs
             )
+            timer.add("init trace projection", time.perf_counter() - _t_proj)
             del W0, b0_0
             C_raw = (YA_init / nA_init[None, :]).T.astype(np.float32)     # (K, T)
             C = C_raw.copy()
@@ -1677,6 +1684,7 @@ class CNMFe:
         g_per_k: list[np.ndarray] = []
         sn_per_k = np.zeros(K_init, dtype=np.float32)
 
+        _t_g = time.perf_counter()
         if p.global_ar:
             try:
                 g_global, _ = estimate_ar_params(
@@ -1714,6 +1722,7 @@ class CNMFe:
                     g_k = np.array([fallback_g] * p.ar_order, dtype=np.float32)
                 g_per_k.append(g_k)
                 sn_per_k[k] = _sn_from_footprint(A[:, k], sn_flat)
+        timer.add("AR g estimation", time.perf_counter() - _t_g)
 
         # --- Step 5: Initial ring background ---
         # ring_radius computed above (reused by the init-projection bootstrap).
@@ -1732,9 +1741,11 @@ class CNMFe:
         f_bg: np.ndarray | None = None
         if p.global_bg_rank == 1:
             print("Fitting rank-1 global background b_f · f(t) (initial)...")
+            _t_gbg = time.perf_counter()
             bf, f_bg = _fit_global_bg_rank1(
                 Y_flat, A, C, W_mat, b0, bf=None, f=None, n_iter=2,
             )
+            timer.add("global bg rank-1", time.perf_counter() - _t_gbg)
 
         def _cache_after_merge(members_per_group: list[np.ndarray]) -> None:
             """Update g_per_k / sn_per_k after merge_components reorders K."""
@@ -1758,6 +1769,7 @@ class CNMFe:
             # still overlap, before threshold_footprint() in update_spatial separates them.
             if iteration == 0 and A.shape[1] >= 2:
                 print("  Pre-merging duplicate seeds...")
+                _t_m = time.perf_counter()
                 A, C, n_pre_merged, members_per_group = merge_components(
                     A, C_raw,
                     thr_corr=p.merge_thr_corr,
@@ -1767,6 +1779,7 @@ class CNMFe:
                     dims=dims,
                     centre_dist_factor=p.merge_centre_dist_factor,
                 )
+                timer.add("merge", time.perf_counter() - _t_m)
                 _cache_after_merge(members_per_group)
                 # Keep C_raw aligned with A's new column order: merge groups
                 # become the mean of their members' rows (matches what
@@ -1827,6 +1840,7 @@ class CNMFe:
             timer.add("update_temporal", time.perf_counter() - _t)
 
             print("  Merging correlated components...")
+            _t_m = time.perf_counter()
             A, C, n_merged, members_per_group = merge_components(
                 A, C,
                 thr_corr=p.merge_thr_corr,
@@ -1836,6 +1850,7 @@ class CNMFe:
                 dims=dims,
                 centre_dist_factor=p.merge_centre_dist_factor,
             )
+            timer.add("merge", time.perf_counter() - _t_m)
             _cache_after_merge(members_per_group)
             C_raw = np.vstack([
                 C_raw[m].mean(axis=0).clip(0) for m in members_per_group
