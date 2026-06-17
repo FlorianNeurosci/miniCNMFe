@@ -338,6 +338,22 @@ inside the sweep. Validated equivalent to serial — seeds land on the same cell
 cores). Set `init_patches=False` to force the bit-for-bit serial path. Regression
 test: `test_pipeline.py::test_patched_init_recovers_same_neurons_as_global`.
 
+**Worker count is capped — `init_patch_max_workers` (default 32).** Each patch
+runs in a loky **process**, so on a many-core box the binding cost is *process
+count*, not per-worker size: spawning one Python interpreter per requested job
+(e.g. `n_jobs=128`) for a large movie multiplies per-process RSS far past the
+useful number of patches, and most of that is pure interpreter overhead. `pipeline.fit`
+therefore resolves the requested workers (`init_patch_n_jobs or n_jobs`, with
+`-1`→all CPUs **before** clamping so `min(-1, cap)` can't bypass the cap) and
+clamps to `init_patch_max_workers` via `initialization._resolve_patch_workers`;
+`greedy_corr_pnr_patched` additionally clamps to `len(tiles)` (never more workers
+than patches). At the default 32, init stays well-parallelized while bounding the
+process count. **Results are unchanged** (patches are independent — worker count
+is a pure scheduling choice). Raise the field to use more cores, or set it huge
+to disable. The print line shows the effective (and capped) count. Regression:
+`test_pipeline.py::test_resolve_patch_workers_caps_and_resolves` +
+`test_patched_init_max_workers_does_not_change_results`.
+
 ### `update_spatial` per-pixel CD: ridge for convergence (`spatial_ridge`)
 `update_spatial` solves a per-pixel non-negative LASSO via
 `enet_coordinate_descent_gram`. On real data, active components often have
@@ -1008,6 +1024,7 @@ CaImAn-main/                   Reference source only — never import from here 
 `CNMFeParams` fields (excerpt of the params added or made adjustable in this round):
 - `init_min_corr_neuron: float = 0.8` (was hardcoded 0.9)
 - `init_max_corr_bg: float = 0.4` (was hardcoded 0.3)
+- `init_patch_max_workers: int = 32` — upper bound on patch-init loky processes (caps process-count RAM on many-core boxes; results unchanged). See *Patch-based parallel initialization*.
 - `seed_suppress_factor: float = 2.0` — controls greedy-init suppression disk size
 - `circular_max_dist_factor: float = 2.5` — `circular_constraint` cutoff
 - `merge_centre_dist_factor: float = 2.0` — centre-distance fallback for `merge_components`

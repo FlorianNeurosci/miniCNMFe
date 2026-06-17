@@ -370,6 +370,55 @@ class TestCNMFePipeline:
             from scipy.spatial.distance import pdist
             assert pdist(np.array(cms)).min() > 5.0, "duplicate footprints survived"
 
+    def test_resolve_patch_workers_caps_and_resolves(self):
+        """_resolve_patch_workers caps process count and resolves -1 safely."""
+        import os as _os
+
+        from minicnmfe.initialization import _resolve_patch_workers
+
+        cpu = _os.cpu_count() or 1
+        # -1 / None / 0 ("all CPUs") resolve to cpu_count, then clamp to the cap.
+        assert _resolve_patch_workers(-1, 32) == min(cpu, 32)
+        assert _resolve_patch_workers(None, 32) == min(cpu, 32)
+        # A large request is clamped to the cap — the 128-worker case.
+        assert _resolve_patch_workers(128, 32) == 32
+        # A small request passes through unchanged.
+        assert _resolve_patch_workers(8, 32) == 8
+        # n_patches is a further (structural) clamp.
+        assert _resolve_patch_workers(128, 32, n_patches=10) == 10
+        # Critically, -1 does NOT bypass the cap (min(-1, 32) would be -1).
+        assert _resolve_patch_workers(-1, 4) == min(cpu, 4)
+        # Never returns < 1.
+        assert _resolve_patch_workers(0, 0) >= 1
+
+    def test_patched_init_max_workers_does_not_change_results(self):
+        """Capping init_patch_max_workers must not change extracted components."""
+        from tests.conftest import make_synthetic_movie
+
+        H, W = 96, 96
+        synth = make_synthetic_movie(
+            n_neurons=8, dims=(H, W), T=400, noise_std=0.3, bg_strength=0.6, seed=2,
+        )
+        movie = synth["movie"]
+        common = dict(
+            sigma=3.0, min_corr=0.85, min_pnr=10.0, n_iter_main=1,
+            n_iter_temporal=1, init_stride=1, n_jobs=4, init_patches=True,
+            init_patch_size=48, init_patch_overlap=16, init_patch_min_fov=32,
+        )
+        m_cap1 = CNMFe(CNMFeParams(**common, init_patch_max_workers=1)).fit(
+            movie, do_motion_correction=False
+        )
+        m_cap8 = CNMFe(CNMFeParams(**common, init_patch_max_workers=8)).fit(
+            movie, do_motion_correction=False
+        )
+        # Worker count is purely a scheduling choice — patches are independent —
+        # so the neuron count and footprints must be identical.
+        assert m_cap1.A.shape[1] == m_cap8.A.shape[1]
+        np.testing.assert_allclose(
+            np.asarray(m_cap1.A.todense()), np.asarray(m_cap8.A.todense()),
+            rtol=1e-5, atol=1e-6,
+        )
+
     def test_init_corrpnr_stride_recovers_footprints(self):
         """init_corrpnr_stride must not break neuron recovery.
 

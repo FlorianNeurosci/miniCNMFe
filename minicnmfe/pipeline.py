@@ -7,6 +7,7 @@ ring background → iterative spatial/temporal refinement.
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
@@ -18,7 +19,11 @@ import scipy.sparse as sp
 from minicnmfe._utils import StageTimer, make_2d
 from minicnmfe.background import BackgroundSubtractor, compute_W
 from minicnmfe.evaluate import auto_evaluate_components
-from minicnmfe.initialization import greedy_corr_pnr, greedy_corr_pnr_patched
+from minicnmfe.initialization import (
+    _resolve_patch_workers,
+    greedy_corr_pnr,
+    greedy_corr_pnr_patched,
+)
 from minicnmfe.io import transpose_zarr_to_pixel_major
 from minicnmfe.merging import merge_components
 from minicnmfe.motion_correction import motion_correction_rigid
@@ -288,6 +293,10 @@ class CNMFeParams:
     init_patch_overlap: "int | None" = None  # overlap px; None -> int(4*sigma) (> patch_radius ~3*sigma)
     init_patch_min_fov: int = 128            # only tile when min(H, W) >= this; else global init
     init_patch_n_jobs: "int | None" = None   # patch workers; None -> n_jobs
+    init_patch_max_workers: int = 32         # upper bound on patch-init loky processes
+                                             # (caps process-count RAM on many-core
+                                             # boxes; raise to use more, or set huge
+                                             # to disable). Results are unchanged.
 
     # --- Background (ring model) ---
     ring_size_factor: float = 1.5  # ring radius = ring_size_factor * (2*sigma+1)
@@ -1443,10 +1452,21 @@ class CNMFe:
                 if p.init_patch_overlap is not None
                 else int(4 * p.sigma)
             )
-            patch_n_jobs = p.init_patch_n_jobs or p.n_jobs
+            requested_jobs = p.init_patch_n_jobs or p.n_jobs
+            patch_n_jobs = _resolve_patch_workers(
+                requested_jobs, p.init_patch_max_workers
+            )
+            capped = patch_n_jobs < (
+                (os.cpu_count() or 1) if requested_jobs < 0 else requested_jobs
+            )
             print(
                 f"  Patch-parallel init: patch_size={patch_size}, "
                 f"overlap={patch_overlap}, n_jobs={patch_n_jobs}"
+                + (
+                    f" (capped to init_patch_max_workers={p.init_patch_max_workers})"
+                    if capped
+                    else ""
+                )
             )
             A, C_init, C_raw_init, centers = greedy_corr_pnr_patched(
                 init_movie,

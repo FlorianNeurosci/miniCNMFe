@@ -11,6 +11,7 @@ Reference (algorithmic only):
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import cv2
@@ -567,6 +568,32 @@ def greedy_corr_pnr(
 # `merge_components`. Opt-in through CNMFeParams.init_patches.
 # ---------------------------------------------------------------------------
 
+def _resolve_patch_workers(
+    requested: "int | None",
+    max_workers: int,
+    n_patches: "int | None" = None,
+) -> int:
+    """Resolve the effective patch-init worker count.
+
+    Each patch worker is a loky *process* (Py+numpy+scipy+cv2 ≈ 0.3-0.45 GB RSS
+    on a big movie), so on a many-core box (e.g. 128) spawning one per requested
+    job blows up RAM via process count, not per-worker size. This:
+
+    1. resolves ``-1`` / ``None`` ("all CPUs") to ``os.cpu_count()`` **before**
+       clamping — otherwise ``min(-1, max_workers) == -1`` would bypass the cap;
+    2. clamps to ``max_workers`` (the ``CNMFeParams.init_patch_max_workers``
+       policy cap);
+    3. clamps to ``n_patches`` when given (never spawn more workers than tiles).
+
+    Always returns ``>= 1``.
+    """
+    n = (os.cpu_count() or 1) if (requested is None or requested < 0) else requested
+    n = min(n, max_workers)
+    if n_patches is not None:
+        n = min(n, n_patches)
+    return max(1, n)
+
+
 def _tile_grid(
     H: int, W: int, patch_size: int, patch_overlap: int
 ) -> list[tuple[int, int, int, int]]:
@@ -704,7 +731,10 @@ def greedy_corr_pnr_patched(
     Tiles the in-RAM ``(T, H, W)`` movie into overlapping patches, runs
     `greedy_corr_pnr` per patch in parallel processes, concatenates the
     global-remapped components, and merges border duplicates. Peak extra RAM is
-    ``≈ n_jobs × T × patch_size² × 4`` bytes (per-worker patch copies).
+    ``≈ n_jobs × T × patch_size² × 4`` bytes (per-worker patch copies), so the
+    effective worker count is clamped to ``min(n_jobs, n_patches)`` here (with
+    ``-1`` resolved to all CPUs); the policy upper bound lives in
+    ``CNMFeParams.init_patch_max_workers`` and is applied upstream.
     """
     from joblib import Parallel, delayed
 
@@ -713,6 +743,9 @@ def greedy_corr_pnr_patched(
     movie = np.asarray(movie, dtype=np.float32)
     T, H, W = movie.shape
     tiles = _tile_grid(H, W, patch_size, patch_overlap)
+    # Never spawn more processes than patches (and resolve -1 -> all CPUs). The
+    # CNMFeParams policy cap is applied in pipeline; this protects direct callers.
+    n_jobs = _resolve_patch_workers(n_jobs, os.cpu_count() or 1, len(tiles))
 
     results = Parallel(n_jobs=n_jobs)(
         delayed(_greedy_patch_worker)(
