@@ -1405,6 +1405,23 @@ class CNMFe:
         #     n_jobs=p.n_jobs, device=p.device,
         # )
 
+        # L3 chunked materialisation of a deferred zarr movie into a fresh
+        # float32 array. np.empty + chunked copy, NOT np.asarray(zarr, float32)
+        # (which reads the native array then .astype-copies it -> ~3x resident).
+        # Caps materialisation at ~1x. Used by the stride==1 path (before greedy)
+        # and the stride>1 path (after the init bootstrap), so the full movie is
+        # never co-resident with the strided init sample.
+        def _materialise_full_movie():
+            nonlocal movie_arr
+            _t_mat = time.perf_counter()
+            _zsrc = movie_arr
+            movie_arr = np.empty(_zsrc.shape, dtype=np.float32)
+            for _s in range(0, _zsrc.shape[0], 1000):
+                _e = min(_s + 1000, _zsrc.shape[0])
+                movie_arr[_s:_e] = _zsrc[_s:_e]
+            del _zsrc
+            timer.add("materialise movie (post-init)", time.perf_counter() - _t_mat)
+
         # --- Step 4: Initialization ---
         # Greedy init allocates two full (T, H, W) float32 copies inside
         # (`data_filtered` after PSF + `data_raw`). On a 10k × 600 × 600
@@ -1428,7 +1445,7 @@ class CNMFe:
                 # also leave init_movie as a zarr handle, disabling patched init
                 # (which needs a numpy init_movie). Materialise now so the path
                 # matches the numpy case exactly.
-                movie_arr = np.asarray(movie_arr, dtype=np.float32)
+                _materialise_full_movie()
                 defer_materialize = False
             init_movie = movie_arr
         T_init = int(init_movie.shape[0])
@@ -1562,30 +1579,19 @@ class CNMFe:
         # materialisation.
         if streaming:
             Y_flat = Y_flat_zarr
+        elif defer_materialize and init_stride > 1:
+            # L3 + strided init: DEFER the full materialisation past the init
+            # bootstrap below (its compute_W needs only the strided init sample).
+            # The full movie is brought in just before project_onto, AFTER
+            # init_movie is freed, so the full movie and the strided sample are
+            # never co-resident (the ~movie + 2*sample peak). Y_flat set there.
+            Y_flat = None
         else:
+            # Non-deferred (numpy in), or stride==1 (already materialised above).
+            # Greedy is done and its (T_init,H,W) buffers are freed, so the
+            # resident-movie floor no longer stacks under the peak.
             if defer_materialize:
-                # L3: greedy is done and its (T_init,H,W) buffers are freed, so
-                # the resident-movie floor no longer stacks under the peak. Bring
-                # the full movie into RAM now for the BCD (Y_flat is a view of it).
-                #
-                # Read chunk-by-chunk into a preallocated float32 array — NOT
-                # `np.asarray(zarr, dtype=float32)`, which reads the native array
-                # and then `.astype`-copies it (~3x the movie resident at once,
-                # ~70 GB for a 23 GB movie). That transient would become the new
-                # global peak (worse than the greedy peak we just cut). Preallocate
-                # + fill caps the materialisation at ~1x the movie (same pattern as
-                # the fused-MC in-RAM load).
-                _t_mat = time.perf_counter()
-                _zsrc = movie_arr
-                movie_arr = np.empty(_zsrc.shape, dtype=np.float32)
-                _load_chunk = 1000   # frames per read; bounds the transient buffer
-                for _s in range(0, _zsrc.shape[0], _load_chunk):
-                    _e = min(_s + _load_chunk, _zsrc.shape[0])
-                    movie_arr[_s:_e] = _zsrc[_s:_e]
-                del _zsrc
-                timer.add(
-                    "materialise movie (post-init)", time.perf_counter() - _t_mat
-                )
+                _materialise_full_movie()
             Y_flat = make_2d(movie_arr)     # (H*W, T) view
         sn_flat = self.sn.ravel()           # (H*W,)
 
@@ -1631,6 +1637,15 @@ class CNMFe:
                 lambda_reg=p.ring_lambda, n_jobs=p.n_jobs, device=p.device,
                 tsub=1, constrain_sum=p.ring_constrain_sum,
             )
+            # init_movie is no longer needed: project_onto uses the full Y_flat +
+            # W0/b0/A, not the strided sample. Free it BEFORE materialising the
+            # full movie (fix #2: never hold the full movie and the strided init
+            # sample together — that was the ~movie + 2*sample bootstrap co-peak),
+            # then bring the full movie in for the projection and the BCD.
+            del init_movie
+            if Y_flat is None:        # deferred (L3 + stride>1) -> materialise now
+                _materialise_full_movie()
+                Y_flat = make_2d(movie_arr)
             # project_onto handles numpy and zarr Y_flat (streaming) and
             # returns the background-subtracted projection Y_bg.T @ A → (T, K).
             YA_init = BackgroundSubtractor(Y_flat, W0, b0_0).project_onto(
@@ -1643,11 +1658,7 @@ class CNMFe:
             # stride==1: greedy already produced full-T per-pixel-OLS traces.
             C_raw = C_raw_init.astype(np.float32)
             C = C_init.astype(np.float32)
-
-        # The strided init movie is no longer needed once its traces are
-        # re-projected at full T.
-        if init_stride > 1:
-            del init_movie
+            # (init_movie == movie_arr here; it stays as the working movie.)
 
         # Estimate the AR coefficient `g` ONCE from the pooled raw traces.
         #
