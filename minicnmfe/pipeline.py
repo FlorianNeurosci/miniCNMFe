@@ -1635,11 +1635,17 @@ class CNMFe:
             # full-T init traces through it. This mirrors what the stride==1
             # path gets for free (its first ``compute_W`` sees clean traces),
             # so the first full ``compute_W`` below is no longer blinded.
+            # Subsample time like the main ring fit (was tsub=1). This bootstrap
+            # only needs a ROUGH W0/b0 to de-leak the strided-init projection, and
+            # compute_W clamps actual_tsub to keep >=200 frames, so the per-pixel
+            # ring regression stays hugely overdetermined -> W0/b0 ~unchanged but
+            # ~bg_tsub x faster (it was the single largest fit_extract stage, run
+            # at full time resolution on the strided sample).
             _t_boot = time.perf_counter()
             W0, b0_0 = compute_W(
                 make_2d(init_movie), A, C_init, dims, ring_radius,
                 lambda_reg=p.ring_lambda, n_jobs=p.n_jobs, device=p.device,
-                tsub=1, constrain_sum=p.ring_constrain_sum,
+                tsub=p.bg_tsub, constrain_sum=p.ring_constrain_sum,
             )
             timer.add("init bootstrap compute_W", time.perf_counter() - _t_boot)
             # init_movie is no longer needed: project_onto uses the full Y_flat +
