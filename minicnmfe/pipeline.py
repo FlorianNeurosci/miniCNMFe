@@ -1323,6 +1323,8 @@ class CNMFe:
 
         # --- Streaming mode (Y_flat_zarr supplied or auto-derived) ------------
         streaming = Y_flat_zarr is not None
+        # L3: in-memory path on a zarr movie -> materialise AFTER greedy init.
+        defer_materialize = False
         if streaming:
             try:
                 import zarr as _zarr_pkg
@@ -1341,8 +1343,24 @@ class CNMFe:
                 )
             movie_arr = movie    # zarr handle; never asarray'd in full
         else:
-            movie_arr = np.asarray(movie, dtype=np.float32)
-            T, H, W = movie_arr.shape
+            # In-memory path. When `movie` is a zarr (not numpy) we DEFER the
+            # full 23 GB materialisation until after greedy init (L3): the full
+            # movie is not touched during the greedy peak — only the strided
+            # init sample (`movie_arr[::init_stride]`) and the noise-stats slice
+            # are, and both read lazily from the zarr exactly like the streaming
+            # branch above. Keeping the movie on disk until then removes the
+            # resident-movie floor from under the greedy peak. It is materialised
+            # below, just before `make_2d`, once greedy's buffers are freed.
+            # A numpy `movie` is already resident -> nothing to defer.
+            defer_materialize = is_zarr_movie
+            if defer_materialize:
+                movie_arr = movie    # zarr handle; full asarray happens post-init
+                T, H, W = (
+                    int(movie.shape[0]), int(movie.shape[1]), int(movie.shape[2]),
+                )
+            else:
+                movie_arr = np.asarray(movie, dtype=np.float32)
+                T, H, W = movie_arr.shape
 
         dims = (H, W)
         self.dims = dims
@@ -1350,6 +1368,8 @@ class CNMFe:
         # --- Log effective config so users can see what they got ---
         if streaming:
             stream_str = f"yes (Y_flat_zarr={'auto-derived' if auto_derived_y_flat else 'user-supplied'})"
+        elif defer_materialize:
+            stream_str = "no (movie materialised in RAM after greedy init)"
         else:
             stream_str = "no (movie materialised in RAM)"
         print(
@@ -1532,6 +1552,15 @@ class CNMFe:
         if streaming:
             Y_flat = Y_flat_zarr
         else:
+            if defer_materialize:
+                # L3: greedy is done and its (T_init,H,W) buffers are freed, so
+                # the resident-movie floor no longer stacks under the peak. Bring
+                # the full movie into RAM now for the BCD (Y_flat is a view of it).
+                _t_mat = time.perf_counter()
+                movie_arr = np.asarray(movie_arr, dtype=np.float32)
+                timer.add(
+                    "materialise movie (post-init)", time.perf_counter() - _t_mat
+                )
             Y_flat = make_2d(movie_arr)     # (H*W, T) view
         sn_flat = self.sn.ravel()           # (H*W,)
 

@@ -113,8 +113,11 @@ def main() -> None:
     model = CNMFe(params)
     t0 = time.time()
     if args.in_memory:
-        movie = np.asarray(z, dtype=np.float32)
-        model.fit_extract(movie, evaluate=not args.no_eval)
+        # Pass the zarr handle (no output_dir) so fit_extract takes the L3
+        # deferred-materialize path: greedy init reads only the strided sample,
+        # the full movie is brought into RAM after init -> lower peak, identical
+        # results. (On a network mount, stage the store local first.)
+        model.fit_extract(z, evaluate=not args.no_eval)
     else:
         # zarr + output_dir => streaming: Y_flat pixel-major store derived here.
         model.fit_extract(z, output_dir=out_dir, evaluate=not args.no_eval)

@@ -828,6 +828,49 @@ class TestCNMFePipeline:
         )
         assert m_again.A.shape == m_mem.A.shape
 
+    def test_fit_extract_deferred_materialize_matches_numpy(
+        self, synth_small, tmp_path
+    ):
+        """L3 regression: a zarr movie passed to fit_extract (no Y_flat_zarr,
+        no output_dir) takes the in-memory path but DEFERS the full-RAM
+        materialisation until after greedy init. It must produce the same
+        A/C/S/C_raw as passing the equivalent numpy array (which materialises
+        up front) — the change is *when* the movie is read, not *what* is
+        computed. init_stride=2 forces the trickier init_stride>1 branch
+        (make_2d(init_movie) + ring bootstrap) on the deferred path.
+        """
+        from minicnmfe.io import save_zarr
+        import zarr as _zarr
+
+        movie_np = synth_small["movie"].astype(np.float32)
+
+        src_path = tmp_path / "src.zarr"
+        save_zarr(movie_np, str(src_path))
+        src_zarr = _zarr.open_array(str(src_path), mode="r")
+
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.5, min_pnr=3.0,
+            n_iter_main=2, n_iter_temporal=2,
+            init_stride=2,   # exercise the init_stride>1 deferred branch
+            n_jobs=1,        # deterministic reductions for a tight comparison
+        )
+
+        # Baseline: numpy in -> materialised up front (defer_materialize=False).
+        m_mem = CNMFe(params).fit_extract(movie_np)
+        # L3: zarr in, no Y_flat_zarr/output_dir -> deferred materialisation.
+        m_def = CNMFe(params).fit_extract(src_zarr)
+
+        assert m_def.A.shape == m_mem.A.shape, (
+            f"K mismatch: deferred={m_def.A.shape[1]}, numpy={m_mem.A.shape[1]}"
+        )
+        np.testing.assert_allclose(
+            np.asarray(m_def.A.todense()), np.asarray(m_mem.A.todense()),
+            atol=1e-4, rtol=1e-4,
+        )
+        np.testing.assert_allclose(m_def.C, m_mem.C, atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(m_def.S, m_mem.S, atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(m_def.C_raw, m_mem.C_raw, atol=1e-4, rtol=1e-4)
+
     def test_yflat_store_knobs_divert_location_and_preserve_results(
         self, synth_small, tmp_path
     ):
