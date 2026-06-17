@@ -871,6 +871,48 @@ class TestCNMFePipeline:
         np.testing.assert_allclose(m_def.S, m_mem.S, atol=1e-4, rtol=1e-4)
         np.testing.assert_allclose(m_def.C_raw, m_mem.C_raw, atol=1e-4, rtol=1e-4)
 
+    def test_fit_extract_deferred_materialize_matches_numpy_with_patches(self, tmp_path):
+        """L3 + patch-parallel greedy init (the production server config). The
+        deferred-zarr path must match the numpy path even when init_patches=True,
+        which is what the CalciumImagingPipelineDB MiniCnmfeExtraction wrapper runs.
+        init_stride=2 keeps init_movie a numpy strided sample so the patch-guard
+        (isinstance(init_movie, np.ndarray)) holds on the deferred path too. Params
+        mirror test_patched_init_recovers_same_neurons_as_global (well-posed: tight
+        thresholds + low noise) so neither path over-detects into a degenerate solve.
+        """
+        from tests.conftest import make_synthetic_movie
+        from minicnmfe.io import save_zarr
+        import zarr as _zarr
+
+        movie_np = make_synthetic_movie(
+            n_neurons=8, dims=(96, 96), T=400, noise_std=0.3, bg_strength=0.6, seed=2,
+        )["movie"].astype(np.float32)
+
+        src_path = tmp_path / "src.zarr"
+        save_zarr(movie_np, str(src_path))
+        src_zarr = _zarr.open_array(str(src_path), mode="r")
+
+        params = CNMFeParams(
+            sigma=3.0, min_corr=0.85, min_pnr=10.0,
+            n_iter_main=2, n_iter_temporal=2,
+            init_stride=2,
+            init_patches=True, init_patch_size=48, init_patch_overlap=16,
+            init_patch_min_fov=32, init_patch_n_jobs=2,
+            n_jobs=1,
+        )
+
+        m_mem = CNMFe(params).fit_extract(movie_np)
+        m_def = CNMFe(params).fit_extract(src_zarr)
+
+        assert m_def.A.shape == m_mem.A.shape, (
+            f"K mismatch: deferred={m_def.A.shape[1]}, numpy={m_mem.A.shape[1]}"
+        )
+        np.testing.assert_allclose(
+            np.asarray(m_def.A.todense()), np.asarray(m_mem.A.todense()),
+            atol=1e-4, rtol=1e-4,
+        )
+        np.testing.assert_allclose(m_def.C, m_mem.C, atol=1e-4, rtol=1e-4)
+
     def test_yflat_store_knobs_divert_location_and_preserve_results(
         self, synth_small, tmp_path
     ):

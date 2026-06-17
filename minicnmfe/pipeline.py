@@ -1417,8 +1417,19 @@ class CNMFe:
             init_stride = max(1, T // 5000)
 
         if init_stride > 1:
+            # In deferred mode movie_arr is a zarr handle; `[::init_stride]`
+            # reads the strided sample as a numpy array (the only allocation
+            # greedy needs), leaving the full movie on disk until after init.
             init_movie = movie_arr[::init_stride]
         else:
+            if defer_materialize:
+                # stride 1: greedy reads every frame, so deferral saves no peak
+                # (the movie must be resident during init regardless) and would
+                # also leave init_movie as a zarr handle, disabling patched init
+                # (which needs a numpy init_movie). Materialise now so the path
+                # matches the numpy case exactly.
+                movie_arr = np.asarray(movie_arr, dtype=np.float32)
+                defer_materialize = False
             init_movie = movie_arr
         T_init = int(init_movie.shape[0])
 
@@ -1556,8 +1567,22 @@ class CNMFe:
                 # L3: greedy is done and its (T_init,H,W) buffers are freed, so
                 # the resident-movie floor no longer stacks under the peak. Bring
                 # the full movie into RAM now for the BCD (Y_flat is a view of it).
+                #
+                # Read chunk-by-chunk into a preallocated float32 array — NOT
+                # `np.asarray(zarr, dtype=float32)`, which reads the native array
+                # and then `.astype`-copies it (~3x the movie resident at once,
+                # ~70 GB for a 23 GB movie). That transient would become the new
+                # global peak (worse than the greedy peak we just cut). Preallocate
+                # + fill caps the materialisation at ~1x the movie (same pattern as
+                # the fused-MC in-RAM load).
                 _t_mat = time.perf_counter()
-                movie_arr = np.asarray(movie_arr, dtype=np.float32)
+                _zsrc = movie_arr
+                movie_arr = np.empty(_zsrc.shape, dtype=np.float32)
+                _load_chunk = 1000   # frames per read; bounds the transient buffer
+                for _s in range(0, _zsrc.shape[0], _load_chunk):
+                    _e = min(_s + _load_chunk, _zsrc.shape[0])
+                    movie_arr[_s:_e] = _zsrc[_s:_e]
+                del _zsrc
                 timer.add(
                     "materialise movie (post-init)", time.perf_counter() - _t_mat
                 )
