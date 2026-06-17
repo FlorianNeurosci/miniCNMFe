@@ -160,8 +160,12 @@ def estimate_ar_params(
             g[1:] = g[1:] * fudge_factor
     else:
         g = g_yw * fudge_factor
-    # Clip to (0, 1) for stability
-    g = np.clip(g, 0.0, 0.9999)
+    # Clip to (0, 1) for stability. The lower bound must be strictly positive:
+    # oasis' constrained_oasisAR1 returns a NaN (at the last frame) when g==0
+    # exactly, which then poisons b0/W/the whole background. 1e-6 matches the
+    # floor used by decay_time_to_g above; g~1e-6 deconvolves to ~the raw trace
+    # (no AR smoothing), correct for a noise-like seed.
+    g = np.clip(g, 1e-6, 0.9999)
     return g.astype(np.float32), float(sn)
 
 
@@ -286,6 +290,23 @@ def _oasis_ar1_pava(y: np.ndarray, g: float, sn: float) -> tuple[np.ndarray, np.
     return c.astype(np.float32), s.astype(np.float32), float(bl)
 
 
+def _guard_deconv_output(c, s, bl, trace):
+    """Sanitize a (c, s, bl) deconvolution result.
+
+    oasis can return a non-finite trace for pathological inputs (e.g. g==0,
+    which NaNs the last frame). A single NaN here propagates through b0/W into
+    the whole background and silently kills the extraction, so fall back to the
+    clipped raw trace rather than let a NaN escape.
+    """
+    c = np.asarray(c, dtype=np.float32)
+    s = np.asarray(s, dtype=np.float32)
+    if not np.isfinite(c).all() or not np.isfinite(bl):
+        c = trace.clip(0).astype(np.float32)
+        s = np.zeros_like(c)
+        bl = 0.0
+    return c, s, float(bl)
+
+
 def deconvolve(
     trace: np.ndarray,
     g: np.ndarray,
@@ -318,7 +339,7 @@ def deconvolve(
                 g=(float(g[0]),),
                 sn=sn,
             )
-            return c.astype(np.float32), s.astype(np.float32), float(bl)
+            return _guard_deconv_output(c, s, bl, trace)
         else:
             from oasis.functions import deconvolve as oasis_deconvolve
             c, s, bl, g_out, _ = oasis_deconvolve(
@@ -327,7 +348,7 @@ def deconvolve(
                 g=tuple(float(gi) for gi in g),
                 sn=sn,
             )
-            return c.astype(np.float32), s.astype(np.float32), float(bl)
+            return _guard_deconv_output(c, s, bl, trace)
     except ImportError:
         # Pure-Python fallback (AR1 only)
         if p == 1:
