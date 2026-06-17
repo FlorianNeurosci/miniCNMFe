@@ -40,13 +40,18 @@ class StageTimer:
         self._order: list[str] = []
 
     def add(self, label: str, secs: float) -> None:
-        """Record ``secs`` against ``label`` (accumulates if repeated)."""
+        """Record ``secs`` against ``label`` (accumulates if repeated).
+
+        Also prints the duration live (flushed) so a long run shows each stage's
+        time as it completes, not only in the end-of-run ``summary()``.
+        """
         if label not in self._secs:
             self._secs[label] = 0.0
             self._calls[label] = 0
             self._order.append(label)
         self._secs[label] += secs
         self._calls[label] += 1
+        print(f"  [stage] {label}: {secs:.1f}s", flush=True)
 
     @contextmanager
     def stage(self, label: str):
