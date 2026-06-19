@@ -8,7 +8,8 @@ PNG figures) you can use to judge quality.
 Two depth modes:
 
 - ``heuristic`` — fast image-based suggestions (blob_log neuron radius,
-  seed-count knee, shift histograms). No full extraction.
+  CORR/PNR threshold from cell-blob morphology, shift histograms). No full
+  extraction.
 - ``sweep`` — actually run ``fit_extract`` across a small grid of the key
   extraction knobs and score each candidate with ground-truth-free quality
   proxies (cell count, accepted fraction, ``corr(C, C+YrA)``, footprint area,

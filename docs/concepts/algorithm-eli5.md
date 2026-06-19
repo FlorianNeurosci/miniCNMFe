@@ -4,7 +4,7 @@ tags: [minicnmfe, explainer, eli5]
 
 # CNMFe — Explained Like You're Five
 
-> For the equations behind each step, see [[algorithm-math]]. For where to find the code, see [[architecture]].
+> For the equations behind each step, see [algorithm math](./algorithm-math.md). For where to find the code, see [architecture](./architecture.md).
 
 ---
 
@@ -124,7 +124,7 @@ We use an algorithm called **OASIS** (Online Active Set to Infer Spikes) — it'
 
 The decay number `g` depends on the indicator (which GCaMP variant you're using) and how fast you record. You can let the pipeline guess it from the data (fine on clean recordings), but on noisy 1-photon recordings the slow background drift makes the guess wrong — it usually says "the bathtub drains very slowly" even when it doesn't.
 
-The fix: tell the pipeline what you actually used. Set `decay_time_ms` (e.g. 140 for GCaMP6f, 180 for jGCaMP8m) and `frame_rate_hz`. The pipeline turns those into the right `g` and uses it as a Bayesian *prior* — the data gets to nudge `g` away from the target if it really disagrees, but mostly it just anchors `g` where biology says it should be. See `wiki/api-reference.md` for the indicator table.
+The fix: tell the pipeline what you actually used. Set `decay_time_ms` (e.g. 140 for GCaMP6f, 180 for jGCaMP8m) and `frame_rate_hz`. The pipeline turns those into the right `g` and uses it as a Bayesian *prior* — the data gets to nudge `g` away from the target if it really disagrees, but mostly it just anchors `g` where biology says it should be. See the [API reference](../api/index.md) for the indicator table.
 
 ---
 

@@ -8,7 +8,7 @@ tags: [minicnmfe, math, algorithm, background, extension]
 > `CNMFeParams(ring_constrain_sum=True)`. Off by default — set explicitly
 > to True for recordings with global brightness events.
 >
-> See also: [[algorithm-math]] §6 (ring background), [[api-reference]]
+> See also: [algorithm math](./algorithm-math.md) §6 (ring background), [API reference](../api/index.md)
 > for `compute_W`.
 
 ## Problem

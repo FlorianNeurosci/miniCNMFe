@@ -41,6 +41,8 @@ oasis = ["oasis-deconv"]
 #   pip install cupy-cuda12x   (CUDA 12.x)
 #   pip install cupy-cuda11x   (CUDA 11.x)
 gpu = ["cupy-cuda12x >= 12.0"]
+# Build the MkDocs Material documentation site locally (`mkdocs serve` / `mkdocs build`).
+docs = ["mkdocs-material >= 9.5", "pymdown-extensions >= 10.0"]
 dev = ["minicnmfe[test,tutorial,oasis]", "ruff"]
 
 [build-system]

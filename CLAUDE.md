@@ -19,7 +19,7 @@ algorithmic reference only. All math is reimplemented from scratch with numpy/sc
 
 ## Current status
 
-**Complete and working.** All 88 tests pass:
+**Complete and working.** All 282 tests pass:
 
 ```bash
 pytest tests/ -v
@@ -35,7 +35,7 @@ Major work done so far:
 - Four tutorials: `tutorial.ipynb`, `tutorial2.ipynb` (clean rewrite), `tutorial_realistic.ipynb` (uses the realistic simulator), `tutorial_caiman_compare.ipynb` (CaImAn side-by-side, requires CaImAn), and `tutorial_demo.ipynb` (realistic lazy-load AVI workflow)
 - Demo movie generation + AVI-to-zarr workflow: `generate_demo_movies.py`, `convert_to_zarr.py`, `concat_avis_to_zarr.py`
 - CLI pipeline runner: `full_pipeline.py` (loads zarr lazily, runs full pipeline, saves all results to disk)
-- Obsidian wiki (`wiki/`) updated for all of the above
+- Documentation in `docs/` (getting-started, concepts, api, guides, tuning) — GitHub-renderable, updated for all of the above
 
 ### Experimental — passing automated tests, NOT yet validated on real data
 
@@ -61,7 +61,7 @@ change standard behaviour unless explicitly enabled.
    not verified. The weakest-tested of the three; validate on a small batch
    first.
 4. **Parameter tuning** (`tuning/`, `tune.py`, `live_runs/tune.ipynb`,
-   `wiki/parameter-tuning.md`) — one-path-in workflow that suggests MC +
+   `docs/tuning/guide.md`) — one-path-in workflow that suggests MC +
    extraction params and writes a report folder (`recommended_params.json` +
    `report.md` + figures). Heuristics are lifted verbatim from the maintainer's
    `estimate_params.ipynb`; the graded extraction **sweep** + ground-truth-free
@@ -90,7 +90,7 @@ change standard behaviour unless explicitly enabled.
 | Deconvolution | `oasis-deconv` package | Pure-Python PAVA AR(1) fallback if not installed |
 | CPU parallelism | `joblib` / `loky` | All parallel workers defined at module level (pickling requirement) |
 | GPU | `cupy` (optional) | `get_xp(device)` in `_utils.py` returns numpy or cupy |
-| Spatial LASSO | `sklearn.linear_model.LassoLars` | CPU-only, no GPU equivalent |
+| Spatial solve | `sklearn` `enet_coordinate_descent_gram` (positive elastic-net CD, L1 + `spatial_ridge` L2) | CPU-only, no GPU equivalent |
 | OASIS | sequential PAVA | Cannot be GPU-accelerated (inherently sequential) |
 | mp4 export | `opencv-python` (cv2) preferred, imageio with explicit codec as fallback | imageio's `pyav` plugin without an explicit codec fails on Windows envs |
 | Tests | pytest | Synthetic ground-truth movies in `tests/conftest.py` and `tests/miniscope_simulator.py` |
@@ -289,7 +289,7 @@ and apply the resulting shift to the full (uncropped) frame.
 - GPU-capable functions take `device: str = "cpu"` parameter
 - CPU-parallel functions take `n_jobs: int = 1` parameter
 - Both are threaded through `CNMFeParams` → `CNMFe.fit()` → every downstream call
-- `spatial.py` has no GPU path (LassoLars); `temporal.py` GPU only covers the projection, not OASIS
+- `spatial.py` has no GPU path (elastic-net CD via `enet_coordinate_descent_gram`); `temporal.py` GPU only covers the projection, not OASIS
 
 ### Module-level worker functions
 All functions dispatched by `joblib.Parallel` are defined at module top level (not as
@@ -525,6 +525,10 @@ this is a labeling choice, not a change to the extracted signal.
   path (old saved models with un-normalized `A`; the direct unit tests in
   `tests/test_evaluate.py`). **Do not** unit-norm `A` without threading `A_norm` into
   evaluate — it destroys the ghost filter and its tuned `auto_eval_snr_amp_thr=3.0`.
+  (Note: `3.0` is the `CNMFeParams` package default. The tuner's long-recording
+  base — `tuning/validate.py:good_defaults` — deliberately overrides it to `20.0`,
+  a harder ghost cut given typical SNR spreads on long sessions. Both numbers are
+  intentional; they apply to different entry points.)
 - `upsample_to_native` / `place_in_full_fov` carry `A_norm` over (exact for the
   zero-padding map-back; approximate after bilinear upsampling — inspection-only views).
 - Regression: `tests/test_stage_split.py` (bit-for-bit `fit()` == staged, and
@@ -995,7 +999,7 @@ tests/
   test_pipeline.py             includes test_temporal_correlation_against_truth (regression for the AR drift fix)
   test_stage_split.py          fit() == fit_mc -> fit_extract -> evaluate (staged decomposition)
   test_downsample.py           downsample_movie / downscaled / end-to-end downsampled recovery
-wiki/                          Obsidian docs (math, eli5, architecture, api-reference, usage-guide)
+docs/                          GitHub-renderable docs: getting-started/, concepts/ (algorithm-math, algorithm-eli5, architecture, ring-background, caiman-comparison), api/, guides/ (per-stage), tuning/ (index + guide)
 demo_movies/                   Generated AVI files + _meta.npz sidecars + .zarr stores (created by scripts below)
 generate_demo_movies.py        Generate demo_movies/*.avi with ground-truth NPZ sidecars (idempotent)
 convert_to_zarr.py             Batch-convert demo_movies/*.avi -> *.zarr (idempotent)
@@ -1008,7 +1012,7 @@ tune.py                        SINGLE front door: `tune.py <path>` = heuristics 
 validate_session.py            Internal stage / standalone CLI: fused MC once -> Y_flat once -> fit_extract per threshold set (reuses Y_flat) -> diagnostics + comparison.md. Use directly only to re-validate or add threshold sets.
 batch_tune.py                  Batch stage: run_batch() runs one `tune.py --validate` subprocess per session in ONE background process (bounded concurrency, BLAS-capped) -> batch_summary.md. No sub-agents. `tune.py --sessions` delegates here.
 tuning/                        Tuning package: io_sample, heuristics (per-knob suggest_*; neuron-radius estimate spatial-high-pass-filtered, highpass_sigma=8, for hazy/out-of-focus FOV robustness), metrics (GT-free quality proxies), sweep (graded fit_extract grid), report (figures + report.md + packaged diagnostics: fig_footprint_grid/eccentricity/jaccard_merge/centroid_drift/mean_proj_and_activity + DIAGNOSTIC_FIGS + METRICS_BLURB/SYMPTOM_CAUSE_KNOB), report_html (self-contained report.html: base64 figs + sortable candidate table), tuner, validate (read_session_meta + validate_session + tune_then_validate + good_defaults)
-.claude/skills/tune-session/   User-invoked skill (/tune-session <path...>|<list.txt>): metadata -> tune.py (tune+validate+html) -> verdict + per-session LEARNINGS.md. Gotcha checklist lives in wiki/parameter-tuning.md (single source). Multiple paths / a .txt list run via batch_tune (one background process, NOT sub-agents). --figs/--no-figs gates end-of-run PNG viewing (the dominant token cost)
+.claude/skills/tune-session/   User-invoked skill (/tune-session <path...>|<list.txt>): metadata -> tune.py (tune+validate+html) -> verdict + per-session LEARNINGS.md. Gotcha checklist lives in docs/tuning/guide.md (single source). Multiple paths / a .txt list run via batch_tune (one background process, NOT sub-agents). --figs/--no-figs gates end-of-run PNG viewing (the dominant token cost)
 tutorial.ipynb                 Original walkthrough (preserved)
 tutorial2.ipynb                Clean rewrite of the original tutorial
 tutorial_realistic.ipynb       Tutorial on the realistic simulator + mp4 export of the simulated movie
@@ -1063,7 +1067,7 @@ pip install oasis-deconv          # faster deconvolution
 pip install cupy-cuda12x                 # GPU support (match your CUDA version)
 
 # Tests
-pytest tests/ -v                         # all 88 tests
+pytest tests/ -v                         # all 282 tests
 pytest tests/test_pipeline.py -v         # pipeline + temporal-correlation regression
 pytest tests/test_multiprocessing.py -v  # parallelism only
 

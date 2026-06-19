@@ -132,7 +132,7 @@ def good_defaults(*, frame_rate_hz: float, decay_time_ms: float = 180.0,
         min_corr=min_corr, min_pnr=min_pnr,
         min_pixel=60,                 # floor only; SNR is the ghost discriminator
         global_bg_rank=1,             # absorb slow drift on long recordings
-        auto_eval_snr_amp_thr=20.0,   # real ghost cut given typical SNR spreads
+        auto_eval_snr_amp_thr=20.0,   # long-recording override of the CNMFeParams default (3.0); a harder ghost cut given typical SNR spreads on long sessions
         decay_time_ms=decay_time_ms,  # physical τ, NOT the drift-inflated estimate
         frame_rate_hz=frame_rate_hz, g_prior_weight=0.6,
         init_stride=2,                # auto under-seeds long movies

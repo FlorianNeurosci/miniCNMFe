@@ -371,7 +371,13 @@ def ensure_float32_1d(x: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def _deconvolve_one(trace_k: np.ndarray, ar_order: int) -> tuple[np.ndarray, np.ndarray]:
-    """Deconvolve a single trace (module-level so it is picklable)."""
+    """Deconvolve a single trace (module-level so it is picklable).
+
+    UNUSED / dead code: superseded by ``_deconvolve_with`` (which takes a
+    pre-computed ``g``/``sn`` instead of re-estimating per call, avoiding
+    fudge-factor drift). ``update_temporal`` only ever calls ``_deconvolve_with``.
+    Retained pending a separate code-cleanup PR.
+    """
     try:
         g_k, sn_k = estimate_ar_params(trace_k, p=ar_order)
         c_k, s_k, _ = deconvolve(trace_k, g_k, sn_k)

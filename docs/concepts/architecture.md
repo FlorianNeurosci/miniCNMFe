@@ -4,7 +4,7 @@ tags: [minicnmfe, architecture, modules]
 
 # CNMFe — Architecture & File Map
 
-> See [[api-reference]] for function signatures. See [[usage-guide]] for how to run the pipeline.
+> See [API reference](../api/index.md) for function signatures. See [usage guide](../getting-started/index.md) for how to run the pipeline.
 
 ---
 
@@ -20,7 +20,7 @@ D:\code\claude_cnmfe\
 │   ├── preprocess.py             # Noise estimation, center-surround PSF, CORR/PNR
 │   ├── background.py             # Ring-model background (compute_W, subtract_background)
 │   ├── initialization.py         # Greedy CORR-PNR seed detection and extraction
-│   ├── spatial.py                # Spatial footprint update (LassoLars per pixel)
+│   ├── spatial.py                # Spatial footprint update (elastic-net coordinate descent per pixel)
 │   ├── temporal.py               # Temporal update + OASIS AR deconvolution
 │   ├── merging.py                # Component merging (overlap + correlation)
 │   ├── concat_avis_to_zarr.py    # Concatenate 0.avi...N.avi into one zarr (importable + `python -m`)
@@ -37,7 +37,7 @@ D:\code\claude_cnmfe\
 │   ├── test_temporal.py
 │   ├── test_pipeline.py
 │   └── test_multiprocessing.py   # n_jobs parallelism tests
-├── wiki/                         # This documentation
+├── docs/                         # This documentation (guides, concepts, api, tuning)
 ├── demo_movies/                  # Generated AVI + zarr + meta files (created by scripts)
 ├── generate_demo_movies.py       # Generate demo_movies/*.avi with ground-truth NPZ sidecars
 ├── convert_to_zarr.py            # Batch-convert demo_movies/*.avi -> *.zarr
@@ -72,8 +72,7 @@ graph TD
     preprocess --> _utils
 ```
 
-> [!NOTE]
-> `_utils.py` is the only module with no internal imports. All other modules may import from `_utils`. Circular imports are not possible in this layout.
+> **Note:** `_utils.py` is the only module with no internal imports. All other modules may import from `_utils`. Circular imports are not possible in this layout.
 
 ---
 
@@ -169,8 +168,7 @@ Parallelism is **axis-aligned** — partitioning along frames, flattened pixels,
 | `update_spatial` | pixels (H·W) | `_spatial_pixel_batch` | 256 pixels per batch |
 | `update_temporal` (OASIS) | neurons (K) | `_deconvolve_with` | one component |
 
-> [!WARNING]
-> On Windows, `n_jobs != 1` uses `spawn` (no fork). Avoid large global state; prefer passing arguments explicitly. The greedy seed loop in `greedy_corr_pnr` is itself sequential — only the per-frame PSF convolution that feeds it is parallel. By default (`init_patches=True`) the FOV is split into overlapping patches run in parallel **processes** (`greedy_corr_pnr_patched`), but each patch's seed loop is still sequential. OASIS is sequential along T per component (cannot be parallelised within a trace), only across K.
+> **Warning:** On Windows, `n_jobs != 1` uses `spawn` (no fork). Avoid large global state; prefer passing arguments explicitly. The greedy seed loop in `greedy_corr_pnr` is itself sequential — only the per-frame PSF convolution that feeds it is parallel. By default (`init_patches=True`) the FOV is split into overlapping patches run in parallel **processes** (`greedy_corr_pnr_patched`), but each patch's seed loop is still sequential. OASIS is sequential along T per component (cannot be parallelised within a trace), only across K.
 
 ### Why axis-aligned and not patch-based (vs CaImAn)
 
@@ -197,4 +195,4 @@ Functions dispatched by `joblib.Parallel` (e.g. `_filter_estimate_apply`, `_deco
 ### Bayesian-prior path for AR coefficient `g`
 `estimate_ar_params` has two shrinkage paths. The legacy path multiplies the Yule-Walker estimate by `fudge_factor` (default `0.96`) — a unitless prior toward zero. The prior path takes `g_prior = exp(-1 / (fps · τ_ms / 1000))` derived from `CNMFeParams.decay_time_ms` + `frame_rate_hz` and shrinks toward it: `g = (1 - g_prior_weight) · g_yw + g_prior_weight · g_prior`. `fudge_factor` is bypassed on the prior path.
 
-`g_target` is computed once in `CNMFe.fit` and threaded into every estimator: pipeline-init pooled estimate, per-component init estimate (greedy `extract_spatial_temporal`), and the `update_temporal` fallback when the cache is empty. With this, the same shrinkage target governs the AR coefficient end-to-end across init → BCD → final pass. See [todo/oasis_oversmoothing.md](../todo/oasis_oversmoothing.md) for the diagnostic that motivated the path.
+`g_target` is computed once in `CNMFe.fit` and threaded into every estimator: pipeline-init pooled estimate, per-component init estimate (greedy `extract_spatial_temporal`), and the `update_temporal` fallback when the cache is empty. With this, the same shrinkage target governs the AR coefficient end-to-end across init → BCD → final pass. See [todo/oasis_oversmoothing.md](https://github.com/FlorianNeurosci/simpler_cnmfe/blob/master/todo/oasis_oversmoothing.md) for the diagnostic that motivated the path.

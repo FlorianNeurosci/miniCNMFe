@@ -1,0 +1,87 @@
+site_name: minicnmfe
+site_description: Clean CNMF-E for 1-photon miniscope calcium imaging
+site_url: https://florianneurosci.github.io/simpler_cnmfe/
+repo_url: https://github.com/FlorianNeurosci/simpler_cnmfe
+repo_name: FlorianNeurosci/simpler_cnmfe
+edit_uri: edit/master/docs/
+
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.top
+    - navigation.sections
+    - toc.follow
+    - content.code.copy
+    - search.highlight
+    - search.suggest
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.arithmatex:
+      generic: true
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started/index.md
+  - API reference: api/index.md
+  - Concepts:
+      - Algorithm (ELI5): concepts/algorithm-eli5.md
+      - Algorithm (math): concepts/algorithm-math.md
+      - Architecture: concepts/architecture.md
+      - Ring background: concepts/ring-background.md
+      - CaImAn comparison: concepts/caiman-comparison.md
+  - Implementation guides:
+      - Overview: guides/index.md
+      - Motion correction: guides/motion-correction.md
+      - Seeds (CORR / PNR): guides/seeds-corr-pnr.md
+      - Initialization: guides/initialization.md
+      - Background: guides/background.md
+      - Spatial update: guides/spatial-update.md
+      - Temporal update: guides/temporal-update.md
+      - Merging: guides/merging.md
+      - Evaluation: guides/evaluation.md
+  - Parameter tuning:
+      - Overview: tuning/index.md
+      - Tuning guide: tuning/guide.md
+      - Heuristics: tuning/heuristics.md
+      - Motion-correction search: tuning/mc-search.md
+      - Extraction sweep: tuning/sweep.md
+      - Quality metrics: tuning/metrics.md
+      - Validation: tuning/validation.md

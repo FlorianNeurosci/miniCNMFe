@@ -268,7 +268,7 @@ class CNMFeParams:
     max_neurons: int | None = None  # Stop early (None = no limit)
     init_min_corr_neuron: float = 0.8         # "Neuron pixel" threshold inside extract_spatial_temporal
     init_max_corr_bg: float = 0.4             # "Background pixel" threshold inside extract_spatial_temporal
-    seed_suppress_factor: float = 2.0         # Suppression disk radius after extraction = factor * sigma
+    seed_suppress_factor: float = 2.0         # DEPRECATED no-op (kept for API stability). Greedy init now suppresses found neurons with an `ind_search` support mask (ai > ai.max()/2), not a disk; see initialization.greedy_corr_pnr.
     circular_max_dist_factor: float = 2.5     # circular_constraint cutoff = factor * estimated_radius
     # [NON-STANDARD speed] Temporal stride for greedy init (None = auto: max(1, T//5000)).
     init_stride: "int | None" = None
@@ -1486,6 +1486,9 @@ class CNMFe:
         # fudge_factor ceiling on data with un-subtracted slow background.
         g_target: float | None = None
         if p.decay_time_ms is not None and p.frame_rate_hz is not None:
+            # NB: this is exactly temporal.g_from_decay_time(decay_time_ms,
+            # frame_rate_hz); kept inline only to avoid an import here — keep the
+            # two in sync (flagged for a cleanup PR to call the helper).
             g_target = float(np.exp(
                 -1.0 / (p.frame_rate_hz * p.decay_time_ms / 1000.0)
             ))

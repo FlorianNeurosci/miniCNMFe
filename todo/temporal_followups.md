@@ -75,6 +75,6 @@ impossible — we should be optimising the denoised `C` instead.
 - Update `tmp/compare_to_truth.py` and the comparison notebook to
   report and visualise `r(C, truth)` as the primary metric, with
   `r(C+YrA, truth)` shown only for diagnostic context.
-- Document in `wiki/` (or CLAUDE.md) that on miniscope-quality data
+- Document in `docs/` (or CLAUDE.md) that on miniscope-quality data
   the relevant metric for evaluating extracted traces is the
   AR(1)-denoised `C`, not the noisy projection.

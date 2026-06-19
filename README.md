@@ -33,7 +33,7 @@ AVI / zarr movie  (T × H × W)
         │
         └─ for n_iter_main:
                BackgroundSubtractor  — lazy (Y − b0) − W(Y − b0), never materialised
-               update_spatial()      — per-pixel non-negative LassoLars
+               update_spatial()      — per-pixel non-negative elastic-net CD
                update_temporal()     — block coordinate descent + OASIS AR deconvolution
                merge_components()    — merge spatially overlapping + correlated pairs
                compute_W()           — refresh b0 (W cached)
@@ -138,7 +138,7 @@ params = CNMFeParams(sigma=3.0, n_jobs=4, device="cuda")
 | Temporal projection | `(H·W × T) @ (H·W × K)` matrix multiply |
 | Greedy init | Initial per-frame PSF convolution |
 
-Steps that stay on CPU regardless: motion correction (cv2 — bit-identical to CaImAn), OASIS deconvolution, LassoLars, the greedy loop.
+Steps that stay on CPU regardless: motion correction (cv2 — bit-identical to CaImAn), OASIS deconvolution, the spatial elastic-net coordinate descent, the greedy loop.
 
 GPU speedup is most significant for large recordings (≥ 256 × 256, T ≥ 1000 frames). On small data the CPU↔GPU transfer overhead can outweigh the benefit.
 
@@ -209,14 +209,14 @@ minicnmfe/
 ├── preprocess.py          # Noise estimation, center-surround PSF, CORR/PNR
 ├── background.py          # Ring-model background (compute_W, BackgroundSubtractor)
 ├── initialization.py      # Greedy CORR-PNR seed detection and extraction
-├── spatial.py             # Spatial footprint update (LassoLars per pixel)
+├── spatial.py             # Spatial footprint update (elastic-net coordinate descent per pixel)
 ├── temporal.py            # Temporal update + OASIS AR deconvolution
 ├── merging.py             # Component merging (overlap + correlation)
 ├── evaluate.py            # Auto-evaluation: ghost-component quality filter
 └── pipeline.py            # CNMFeParams dataclass + CNMFe.fit() orchestrator
 
-tests/                     # pytest suite (~127 tests) — synthetic ground-truth data
-wiki/                      # Obsidian-optimised documentation
+tests/                     # pytest suite (~282 tests) — synthetic ground-truth data
+docs/                      # Documentation (getting-started, concepts, api, guides, tuning)
 demo_movies/               # Generated demo AVIs + zarr stores (created by scripts)
 demo_notebooks/            # Tutorial notebooks (see below)
 generate_demo_movies.py    # Generate demo_movies/*.avi with ground-truth sidecars
@@ -253,6 +253,15 @@ python full_pipeline.py /path/to/recording/movie.zarr --sigma 3.0 --n-jobs -1
 #   params.json   all pipeline parameters
 ```
 
+For more control, the pipeline is also split into **staged CLIs** with a disk
+handoff between each step (a `--params p.json` carries a `CNMFeParams` between
+stages): `run_preprocess.py` (downsample) → `run_mc.py` (motion correction) →
+`run_extract.py` (extraction) → `run_evaluate.py` (re-run auto-eval / retune
+thresholds without re-extracting). To pick good parameters for a session, use
+`tune.py <path>` (heuristics + extraction sweep + full-recording validation →
+`report.html`). See [`docs/getting-started/`](docs/getting-started/index.md) and
+[`docs/tuning/`](docs/tuning/index.md).
+
 To generate demo movies and try the pipeline end-to-end:
 
 ```bash
@@ -266,15 +275,15 @@ python convert_to_zarr.py        # creates demo_movies/*.zarr
 
 ## Documentation
 
-The `wiki/` directory contains Obsidian-optimised documentation:
+Full documentation lives in [`docs/`](docs/index.md) and renders directly on GitHub:
 
-| File | Contents |
+| Page | Contents |
 |------|----------|
-| `wiki/algorithm-math.md` | Full mathematical derivation (LaTeX) |
-| `wiki/algorithm-eli5.md` | Plain-English explanation with analogies |
-| `wiki/architecture.md` | Module map, dependency graph, data-flow diagram |
-| `wiki/api-reference.md` | Every public function — signatures, parameters, returns |
-| `wiki/usage-guide.md` | Quick-start, parameter tuning, CLI workflow, troubleshooting |
+| [`docs/getting-started/`](docs/getting-started/index.md) | Install, quick-start, end-to-end workflow, CLI, troubleshooting |
+| [`docs/api/`](docs/api/index.md) | Every public function and `CNMFeParams` field — signatures, parameters, returns |
+| [`docs/concepts/`](docs/concepts/algorithm-math.md) | Algorithm math + ELI5, architecture, ring background, CaImAn comparison |
+| [`docs/guides/`](docs/guides/index.md) | Per-stage implementation walkthroughs (motion correction → evaluation) |
+| [`docs/tuning/`](docs/tuning/index.md) | Automated parameter-tuning workflow + the [tuning guide](docs/tuning/guide.md) |
 
 The `demo_notebooks/01_load_and_motion_correct.ipynb` and `demo_notebooks/02_extract_components.ipynb` walk through the full pipeline end-to-end. Earlier walkthroughs are preserved in `demo_notebooks/old_demos/`.
 
@@ -292,7 +301,7 @@ All algorithms are reimplemented from scratch. The CaImAn repository is used as 
 | Noise estimation | `pre_processing.py:128` | `numpy.fft.rfft` along time axis |
 | Ring background | `initialization.py:1900` | vectorised ridge regression per pixel |
 | GreedyCorr init | `initialization.py:1380` | reimplemented, sequential greedy loop |
-| Spatial update | `spatial.py:29` | `sklearn.linear_model.LassoLars` |
+| Spatial update | `spatial.py:29` | `sklearn` `enet_coordinate_descent_gram` (positive elastic-net CD) |
 | Temporal update | `temporal.py:64` | coordinate descent + OASIS package |
 | Deconvolution | `deconvolution.py:16` | `oasis-deconv` + pure-Python AR(1) fallback |
 | Merging | `merging.py:19` | `scipy.sparse` graph connected components |
@@ -307,7 +316,7 @@ All algorithms are reimplemented from scratch. The CaImAn repository is used as 
 | `numpy` | Array operations throughout |
 | `scipy` | FFT, sparse matrices, ndimage filters |
 | `scikit-image` | Peak detection, blob feature filters |
-| `scikit-learn` | LassoLars for spatial update |
+| `scikit-learn` | Elastic-net coordinate descent (`enet_coordinate_descent_gram`) for spatial update |
 | `opencv-python` | Motion correction (`filter2D`, `dft`, `warpAffine`) |
 | `av` (PyAV) | AVI decoding via imageio's pyav plugin |
 | `zarr` | Lazy, chunked movie storage |

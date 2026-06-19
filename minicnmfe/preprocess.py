@@ -1,7 +1,12 @@
 """Preprocessing: noise estimation and CORR/PNR summary images.
 
 These images are the inputs to seed detection in CNMFe initialization.
-All operations work chunk-by-chunk to avoid loading the full movie.
+
+NOTE: these functions load the full ``(T, H, W)`` movie into RAM. ``estimate_noise``,
+``correlation_pnr`` and ``local_correlations_fft`` each call ``np.asarray(movie, ...)``
+because the per-pixel PSD / FFT needs all T frames at once (the ``iter_frames`` import
+is used only to read the first frame's shape). The package's streaming, low-RAM paths
+live in ``background.py`` / ``pipeline.py``, not here.
 
 References (algorithmic only, no imports):
     CaImAn summary_images.py:correlation_pnr (line 286)

@@ -177,7 +177,7 @@ Look at `mc_shifts.png` too if MC looks suspect. With `--no-figs`, skip and judg
 from `comparison.md` + the auto-eval log line.
 
 Then **apply every item in the Gotcha checklist** — the single source of truth is
-the "Gotcha checklist" section of `wiki/parameter-tuning.md` (long recording →
+the "Gotcha checklist" section of `docs/tuning/guide.md` (long recording →
 `global_bg_rank=1`; drift-inflated `decay_time_ms`; `min_pixel` floor vs SNR ghost
 cut; full-vs-cutout recall; density↔purity; MC shifts). Do not re-derive it here —
 read that section and apply each bullet to this session's numbers/figures.

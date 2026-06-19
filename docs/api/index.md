@@ -4,7 +4,7 @@ tags: [minicnmfe, api, reference]
 
 # CNMFe — API Reference
 
-> See [[usage-guide]] for examples. See [[architecture]] for the module map.
+> See the [usage guide](../getting-started/index.md) for examples. See the [architecture overview](../concepts/architecture.md) for the module map.
 
 ---
 
@@ -39,15 +39,16 @@ class CNMFeParams:
     max_neurons: int | None = None             # Stop early (None = no limit)
     init_min_corr_neuron: float = 0.8          # "Neuron pixel" threshold inside extract_spatial_temporal
     init_max_corr_bg: float = 0.4              # "Background pixel" threshold inside extract_spatial_temporal
-    seed_suppress_factor: float = 2.0          # Suppression disk after extraction = factor * sigma
+    seed_suppress_factor: float = 2.0          # DEPRECATED no-op (kept for API stability); greedy init now suppresses via an ind_search support mask, not a disk
     circular_max_dist_factor: float = 2.5      # circular_constraint cutoff = factor * estimated_radius
     init_stride: int | None = None             # Temporal stride for greedy init (None = auto, max(1, T//5000))
     init_corrpnr_stride: int | None = None     # Temporal stride for the CORR/PNR summary images (None = auto)
-    init_patches: bool = False                 # Opt-in patch-PARALLEL greedy init (CPU only); OFF = single-FOV greedy
+    init_patches: bool = True                  # Patch-PARALLEL greedy init (CPU only); default ON. Auto-skips to single-FOV greedy for small FOV / GPU / streaming-zarr movies
     init_patch_size: int | None = None         # patch side px; None -> max(int(12*sigma), 48)
     init_patch_overlap: int | None = None      # overlap px between patches; None -> int(4*sigma)
     init_patch_min_fov: int = 128              # only tile when min(H, W) >= this; else fall back to global init
     init_patch_n_jobs: int | None = None       # patch workers (processes); None -> n_jobs
+    init_patch_max_workers: int = 32           # upper bound on patch-init loky processes (caps process-count RAM on many-core boxes; results unchanged)
 
     # Background (ring model)
     ring_size_factor: float = 1.5              # ring_radius = factor * (2*sigma + 1)
@@ -56,13 +57,20 @@ class CNMFeParams:
     global_bg_rank: int = 0                    # Extra low-rank global background components (0 = ring only)
     bg_tsub: int = 5                           # Temporal subsample factor when fitting W / b0
 
-    # Spatial update
-    dilation_radius: int = 2                   # Support dilation for LassoLars
-    spatial_max_thr: float = 0.1               # Zero footprint pixels < this fraction of peak
+    # Spatial update (per-pixel positive elastic-net coordinate descent)
+    dilation_radius: int = 2                   # Support dilation for the per-pixel CD solve
+    spatial_max_thr: float = 0.1               # Zero footprint pixels < this fraction of peak (used when spatial_thr_method="max")
     spatial_close_radius: int = 1              # Morphological close radius on the support mask
-    spatial_max_iter: int = 1000               # LassoLars max iterations
-    spatial_tol: float = 1e-4                  # LassoLars convergence tolerance
+    spatial_max_iter: int = 1000               # Per-pixel coordinate-descent iteration cap
+    spatial_tol: float = 1e-4                  # Per-pixel coordinate-descent convergence tolerance
     spatial_circular_max_dist_factor: float = 1.5  # circular cutoff applied after the spatial update
+    spatial_ridge: float = 1e-2                # Elastic-net L2 fraction (beta = spatial_ridge * max(diag(Gram))); bounds CD conditioning, 0 = pure LASSO
+    spatial_thread_cap: int = 16               # Max BLAS/worker threads in the spatial CD
+    spatial_lambda_scale: float = 1.0          # Multiplier on the per-pixel L1 penalty (>1 = tighter footprints; 1.0 = standard CNMF-E)
+    spatial_max_radius_factor: float = 0.0     # Absolute clip radius cap = factor * sigma px (0.0 = off, area-derived radius only)
+    spatial_thr_method: str = "nrg"            # Footprint thresholding: "nrg" (energy, default) or "max" (peak-relative, legacy)
+    spatial_nrg_thr: float = 0.95              # Energy fraction kept when thr_method="nrg" (brightest pixels summing to this share of total a^2)
+    spatial_tsub: int = 1                      # Time-subsample factor for the bandwidth-bound update_spatial slab
 
     # Temporal update / deconvolution
     ar_order: int = 1                          # AR model order (1 or 2)
@@ -185,7 +193,7 @@ bit-for-bit identical to the old monolith at `n_jobs=1`
 disk handoff between stages (the four `run_*.py` CLIs wrap them):
 
 ```python
-def fit_mc(self, movie, output_dir=None) -> zarr.Array | np.ndarray: ...
+def fit_mc(self, movie, output_dir=None, in_place=False) -> zarr.Array | np.ndarray: ...
 def fit_extract(self, movie, *, Y_flat_zarr=None, output_dir=None, evaluate=True) -> "CNMFe": ...
 def evaluate(self) -> "CNMFe": ...
 ```
@@ -791,7 +799,8 @@ remaps each patch's footprints/centres to global coordinates, concatenates, then
 de-duplicates neurons detected in patch overlaps via `merge_components` (the
 centre-distance fallback). Edge rejection (`border_px`) and `max_neurons` are
 applied **globally** after dedup. Peak extra RAM ≈ `n_jobs × T × patch_size² × 4`
-bytes. CPU only. Driven by `CNMFeParams.init_patches` (default off) — see the
+bytes. CPU only. Driven by `CNMFeParams.init_patches` (default **on**; auto-skips
+to single-FOV greedy for small FOV / GPU / streaming-zarr movies) — see the
 `init_patch_*` params and the `CNMFe.fit` init branch.
 
 ---
@@ -848,12 +857,22 @@ def update_spatial(
     max_iter: int = 1000,
     tol: float = 1e-4,
     circular_max_dist_factor: float = 1.5,
+    spatial_ridge: float = 1e-2,
+    spatial_thread_cap: int = 16,
+    lambda_scale: float = 1.0,
+    sigma: float | None = None,
+    max_radius_factor: float = 0.0,
+    thr_method: str = "max",
+    nrg_thr: float = 0.9999,
+    spatial_tsub: int = 1,
 ) -> sp.csc_matrix
 ```
 
-Refine spatial footprints by per-pixel non-negative LassoLars regression. **Returns** updated `(H·W, K)` sparse matrix.
+Refine spatial footprints by per-pixel non-negative **elastic-net coordinate descent** (`sklearn.linear_model._cd_fast.enet_coordinate_descent_gram`, via `_spatial_pixel_batch` / the numba `_spatial_cd_kernel`) — not `LassoLars`. The solve carries an L1 penalty (`λ_p = lambda_scale · 0.5 · sn[p] · √(max diag Gram) / T`) plus an L2 ridge term (`beta = spatial_ridge · max(diag(Gram))`) that keeps the CD well-conditioned. **Returns** updated `(H·W, K)` sparse matrix.
 
-`max_thr`: after regression, pixels whose value falls below `max_thr × peak` are zeroed. Lower values keep dim peripheral pixels; higher values produce tighter footprints.
+`thr_method` / `nrg_thr`: footprint cleanup method. `"max"` zeroes pixels below `max_thr × peak`; `"nrg"` keeps the brightest pixels whose summed `a²` reaches `nrg_thr` of the footprint's total energy. (The pipeline passes `thr_method="nrg"`, `nrg_thr=0.95` from `CNMFeParams` by default; the standalone-function defaults shown here stay `"max"` / `0.9999` for backward compatibility.)
+
+`max_thr`: when `thr_method="max"`, pixels whose value falls below `max_thr × peak` are zeroed. Lower values keep dim peripheral pixels; higher values produce tighter footprints.
 
 ---
 

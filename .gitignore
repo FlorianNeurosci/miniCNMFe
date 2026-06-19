@@ -109,3 +109,6 @@ live_runs/tuning_*/
 live_runs/diagnostics_figs/
 **/full/
 **/batch_summary.md
+
+# MkDocs build output
+site/

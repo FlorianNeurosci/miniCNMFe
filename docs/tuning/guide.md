@@ -9,8 +9,8 @@ tags: [minicnmfe, tuning, workflow, parameters]
 > recording, and writes a self-contained `report.html` (recommended values +
 > graphs) so you can judge quality **by eye, no AI needed**.
 >
-> For what each knob *does*, see [[usage-guide#Parameter Tuning Guide]]; for
-> signatures see [[api-reference]].
+> For what each knob *does*, see [Parameter Tuning Guide](../getting-started/index.md#parameter-tuning-guide); for
+> signatures see [API reference](../api/index.md).
 
 `tune.py` is the **single front door** for the workflow in the `tuning/`
 package: it runs the heuristics + graded sweep, then (by default, for AVI input)
@@ -115,7 +115,7 @@ from a 2000-frame, chunk-aligned sample of `mc.zarr` (`n_init_frames`); the
 chunk-aligned read avoids the strided-single-frame I/O blow-up on time-chunked zarrs.
 
 **Sweep grid** (the most-impactful extraction knobs, per the real-recording
-findings in [[usage-guide#Tuning long or dense recordings]]): `sigma`,
+findings in [Tuning long or dense recordings](../getting-started/index.md#tuning-long-or-dense-recordings)): `sigma`,
 `min_corr`, `min_pnr`, `merge_thr_corr`, `global_bg_rank` (0 vs 1), `init_stride`.
 Pass comma-lists, e.g. `--grid-min-pnr 6,10,14 --grid-bg-rank 0,1`.
 
@@ -138,8 +138,7 @@ Pass comma-lists, e.g. `--grid-min-pnr 6,10,14 --grid-bg-rank 0,1`.
   point size = accepted fraction, colour = score, best starred); footprints over
   the **correlation image thresholded at that candidate's `min_corr`** (sub-threshold
   background dropped to black so each footprint reads against the cell it covers; the
-  mean projection is a vignette-dominated blob on 1p data — see [[usage-guide#Tuning
-  long or dense recordings]]); `C` vs `C+YrA` traces for the best candidate.
+  mean projection is a vignette-dominated blob on 1p data — see [Tuning long or dense recordings](../getting-started/index.md#tuning-long-or-dense-recordings)); `C` vs `C+YrA` traces for the best candidate.
 
 ### Component diagnostics (`tuning.report`)
 
@@ -182,7 +181,7 @@ truth on a real recording.
 > you prefer.
 
 These proxies are the seam the roadmap's validation harness
-([[future_improvements_roadmap|C1/C2]]) could later reuse for true cross-method /
+([C1/C2](https://github.com/FlorianNeurosci/simpler_cnmfe/blob/master/todo/future_improvements_roadmap.md)) could later reuse for true cross-method /
 paired-ephys validation.
 
 ---
@@ -243,7 +242,7 @@ most common few:
 | Distinct neighbours fused | raise `merge_thr_corr`, lower `merge_centre_dist_factor` |
 | "Shark-fin" / over-smoothed traces | set `decay_time_ms` + `frame_rate_hz` (Bayesian `g` prior) |
 
-See [[usage-guide#Parameter Tuning Guide]] for the full per-knob discussion, and
+See [Parameter Tuning Guide](../getting-started/index.md#parameter-tuning-guide) for the full per-knob discussion, and
 the **Component diagnostics** figures above to identify which symptom you have.
 
 ---
@@ -271,7 +270,7 @@ session's `metaData.json`. `tune.py` already runs this stage for you (it calls
 re-validate an existing recommendation or to add threshold sets.
 
 > [!CAVEAT]
-> See the [[#Gotcha checklist]] above — in particular the drift-inflated
+> See the [Gotcha checklist](#gotcha-checklist) above — in particular the drift-inflated
 > `decay_time_ms` and the full-vs-cutout recall caveats — when reading the
 > comparison. `live_runs/tuning_picast/LEARNINGS.md` is the worked example.
 
@@ -298,7 +297,7 @@ thing as a standalone CLI.
 
 `/tune-session <session-path>` packages the whole judgement workflow for the AI:
 read the session metadata → run `tune.py` → interpret against the
-[[#Gotcha checklist]] → write a per-session `LEARNINGS.md` and a verdict. Flags:
+[Gotcha checklist](#gotcha-checklist) → write a per-session `LEARNINGS.md` and a verdict. Flags:
 `--quick` (tuner only, no full run), `--no-lowthr`, `--figs`/`--no-figs`,
 `--indicator <name>`. Multiple paths / a `.txt` run via the batch process above
 (not sub-agents). Defined in `.claude/skills/tune-session/SKILL.md`.
@@ -312,6 +311,6 @@ in the notebook.
 
 ## Relation to other docs
 
-- [[usage-guide]] — what each parameter means and the long/dense-recording findings.
-- [[api-reference]] — `CNMFeParams` fields and method signatures.
-- [[architecture]] — where the staged CLIs (`run_mc`/`run_extract`) fit.
+- [usage guide](../getting-started/index.md) — what each parameter means and the long/dense-recording findings.
+- [API reference](../api/index.md) — `CNMFeParams` fields and method signatures.
+- [architecture](../concepts/architecture.md) — where the staged CLIs (`run_mc`/`run_extract`) fit.

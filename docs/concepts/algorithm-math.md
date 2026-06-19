@@ -4,7 +4,7 @@ tags: [minicnmfe, math, algorithm]
 
 # CNMFe — Mathematical Description
 
-> See also: [[algorithm-eli5]] for the intuitive version, [[architecture]] for code locations.
+> See also: [algorithm ELI5](./algorithm-eli5.md) for the intuitive version, [architecture](./architecture.md) for code locations.
 
 ## 1. Problem Statement
 
@@ -40,8 +40,7 @@ $$\hat{\mathbf{f}}_t = \mathcal{F}^{-1}\!\left[\mathcal{F}(\mathbf{f}_t) \cdot \
 
 where $N_r$, $N_c$ are the frequency indices arranged by `ifftshift`.
 
-> [!NOTE]
-> The shift vector uses the convention $(\delta_y, \delta_x)$ — row first, column second — consistent with numpy array indexing.
+> **Note:** The shift vector uses the convention $(\delta_y, \delta_x)$ — row first, column second — consistent with numpy array indexing.
 
 ---
 
@@ -238,15 +237,15 @@ For each pixel $p$:
 
 $$\lambda_p = \frac{\hat{\sigma}_p}{2} \sqrt{\max_k \lambda_\text{max}\!\left(\mathbf{C}[\mathcal{A}_p,:]\mathbf{C}[\mathcal{A}_p,:]^\top\right) / T}$$
 
-$$\mathbf{a}[\mathcal{A}_p] = \arg\min_{\mathbf{a} \geq 0} \frac{1}{2T}\|Y_p - \mathbf{C}[\mathcal{A}_p,:]^\top\mathbf{a}\|^2 + \lambda_p\|\mathbf{a}\|_1$$
+$$\mathbf{a}[\mathcal{A}_p] = \arg\min_{\mathbf{a} \geq 0} \frac{1}{2T}\|Y_p - \mathbf{C}[\mathcal{A}_p,:]^\top\mathbf{a}\|^2 + \lambda_p\|\mathbf{a}\|_1 + \frac{\beta}{2}\|\mathbf{a}\|^2$$
 
-Solved via `sklearn.linear_model.LassoLars` (LARS path, positive=True).
+Solved via positive elastic-net coordinate descent using sklearn's `enet_coordinate_descent_gram` (a positive elastic-net coordinate-descent Gram solver — **not** `LassoLars`). On top of the L1 penalty it carries an L2 ridge term with weight $\beta = \texttt{spatial\_ridge} \cdot \max(\text{diag}(\text{Gram}))$ (default `spatial_ridge=1e-2`), which conditions the near-singular Gram matrix so the coordinate descent converges quickly when active traces are correlated.
 
 ### 7.3 Footprint Thresholding
 
 After regression, for each component $k$:
 1. Apply $3\times3$ median filter to $\mathbf{a}_k$ reshaped to $(H, W)$
-2. Zero pixels $< 0.1 \cdot \max(\mathbf{a}_k)$
+2. Threshold the footprint. The **package default** is energy-based thresholding (`spatial_thr_method="nrg"`, `spatial_nrg_thr=0.95`): keep the brightest pixels whose summed $a^2$ reaches 95% of the footprint's total energy, zeroing the rest. The legacy peak-relative rule — zero pixels $< 0.1 \cdot \max(\mathbf{a}_k)$ — is the `spatial_thr_method="max"` option.
 3. Keep only the largest connected component
 
 ---

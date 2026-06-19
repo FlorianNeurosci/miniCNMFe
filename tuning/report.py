@@ -18,7 +18,7 @@ import numpy as np
 
 # Shared prose so the markdown report, the HTML report and the docs stay in
 # sync from one source (imported by ``tuning.report_html`` and referenced by
-# ``wiki/parameter-tuning.md``).
+# ``docs/tuning/guide.md``).
 METRICS_BLURB = (
     "These are **ground-truth-free proxies**, not validation. `cprojcorr_median` "
     "(median `corr(C, C+YrA)`) is the primary purity signal — in a dense FOV it "

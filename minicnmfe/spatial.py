@@ -680,15 +680,23 @@ def update_spatial(
     nrg_thr: float = 0.9999,
     spatial_tsub: int = 1,
 ) -> sp.csc_matrix:
-    """Refine spatial footprints by per-pixel non-negative LASSO regression.
+    """Refine spatial footprints by per-pixel non-negative elastic-net regression.
 
-    For each pixel p:
+    For each pixel p the active components are solved with a positive
+    coordinate-descent elastic-net (``sklearn.linear_model._cd_fast.
+    enet_coordinate_descent_gram``, via ``_spatial_pixel_batch`` / the numba
+    ``_spatial_cd_kernel``) — NOT ``LassoLars``:
+
         active = compute_support[p]   # components near this pixel
-        lambda_p = 0.5 * sn[p] * sqrt(max(diag(C_active @ C_active.T))) / T
-        a[active] = LassoLars(alpha=lambda_p, positive=True).fit(
-                        C[active].T,   # (T, n_active) — regressors
-                        Y_flat[p],     # (T,) — target
-                    ).coef_
+        Gram   = C[active] @ C[active].T
+        l1     = lambda_scale * 0.5 * sn[p] * sqrt(max(diag(Gram))) / T   # L1 penalty
+        l2     = spatial_ridge * max(diag(Gram))                          # L2 ridge term
+        a[active] = enet_coordinate_descent_gram(positive=True, alpha=l1, beta=l2,
+                                                 Gram, C[active] @ Y_flat[p], ...)
+
+    The L2 ``beta`` term (a pure LASSO/LassoLars would not have it) bounds the
+    Gram condition number so the CD converges in tens of iterations even when
+    components have correlated / near-duplicate traces.
 
     After all pixels are processed, each component's footprint is cleaned
     with threshold_footprint().

@@ -7,8 +7,10 @@ evidence dicts so the heuristics stay importable in headless / worker contexts.
 
 The logic is lifted from ``live_runs/estimate_params.ipynb`` (the notebook is
 now a thin viewer over these functions). It reuses the proven pipeline
-primitives — ``correlation_pnr``, ``detect_seeds``, ``greedy_corr_pnr``,
-``estimate_shifts``, ``estimate_ar_params`` — rather than reimplementing them.
+primitives — ``correlation_pnr``, ``greedy_corr_pnr``, ``estimate_shifts``,
+``estimate_ar_params`` — rather than reimplementing them. Blob/neuron detection
+goes through ``skimage.feature.blob_log`` (directly and via
+``tuning.metrics.detect_product_blobs``), not ``initialization.detect_seeds``.
 """
 
 from __future__ import annotations

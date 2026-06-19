@@ -18,7 +18,7 @@ Tier tags: **[T1]** do-first · **[T2]** next · **[T3]** later/large R&D.
 ## Axis C — Validation infrastructure (the measuring stick)
 
 ### C1 — Real-recording ground-truth harness [T1]
-All validation is synthetic; `wiki/caiman-comparison.md` flags a "home-field effect"
+All validation is synthetic; `docs/concepts/caiman-comparison.md` flags a "home-field effect"
 (the realistic simulator's separable rank-1 background suits our ring model). Nothing
 is trustworthy on real data until this exists.
 
@@ -110,7 +110,7 @@ corr) on a synthetic movie. (Stage 2 [T3]: true frame-by-frame OnACID-E with onl
 deconv + online MC.)
 
 ### B3 — Patch-based streaming BCD for very large FOVs [T3]
-(`wiki/architecture.md`.) Greedy *init* already has a patch-parallel variant
+(`docs/concepts/architecture.md`.) Greedy *init* already has a patch-parallel variant
 (`init_patches`); extend the overlapping-patch + border-dedup machinery to the
 spatial/temporal/background BCD for very large FOVs. Low priority — only bites beyond
 current FOV targets; B1+streaming cover the common large-T case. Files: `spatial.py`,

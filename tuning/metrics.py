@@ -119,8 +119,11 @@ def model_quality(model, cn: "np.ndarray | None" = None) -> dict:
     """Flat dict of quality proxies for a fitted ``CNMFe`` model.
 
     Keys: ``K``, ``K_accepted``, ``accepted_frac``, ``cprojcorr_mean``,
-    ``cprojcorr_median``, ``npix_median``, ``npix_iqr``, ``multipeak_frac``,
-    ``npix_oversize``, ``snr_mean``, ``snr_median``, ``spatialcorr_median``.
+    ``cprojcorr_median``, ``npix_median``, ``npix_iqr``, ``npix_p25``
+    (footprint 25th-pct npix; the tuner derives ``min_pixel`` from it),
+    ``multipeak_frac``, ``npix_oversize``, ``snr_mean``, ``snr_median``,
+    ``trace_corr_median`` (median cross-component trace |corr| — redundancy
+    proxy used in ``session_quality_verdict``), ``spatialcorr_median``.
     Guards the K==0 / unfitted cases (returns 0 / NaN).
 
     ``cn`` (optional, SAME coords as ``model.A``) enables the spatial-fidelity
