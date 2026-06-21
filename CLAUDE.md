@@ -79,6 +79,15 @@ change standard behaviour unless explicitly enabled.
    `/tune-session` skill + the reusable `validate_session.py` /
    `tuning.validate.validate_session` (full MC + Y_flat built once, reused across
    threshold sets). Autotested (`tests/test_validate.py`).
+5. **Cross-session cell registration (CellReg)** — `minicnmfe/cellreg.py`
+   (`register_sessions`, `CellRegResult`) + the `run_cellreg.py` CLI. A clean
+   from-scratch reimplementation of the Ziv lab's CellReg (Sheintuch et al.,
+   2017) that tracks the same neurons across sessions. Autotested end-to-end
+   (`tests/test_cellreg.py`, 11 tests on synthetic Gaussian footprints:
+   alignment recovery, matching precision/recall, conflict resolution, N=3
+   clustering, the `P_same` model, save/load). **Caveat:** not yet validated on a
+   real multi-session recording; defaults (`align="translation"`,
+   threshold-matching) are conservative. See the design note below.
 
 ---
 
@@ -684,6 +693,47 @@ because they're a connected component of pixels each above 10 % of the ghost's o
 
 The regression test is `tests/test_pipeline.py::test_auto_evaluation_rejects_ghosts`.
 
+### Cross-session cell registration (`minicnmfe/cellreg.py`)
+Clean Python reimplementation of the Ziv lab's **CellReg** (Sheintuch et al.,
+2017) — tracks the same neurons across multiple sessions. **No MATLAB / external
+algorithm code**; numpy/scipy/sklearn only. Entry point
+`register_sessions(sessions, ...)` (sessions = `CNMFe` models or results dirs);
+returns a `CellRegResult` with a `cell_to_index_map` `(n_global, n_sessions)`
+(`-1` = absent). CLI: `run_cellreg.py s1/ s2/ ... -o reg/`.
+
+Pipeline stages (all in `cellreg.py`):
+1. **Load** each session's footprints → dense `(K, H, W)` stacks. Footprints are
+   cleaned with `spatial.threshold_footprint` and **unit-max normalised** (so
+   correlations/projections are amplitude-invariant); centroids via
+   `_utils.footprint_center`. `accepted_only=True` honours `model.accepted_mask`.
+   **All sessions must share `dims`** (raises otherwise).
+2. **Align** (`align="translation"` default | `"rotation"` | `"none"`) — rigid
+   registration of each session's max-projection to a reference, reusing
+   `motion_correction.estimate_shifts` (phase correlation). Rotation does a
+   coarse angle grid search. Transforms are applied to footprint *images*
+   (cv2.warpAffine) and *centroids* (analytic, same affine) consistently —
+   `transforms` is `(n_sessions, 3)` of `(dy, dx, theta)`.
+3. **Metrics** — KD-tree (`scipy.spatial.cKDTree`) finds candidate pairs within
+   `max_distance` (µm if `microns_per_pixel` given, else px); per pair: centroid
+   distance + **spatial Pearson correlation over the union of supports**. Note:
+   this correlation falls off fast (~0 by a ~1.3·σ centroid offset) — that's
+   expected/realistic, not a bug.
+4. **Match** — *Phase 1 (default)*: threshold (`dist_thr`, `corr_thr`) + one-to-one
+   Hungarian (`scipy.optimize.linear_sum_assignment`) per session pair, so two
+   nearby cells can't both claim one. *Phase 2* (`probabilistic=True`): fit a
+   2-component Gaussian-mixture `P_same` model (`model="centroid"|"spatial"|"joint"`)
+   over the pooled metrics, match on `P_same >= p_same_thr`. **Gotcha:** the GMM
+   needs *both* same-cell and different-cell candidate pairs to fit — a sparse FOV
+   with a small `max_distance` yields only same-cell neighbours and the mixture
+   degenerates. It falls back to threshold matching when there are <10 candidates.
+5. **Cluster** — greedy-by-weight over the cross-session match graph
+   (`build_cell_map`): strong matches form clusters first; a cell only joins if its
+   session slot is free (≤1 cell/session per global cluster); unmatched cells
+   become singleton rows.
+
+Autotested in `tests/test_cellreg.py` (synthetic Gaussian footprints, no full
+extraction needed). **Not yet validated on a real multi-session recording.**
+
 ### zarr v3 API
 The project uses zarr v3 (`zarr >= 3.0`). The v3 API differs from v2 in chunk
 specification and store opening. Do not regress to v2 patterns.
@@ -991,6 +1041,7 @@ minicnmfe/                         Main package
   avi_mc.py                    Fused AVI -> mc.zarr in one pass (skips session.zarr)
   concat_avis_to_zarr.py       Concatenate a folder of 0.avi ... N.avi into one zarr store (importable + CLI: python -m minicnmfe.concat_avis_to_zarr)
   downsample.py                downsample_movie() — streaming spatial+temporal block-mean (+ ds_meta.json)
+  cellreg.py                   register_sessions() / CellRegResult — cross-session cell registration (CellReg reimplementation)
   pipeline.py                  CNMFeParams (+ .downscaled()), CNMFe.fit()/fit_mc/fit_extract/evaluate
 tests/
   conftest.py                  make_synthetic_movie() — clean fixture; supports motion_max_shift
@@ -999,6 +1050,7 @@ tests/
   test_pipeline.py             includes test_temporal_correlation_against_truth (regression for the AR drift fix)
   test_stage_split.py          fit() == fit_mc -> fit_extract -> evaluate (staged decomposition)
   test_downsample.py           downsample_movie / downscaled / end-to-end downsampled recovery
+  test_cellreg.py              cross-session registration: alignment / matching / clustering / P_same / save-load
 docs/                          GitHub-renderable docs: getting-started/, concepts/ (algorithm-math, algorithm-eli5, architecture, ring-background, caiman-comparison), api/, guides/ (per-stage), tuning/ (index + guide)
 demo_movies/                   Generated AVI files + _meta.npz sidecars + .zarr stores (created by scripts below)
 generate_demo_movies.py        Generate demo_movies/*.avi with ground-truth NPZ sidecars (idempotent)
@@ -1008,6 +1060,7 @@ run_preprocess.py              Staged CLI 1/4: downsample a zarr (ssub/tsub) -> 
 run_mc.py                      Staged CLI 2/4: motion-correct a zarr -> mc.zarr + shifts.npy + params.json
 run_extract.py                 Staged CLI 3/4: extract on mc.zarr -> results/ (--ds-meta auto-rescales params)
 run_evaluate.py                Staged CLI 4/4: re-run auto-eval on a results dir (retune thresholds, no re-extract)
+run_cellreg.py                 CLI: register cells across >=2 results dirs -> cell_to_index_map.npy + transforms.npy + cellreg_info.json
 tune.py                        SINGLE front door: `tune.py <path>` = heuristics + sweep + full-recording validation + report.html (default output ./runs/, gitignored); `--sessions <list>` = batch; `--no-validate`/`--no-html`/`--no-lowthr`/`--dry-run` flags. Composes the stages below (calls tuning.validate.tune_then_validate).
 validate_session.py            Internal stage / standalone CLI: fused MC once -> Y_flat once -> fit_extract per threshold set (reuses Y_flat) -> diagnostics + comparison.md. Use directly only to re-validate or add threshold sets.
 batch_tune.py                  Batch stage: run_batch() runs one `tune.py --validate` subprocess per session in ONE background process (bounded concurrency, BLAS-capped) -> batch_summary.md. No sub-agents. `tune.py --sessions` delegates here.
