@@ -112,3 +112,10 @@ live_runs/diagnostics_figs/
 
 # MkDocs build output
 site/
+
+# ── Local dev / AI-assistant context (not part of the public package) ─────────
+# Kept on disk locally for development; never published.
+CLAUDE.md
+.claude/
+todo/
+live_runs/

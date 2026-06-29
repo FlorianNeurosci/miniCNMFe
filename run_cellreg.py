@@ -56,13 +56,29 @@ def main() -> None:
                         help="Match spatial-correlation threshold")
     parser.add_argument("--corr-weight", type=float, default=0.5,
                         help="Score blend: 0 = distance only, 1 = correlation only")
-    # Phase 2 probabilistic
-    parser.add_argument("--probabilistic", action="store_true",
-                        help="Use the P_same probabilistic model + clustering")
-    parser.add_argument("--model", choices=["centroid", "spatial", "joint"],
-                        default="spatial", help="P_same feature(s) (Phase 2)")
+    # CellReg P_same model (DEFAULT) — data-driven threshold, auto model select
+    parser.add_argument("--registration-approach",
+                        choices=["probabilistic_model", "threshold"],
+                        default="probabilistic_model",
+                        help="DEFAULT probabilistic_model = CellReg lognormal/beta "
+                             "P_same with a data-driven threshold (auto-falls back "
+                             "to threshold matching on sparse/degenerate fields); "
+                             "threshold = hand-set corr_thr/dist_thr")
+    parser.add_argument("--psame-feature", choices=["auto", "spatial", "centroid"],
+                        default="auto",
+                        help="P_same feature for the model approach (auto = "
+                             "choose_best_model by FP+FN+MSE)")
+    parser.add_argument("--clustering", choices=["iterative", "greedy"],
+                        default="iterative",
+                        help="Cluster refinement for the model approach")
     parser.add_argument("--p-same-thr", type=float, default=0.5,
-                        help="P_same acceptance cutoff (Phase 2)")
+                        help="P_same acceptance cutoff")
+    # Legacy GMM probabilistic (only with --registration-approach threshold)
+    parser.add_argument("--probabilistic", action="store_true",
+                        help="Legacy GMM P_same (requires --registration-approach "
+                             "threshold)")
+    parser.add_argument("--model", choices=["centroid", "spatial", "joint"],
+                        default="spatial", help="legacy GMM feature(s)")
     parser.add_argument("--min-sessions", type=int, default=2,
                         help="Report cells present in >= this many sessions")
     args = parser.parse_args()
@@ -87,6 +103,9 @@ def main() -> None:
         dist_thr_px=args.dist_thr_px,
         corr_thr=args.corr_thr,
         corr_weight=args.corr_weight,
+        registration_approach=args.registration_approach,
+        psame_feature=args.psame_feature,
+        clustering=args.clustering,
         probabilistic=args.probabilistic,
         model=args.model,
         p_same_thr=args.p_same_thr,
@@ -97,10 +116,15 @@ def main() -> None:
 
     n_reg = result.n_registered(min_sessions=args.min_sessions)
     print(f"Registered {result.n_sessions} sessions in {elapsed:.1f}s")
+    print(f"  approach: {result.params.get('registration_approach')}"
+          f" (feature={result.params.get('psame_feature')},"
+          f" data-driven thr={result.params.get('data_driven_threshold')})")
     print(f"  global cells: {result.n_global}")
     print(f"  present in >= {args.min_sessions} sessions: {n_reg}")
-    if result.p_same_threshold is not None:
-        print(f"  P_same threshold: {result.p_same_threshold}")
+    if result.uncertain_fraction is not None:
+        print(f"  uncertain fraction: {result.uncertain_fraction:.3f}"
+              f"  (model FP={result.model_false_positive:.3f},"
+              f" FN={result.model_false_negative:.3f})")
     print(f"  saved to: {out_dir}")
 
     run_info = {

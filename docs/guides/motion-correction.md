@@ -50,6 +50,52 @@ With `niter_rig > 1`, each pass rebuilds the template from the *previous pass's
 corrected* frames and the per-pass shifts are summed
 (`shifts_total += shifts_iter`).
 
+### Template sharpening (`sharpen_template`, default on)
+
+A plain bin-median over the strided sample is **smeared** when the drift is large
+relative to the FOV: the sample spans every drift position, so the median lands
+near the *mean* position and cross-correlating against that blur pulls each
+frame's peak toward zero — a single pass then **under-tracks** (recovers the
+right shift *shape* but a compressed *amplitude*). Historically you fixed this
+with several `niter_rig` passes, each re-sharpening the template from the
+corrected frames — but every pass re-reads and re-writes the whole movie.
+
+`sharpen_template=True` (the **default**; `CNMFeParams.mc_sharpen_template`) does
+the sharpening up front and cheaply (`_build_sharpened_template`): it aligns just
+the in-RAM frame *sample* to convergence (the in-memory MC loop run on the
+sample, no streaming IO) and builds the template from the aligned sample. A
+**single** full-movie pass with that template then recovers the full amplitude —
+matching a multi-pass run at ~one-pass cost. Because the sample is fixed-size
+(`≤ template_max_frames`), the expensive full-movie sweep happens **once**
+regardless of recording length, which is the dominant win on long sessions.
+
+Set `sharpen_template=False` (`mc_sharpen_template=False`) for the legacy
+smeared-median template — the exact CaImAn-equivalent behaviour. Sharpening is
+skipped automatically when an explicit `template` is supplied.
+
+### Early-stop on convergence (`converge_tol`)
+
+When you do run multiple full passes, `converge_tol` (e.g. `0.01`;
+`CNMFeParams.mc_converge_tol`) stops the loop early once a pass improves the
+template's high-pass sharpness (`_template_sharpness`) by less than that relative
+amount — a ground-truth-free convergence check, so `niter_rig` becomes just an
+upper bound rather than an exact count. `None` (default) runs exactly
+`niter_rig` passes. The sample-sharpening loop above always runs to its own
+(fixed-tolerance) convergence, independent of this.
+
+### Supplying a template (`fit_mc`)
+
+`CNMFe.fit_mc(movie, ..., template=..., template_window=...)` lets you bypass the
+auto-built template:
+
+- `template` — a precomputed `(H, W)` array to register against (raw; MC
+  high-pass filters it internally).
+- `template_window=(t0, t1)` — build the template as the mean of frames
+  `[t0:t1)`. Pick a *short, low-motion* window; only that slice is read. Mutually
+  exclusive with `template`.
+
+Both are also available on `motion_correction_rigid(..., template=...)`.
+
 ## Two execution paths (chosen automatically)
 
 `motion_correction_rigid` dispatches on input type and `output_path`:

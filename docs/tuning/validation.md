@@ -47,7 +47,7 @@ precision, npix, SNR, PASS/WARN), and a `summary.txt` per run.
 ## The `good_defaults` base
 
 `good_defaults(frame_rate_hz, decay_time_ms, …)` is the native-unit long-recording
-starting point (rationale in `live_runs/tuning_picast/LEARNINGS.md`):
+starting point:
 `global_bg_rank=1`, `min_pixel=60` (floor; SNR does ghost rejection),
 `auto_eval_snr_amp_thr=20.0`, the physical-decay `g` prior (`g_prior_weight=0.6`),
 `init_stride=2`, `n_iter_main=2`. Validation applies `downscaled(ssub, tsub)` to it
@@ -55,12 +55,10 @@ internally so native params run on the (possibly downsampled) grid.
 
 > Note: `good_defaults` sets `auto_eval_snr_amp_thr=20.0`, which diverges from the
 > `CNMFeParams` field default of `3.0` — an intentional long-recording override.
-> See `todo/doc_comment_code_mismatches.md`.
 
 ## Batch & orchestration
 
 `resolve_session_paths` expands a `.txt` list (or several paths) into deduped
 session paths. `tune.py --sessions` / `batch_tune.run_batch` run one
 `tune.py --validate` subprocess per session in a single BLAS-capped background
-process (bounded concurrency), writing a `batch_summary.md`. The `/tune-session`
-skill wraps the same flow.
+process (bounded concurrency), writing a `batch_summary.md`.

@@ -249,7 +249,9 @@ class CNMFeParams:
     # --- Motion correction ---
     max_shift: tuple[int, int] = (20, 20)
     upsample_factor: int = 10
-    mc_n_iter: int = 1                 # number of rigid MC passes (CaImAn default is 1)
+    mc_n_iter: int = 1                 # number of rigid MC passes (max passes when mc_converge_tol is set)
+    mc_converge_tol: "float | None" = None  # if set (e.g. 0.01), stop MC passes early once template sharpness gain falls below it (GT-free convergence; mc_n_iter is then just the cap)
+    mc_sharpen_template: bool = True   # build the MC template by aligning the in-RAM frame sample (recovers full drift amplitude even at mc_n_iter=1, ~one-pass cost on long movies); False = legacy smeared-median template
     mc_gSig_filt: float | None = None  # 1p high-pass sigma; set ≈ sigma to enable
     mc_batch_size: int = 200           # frames per streaming/parallel batch in MC
     mc_template_max_frames: int = 2000 # cap on frames sampled to build the MC template
@@ -808,11 +810,49 @@ class CNMFe:
     # Pipeline
     # ------------------------------------------------------------------
 
+    def _resolve_mc_template(self, movie, template, template_window, dims):
+        """Resolve an optional precomputed MC template (in cropped coords).
+
+        Returns an ``(H, W)`` float32 template or ``None`` (auto, built from a
+        strided sample inside ``motion_correction_rigid``). At most one of
+        ``template`` / ``template_window`` may be given.
+
+        - ``template``: a precomputed ``(H, W)`` array (raw, *not* high-pass
+          filtered — MC filters it internally with ``mc_gSig_filt``).
+        - ``template_window=(t0, t1)``: build the template as the mean of frames
+          ``[t0:t1)``. A *short, low-motion* window gives a sharp, single-position
+          template that avoids the smeared-full-movie under-tracking — only that
+          slice is read, so it is cheap even for a zarr input.
+        """
+        if template is not None and template_window is not None:
+            raise ValueError(
+                "fit_mc: pass at most one of template / template_window"
+            )
+        if template is not None:
+            t = np.asarray(template, dtype=np.float32)
+            if t.shape != dims:
+                raise ValueError(
+                    f"fit_mc: template shape {t.shape} != movie dims {dims} "
+                    "(template must match the post-cutout frame size)"
+                )
+            return t
+        if template_window is not None:
+            t0, t1 = int(template_window[0]), int(template_window[1])
+            T = int(movie.shape[0])
+            if not (0 <= t0 < t1 <= T):
+                raise ValueError(
+                    f"fit_mc: template_window {(t0, t1)} out of range for T={T}"
+                )
+            return np.asarray(movie[t0:t1], dtype=np.float32).mean(axis=0)
+        return None
+
     def fit_mc(
         self,
         movie: "zarr.Array | np.ndarray",
         output_dir: str | Path | None = None,
         in_place: bool = False,
+        template: "np.ndarray | None" = None,
+        template_window: "tuple[int, int] | None" = None,
     ) -> "zarr.Array | np.ndarray":
         """Run only the motion correction step.
 
@@ -832,6 +872,17 @@ class CNMFe:
         Args:
             movie: Input movie, shape (T, H, W). zarr or numpy array.
             output_dir: If given, write ``mc.zarr`` here and return zarr handle.
+            template: Optional precomputed ``(H, W)`` template to register
+                against, instead of the auto strided-sample template. Useful
+                when the auto template smears under large drift (it averages
+                over every drift position) — supply a sharp, single-position
+                template so even a couple of passes recover full amplitude.
+                Must match the post-cutout frame size; given raw (MC high-pass
+                filters it internally).
+            template_window: Optional ``(t0, t1)`` — build the template as the
+                mean of frames ``[t0:t1)`` instead of supplying one. Pick a
+                *short, low-motion* window; only that slice is read. Mutually
+                exclusive with ``template``.
 
         Returns:
             Corrected movie — zarr handle (if output_dir given / zarr input)
@@ -846,6 +897,11 @@ class CNMFe:
         T, H, W = int(movie.shape[0]), int(movie.shape[1]), int(movie.shape[2])
         self.dims = (H, W)
 
+        # Optional sharp / precomputed template (resolved in cropped coords).
+        mc_template = self._resolve_mc_template(
+            movie, template, template_window, (H, W)
+        )
+
         output_path: "Path | None" = None
         if output_dir is not None:
             output_dir = Path(output_dir)
@@ -859,6 +915,9 @@ class CNMFe:
             gSig_filt=p.mc_gSig_filt,
             upsample_factor=p.upsample_factor,
             niter_rig=p.mc_n_iter,
+            converge_tol=p.mc_converge_tol,
+            sharpen_template=p.mc_sharpen_template,
+            template=mc_template,
             batch_size=p.mc_batch_size,
             n_jobs=p.n_jobs,
             template_max_frames=p.mc_template_max_frames,

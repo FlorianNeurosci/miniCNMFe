@@ -316,6 +316,436 @@ def pairwise_metrics(
 
 
 # ---------------------------------------------------------------------------
+# CellReg-style NN / NNN candidate distributions
+# ---------------------------------------------------------------------------
+
+@dataclass
+class NNDistributions:
+    """Same-cell-candidate (nearest-neighbour) vs different-cell (non-nearest)
+    metric distributions, the empirical basis for the CellReg P_same model.
+
+    Mirrors ``compute_data_distribution.m``: for every cell, the cross-session
+    neighbour with the **highest spatial correlation** (and, independently, the
+    **smallest centroid distance**) is the same-cell candidate (NN); every other
+    neighbour within ``max_distance`` is a different-cell example (NNN). The corr
+    and distance NN/NNN arrays are kept separately because CellReg fits a 1-D
+    model to each.
+    """
+
+    nn_corr: np.ndarray
+    nnn_corr: np.ndarray
+    nn_dist: np.ndarray
+    nnn_dist: np.ndarray
+
+
+def compute_nn_nnn_distributions(
+    aligned_fps: list[np.ndarray],
+    aligned_cents: list[np.ndarray],
+    *,
+    max_distance_px: float,
+) -> NNDistributions:
+    """Build NN/NNN correlation & distance distributions across all sessions.
+
+    For each (session, cell), collect every cross-session neighbour within
+    ``max_distance_px`` and its (centroid distance, spatial correlation). The
+    nearest neighbour (max corr / min dist) seeds the NN arrays; the rest seed
+    the NNN arrays. Pairs are gathered from each cell's perspective (so a pair is
+    seen from both sides — fine for distribution fitting).
+    """
+    n = len(aligned_fps)
+    nn_corr: list[float] = []
+    nnn_corr: list[float] = []
+    nn_dist: list[float] = []
+    nnn_dist: list[float] = []
+
+    for a in range(n):
+        cents_a = aligned_cents[a]
+        for i in range(len(cents_a)):
+            ci = cents_a[i]
+            fi = aligned_fps[a][i]
+            corrs: list[float] = []
+            dists: list[float] = []
+            for b in range(n):
+                if b == a:
+                    continue
+                cb = aligned_cents[b]
+                if len(cb) == 0:
+                    continue
+                d = np.hypot(cb[:, 0] - ci[0], cb[:, 1] - ci[1])
+                for j in np.flatnonzero(d <= max_distance_px):
+                    corrs.append(_spatial_corr(fi, aligned_fps[b][j]))
+                    dists.append(float(d[j]))
+            if not corrs:
+                continue
+            ca = np.asarray(corrs)
+            da = np.asarray(dists)
+            kmax = int(np.argmax(ca))
+            nn_corr.append(float(ca[kmax]))
+            nnn_corr.extend(np.delete(ca, kmax).tolist())
+            kmin = int(np.argmin(da))
+            nn_dist.append(float(da[kmin]))
+            nnn_dist.extend(np.delete(da, kmin).tolist())
+
+    return NNDistributions(
+        nn_corr=np.asarray(nn_corr, dtype=np.float64),
+        nnn_corr=np.asarray(nnn_corr, dtype=np.float64),
+        nn_dist=np.asarray(nn_dist, dtype=np.float64),
+        nnn_dist=np.asarray(nnn_dist, dtype=np.float64),
+    )
+
+
+# ---------------------------------------------------------------------------
+# CellReg-style P_same models (lognormal+beta on correlation; lognormal+
+# linear*sigmoid on distance) with a DATA-DRIVEN threshold at the P_same=0.5
+# crossing. Faithful to compute_spatial_correlations_model.m /
+# compute_centroid_distances_model.m. Replaces the hand-set corr_thr/dist_thr.
+# ---------------------------------------------------------------------------
+
+def _lognpdf(x: np.ndarray, mu: float, sigma: float) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    sigma = max(float(sigma), 1e-6)
+    out = np.zeros_like(x)
+    pos = x > 0
+    out[pos] = (1.0 / (x[pos] * sigma * np.sqrt(2 * np.pi))) * \
+        np.exp(-0.5 * ((np.log(x[pos]) - mu) / sigma) ** 2)
+    return out
+
+
+def _betapdf(x: np.ndarray, p: float, q: float) -> np.ndarray:
+    from scipy.special import betaln
+    x = np.clip(np.asarray(x, dtype=float), 1e-9, 1 - 1e-9)
+    logpdf = (p - 1) * np.log(x) + (q - 1) * np.log(1 - x) - betaln(p, q)
+    return np.exp(logpdf)
+
+
+def _beta_mom(weights: np.ndarray, x: np.ndarray) -> tuple[float, float]:
+    """Weighted method-of-moments beta parameters."""
+    w = np.asarray(weights, dtype=float)
+    ws = w.sum() + 1e-12
+    m = float((w * x).sum() / ws)
+    m = min(max(m, 1e-4), 1 - 1e-4)
+    v = float((w * (x - m) ** 2).sum() / ws) + 1e-9
+    common = m * (1 - m) / v - 1.0
+    common = max(common, 1e-3)
+    return max(m * common, 1e-2), max((1 - m) * common, 1e-2)
+
+
+@dataclass
+class SpatialCorrelationModel:
+    """Lognormal(same) + Beta(different) mixture over spatial correlation.
+
+    Correlation in [-1, 1] is mapped to t = (corr+1)/2 in (0, 1) for the fit
+    (CellReg's footprint correlations live in [0,1]; our union-support corr can
+    go negative, so we rescale monotonically). ``p_same(corr)`` interpolates the
+    fitted posterior; ``threshold`` is the corr where P_same crosses 0.5.
+    """
+
+    pi_same: float
+    mu: float
+    sigma: float
+    p: float
+    q: float
+    same_is_lognormal: bool
+    grid_corr: np.ndarray
+    grid_psame: np.ndarray
+    threshold: float
+    cost: float = float("inf")        # FP+FN+MSE (choose_best_model)
+    false_positive: float = float("nan")
+    false_negative: float = float("nan")
+
+    @staticmethod
+    def _to_t(corr):
+        return np.clip((np.asarray(corr, dtype=float) + 1.0) / 2.0, 1e-3, 1 - 1e-3)
+
+    def p_same_from_corr(self, corr) -> np.ndarray:
+        t = self._to_t(corr)
+        return np.interp(t, self.grid_corr, self.grid_psame).astype(np.float32)
+
+
+def fit_spatial_correlation_model(all_corr: np.ndarray, *, em_iters: int = 100
+                                  ) -> SpatialCorrelationModel | None:
+    """Fit the lognormal(same)+beta(different) correlation mixture by EM."""
+    c = np.asarray(all_corr, dtype=float)
+    c = c[np.isfinite(c)]
+    if c.size < 20:
+        return None
+    t = SpatialCorrelationModel._to_t(c)
+    logt = np.log(t)
+
+    pi = 0.5
+    mu, sigma = float(logt.mean()), float(logt.std() + 1e-3)
+    p, q = 2.0, 5.0
+    for _ in range(em_iters):
+        ln = _lognpdf(t, mu, sigma)
+        be = _betapdf(t, p, q)
+        num = pi * ln
+        r = num / (num + (1 - pi) * be + 1e-12)
+        pi = float(r.mean())
+        sw = r.sum() + 1e-12
+        mu = float((r * logt).sum() / sw)
+        sigma = float(np.sqrt((r * (logt - mu) ** 2).sum() / sw) + 1e-6)
+        p, q = _beta_mom(1.0 - r, t)
+        pi = min(max(pi, 1e-3), 1 - 1e-3)
+
+    # Degenerate fit (single mode — e.g. a sparse field with only same-cell
+    # candidates): one component carries everything. Return None so the caller
+    # falls back to threshold matching instead of trusting a meaningless model.
+    if pi < 0.02 or pi > 0.98:
+        return None
+
+    ln_mean = float(np.exp(mu + 0.5 * sigma ** 2))
+    beta_mean = p / (p + q)
+    same_is_lognormal = ln_mean >= beta_mean
+
+    grid_t = np.linspace(1e-3, 1 - 1e-3, 1000)
+    ln_g = _lognpdf(grid_t, mu, sigma)
+    be_g = _betapdf(grid_t, p, q)
+    same_g = pi * ln_g if same_is_lognormal else (1 - pi) * be_g
+    diff_g = (1 - pi) * be_g if same_is_lognormal else pi * ln_g
+    psame_g = same_g / (same_g + diff_g + 1e-12)
+
+    # threshold = corr where P_same crosses 0.5 (the same/different crossing)
+    thr_t = _threshold_from_psame(grid_t, psame_g)
+    threshold = float(2.0 * thr_t - 1.0)
+
+    # model cost = FP + FN + MSE (choose_best_model). Same-cell sits at high t.
+    idx = int(np.argmin(np.abs(psame_g - 0.5)))
+    fp = float(diff_g[idx:].sum() / (diff_g.sum() + 1e-12))
+    fn = float(same_g[:idx].sum() / (same_g.sum() + 1e-12))
+    edges = np.linspace(0, 1, 52)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    hist, _ = np.histogram(t, bins=edges, density=True)
+    total = pi * _lognpdf(centers, mu, sigma) + (1 - pi) * _betapdf(centers, p, q)
+    mse = float(np.mean((total - hist) ** 2))
+
+    return SpatialCorrelationModel(
+        pi_same=pi, mu=mu, sigma=sigma, p=p, q=q,
+        same_is_lognormal=same_is_lognormal,
+        grid_corr=grid_t, grid_psame=psame_g.astype(float), threshold=threshold,
+        cost=fp + fn + mse, false_positive=fp, false_negative=fn,
+    )
+
+
+@dataclass
+class CentroidDistanceModel:
+    """Lognormal(same) + linear*sigmoid(different) mixture over centroid distance
+    (in microns if ``microns_per_pixel`` given, else pixels)."""
+
+    params: np.ndarray            # [p0, mu, sigma, a, c, b]
+    microns_per_pixel: float
+    grid_dist_px: np.ndarray
+    grid_psame: np.ndarray
+    threshold_px: float
+    cost: float = float("inf")        # FP+FN+MSE (choose_best_model)
+    false_positive: float = float("nan")
+    false_negative: float = float("nan")
+
+    def p_same_from_dist(self, dist_px) -> np.ndarray:
+        return np.interp(np.asarray(dist_px, dtype=float),
+                         self.grid_dist_px, self.grid_psame).astype(np.float32)
+
+
+def _centroid_F(x, p0, mu, sigma, a, c, b):
+    same = p0 * _lognpdf(x, mu, sigma)
+    diff = (1 - p0) * b * x / (1.0 + np.exp(-a * (x - c)))
+    return same + diff
+
+
+def fit_centroid_distance_model(all_dist_px: np.ndarray, *,
+                                microns_per_pixel: float | None = None,
+                                max_distance_px: float,
+                                n_bins: int = 51) -> CentroidDistanceModel | None:
+    """Fit the lognormal(same)+linear*sigmoid(different) distance mixture to the
+    pooled-distance histogram via nonlinear least squares (lsqcurvefit-style)."""
+    from scipy.optimize import curve_fit
+
+    mpp = float(microns_per_pixel) if microns_per_pixel else 1.0
+    d = np.asarray(all_dist_px, dtype=float)
+    d = d[np.isfinite(d)]
+    if d.size < 20:
+        return None
+    d_u = d * mpp                                   # work in physical units
+    hi = max_distance_px * mpp
+    edges = np.linspace(0, hi, n_bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    hist, _ = np.histogram(d_u, bins=edges, density=True)
+
+    med = float(np.median(d_u))
+    p0 = [0.4, np.log(max(med * 0.4, 1e-2)), 0.6, 2.0 / max(mpp, 1e-3),
+          0.5 * hi, hist.max() / max(hi, 1e-3)]
+    bounds = ([1e-3, -5, 1e-2, 1e-3, 0.0, 0.0],
+              [1 - 1e-3, np.log(hi + 1), 3.0, 50.0, hi, 1e3])
+    try:
+        popt, _ = curve_fit(_centroid_F, centers, hist, p0=p0, bounds=bounds,
+                            maxfev=20000)
+    except Exception:
+        return None
+
+    p0f, mu, sigma, a, c, b = popt
+    if p0f < 0.02 or p0f > 0.98:        # degenerate single-mode fit -> fall back
+        return None
+    grid = np.linspace(1e-3, hi, 1000)
+    same_g = p0f * _lognpdf(grid, mu, sigma)
+    diff_g = (1 - p0f) * b * grid / (1.0 + np.exp(-a * (grid - c)))
+    psame_g = same_g / (same_g + diff_g + 1e-12)
+    thr_u = _threshold_from_psame(grid, psame_g, increasing=False)
+
+    # model cost = FP + FN + MSE. Same-cell sits at small distance.
+    idx = int(np.argmin(np.abs(psame_g - 0.5)))
+    fp = float(diff_g[:idx].sum() / (diff_g.sum() + 1e-12))
+    fn = float(same_g[idx:].sum() / (same_g.sum() + 1e-12))
+    mse = float(np.mean((_centroid_F(centers, *popt) - hist) ** 2))
+
+    return CentroidDistanceModel(
+        params=np.asarray(popt), microns_per_pixel=mpp,
+        grid_dist_px=(grid / mpp), grid_psame=psame_g.astype(float),
+        threshold_px=float(thr_u / mpp),
+        cost=fp + fn + mse, false_positive=fp, false_negative=fn,
+    )
+
+
+def _threshold_from_psame(grid: np.ndarray, psame: np.ndarray,
+                          increasing: bool = True) -> float:
+    """Locate where P_same crosses 0.5. ``increasing`` = P_same rises with the
+    grid value (correlation); else it falls (distance)."""
+    above = psame >= 0.5
+    if increasing:
+        idx = np.flatnonzero(~above[:-1] & above[1:])
+        return float(grid[idx[0] + 1]) if idx.size else float(grid[int(np.argmax(psame))])
+    idx = np.flatnonzero(above[:-1] & ~above[1:])
+    return float(grid[idx[0]]) if idx.size else float(grid[int(np.argmax(psame))])
+
+
+@dataclass
+class CellRegModel:
+    """Unified P_same model wrapping a spatial-correlation and/or centroid-
+    distance sub-model, with the active ``feature`` exposed via ``p_same``."""
+
+    feature: str                                   # "spatial" | "centroid"
+    spatial: SpatialCorrelationModel | None = None
+    centroid: CentroidDistanceModel | None = None
+
+    def p_same(self, dist, corr) -> np.ndarray:
+        if self.feature == "spatial":
+            return self.spatial.p_same_from_corr(corr)
+        return self.centroid.p_same_from_dist(dist)
+
+    @property
+    def threshold(self) -> float:
+        return (self.spatial.threshold if self.feature == "spatial"
+                else self.centroid.threshold_px)
+
+    @property
+    def _chosen(self):
+        return self.spatial if self.feature == "spatial" else self.centroid
+
+    @property
+    def false_positive(self) -> float:
+        return float(self._chosen.false_positive)
+
+    @property
+    def false_negative(self) -> float:
+        return float(self._chosen.false_negative)
+
+
+def compute_registration_scores(
+    cell_to_index_map: np.ndarray,
+    aligned_fps: list[np.ndarray],
+    aligned_cents: list[np.ndarray],
+    model: "CellRegModel",
+    *,
+    certainty: float = 0.95,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Per-cluster confidence scores for a registration (CellReg compute_scores).
+
+    Returns ``(cell_scores, p_same_registered_pairs, uncertain_fraction)``:
+    - ``cell_scores`` ``(n_global,)`` = mean ``P_same`` of each cluster's
+      within-cluster cross-session pairs (NaN for singletons);
+    - ``p_same_registered_pairs`` = flat array of those pair P_same values;
+    - ``uncertain_fraction`` = fraction of registered pairs with
+      ``1-certainty < P_same < certainty`` (ambiguous matches).
+    """
+    n_global = int(cell_to_index_map.shape[0])
+    cell_scores = np.full(n_global, np.nan, dtype=np.float32)
+    pairs: list[float] = []
+    for g, row in enumerate(cell_to_index_map):
+        members = [(s, int(k)) for s, k in enumerate(row) if k >= 0]
+        if len(members) < 2:
+            continue
+        vals: list[float] = []
+        for a in range(len(members)):
+            for b in range(a + 1, len(members)):
+                sa, ka = members[a]
+                sb, kb = members[b]
+                d = float(np.hypot(aligned_cents[sa][ka][0] - aligned_cents[sb][kb][0],
+                                   aligned_cents[sa][ka][1] - aligned_cents[sb][kb][1]))
+                c = float(_spatial_corr(aligned_fps[sa][ka], aligned_fps[sb][kb]))
+                ps = float(model.p_same(np.array([d]), np.array([c]))[0])
+                vals.append(ps)
+        cell_scores[g] = float(np.mean(vals))
+        pairs.extend(vals)
+    pp = np.asarray(pairs, dtype=np.float32)
+    lo = 1.0 - certainty
+    uncertain = (float(np.mean((pp > lo) & (pp < certainty))) if pp.size
+                 else float("nan"))
+    return cell_scores, pp, uncertain
+
+
+def fit_cellreg_model(all_dist_px: np.ndarray, all_corr: np.ndarray, *,
+                      feature: str = "spatial",
+                      microns_per_pixel: float | None = None,
+                      max_distance_px: float) -> CellRegModel | None:
+    """Fit the CellReg P_same model(s) on pooled candidate metrics."""
+    spatial = centroid = None
+    if feature in ("spatial", "auto"):
+        spatial = fit_spatial_correlation_model(all_corr)
+    if feature in ("centroid", "auto"):
+        centroid = fit_centroid_distance_model(
+            all_dist_px, microns_per_pixel=microns_per_pixel,
+            max_distance_px=max_distance_px)
+    if feature == "spatial":
+        m = CellRegModel("spatial", spatial=spatial) if spatial else None
+    elif feature == "centroid":
+        m = CellRegModel("centroid", centroid=centroid) if centroid else None
+    else:  # auto: choose_best_model — pick the lower-cost (FP+FN+MSE) model.
+        best = choose_best_model(spatial, centroid)
+        m = CellRegModel(best, spatial=spatial, centroid=centroid) if best else None
+    return _reject_degenerate(m, all_dist_px, all_corr)
+
+
+def _reject_degenerate(model: "CellRegModel | None", all_dist_px, all_corr,
+                       *, lo: float = 0.02, hi: float = 0.98) -> "CellRegModel | None":
+    """Return ``None`` if the fitted model has no real two-population structure.
+
+    A trustworthy P_same model labels *some* candidates "same" and *some*
+    "different". If essentially all (or none) of the pooled candidates land on one
+    side of P_same=0.5 — e.g. a sparse field with only same-cell neighbours and no
+    different-cell population to calibrate against — the model is meaningless, so
+    the caller should fall back to threshold matching instead."""
+    if model is None:
+        return None
+    pred = model.p_same(np.asarray(all_dist_px), np.asarray(all_corr))
+    if pred.size == 0:
+        return None
+    frac_same = float(np.mean(pred >= 0.5))
+    return None if frac_same < lo or frac_same > hi else model
+
+
+def choose_best_model(spatial: SpatialCorrelationModel | None,
+                      centroid: CentroidDistanceModel | None) -> str | None:
+    """Pick the lower-cost model (cost = false_positive + false_negative + MSE),
+    matching CellReg's ``choose_best_model.m``. Returns ``"spatial"`` /
+    ``"centroid"`` / ``None``."""
+    if spatial is None and centroid is None:
+        return None
+    if centroid is None:
+        return "spatial"
+    if spatial is None:
+        return "centroid"
+    return "spatial" if spatial.cost <= centroid.cost else "centroid"
+
+
+# ---------------------------------------------------------------------------
 # Stage 3b — probabilistic P_same model (Phase 2)
 # ---------------------------------------------------------------------------
 
@@ -534,6 +964,120 @@ def build_cell_map(
 
 
 # ---------------------------------------------------------------------------
+# Stage 4b — iterative joint clustering (CellReg cluster_cells.m)
+# ---------------------------------------------------------------------------
+
+def cluster_cells_iterative(
+    cell_to_index_map: np.ndarray,
+    aligned_fps: list[np.ndarray],
+    aligned_cents: list[np.ndarray],
+    model: "CellRegModel",
+    *,
+    max_distance_px: float,
+    p_same_thr: float = 0.5,
+    max_iters: int = 10,
+    num_changes_thresh: int = 10,
+    cluster_distance_factor: float = 1.7,
+) -> np.ndarray:
+    """Refine an initial ``cell_to_index_map`` by iterative reassignment.
+
+    Mirrors ``cluster_cells.m``: each iteration recomputes cluster centroids
+    (mean of member centroids) and reassigns every cell to the **maximal-
+    similarity** cluster within ``cluster_distance_factor * max_distance``,
+    enforcing at most one cell per session. Similarity = mean ``model.p_same`` of
+    the cell to the cluster's members in *other* sessions (the calibrated P_same,
+    not raw correlation). A cell whose best similarity is below ``p_same_thr`` is
+    split off into its own singleton. Converges when the per-iteration change
+    count drops below ``num_changes_thresh`` (or ``max_iters`` is reached).
+
+    Unlike single-pass greedy ``build_cell_map``, this re-evaluates decisions, so
+    an early wrong merge can be corrected. Deterministic: cells are visited in a
+    fixed order and a move requires a strict similarity improvement.
+    """
+    n_sessions = int(cell_to_index_map.shape[1])
+    clusters: list[dict[int, int]] = []
+    parent: dict[tuple[int, int], int] = {}
+    for row in cell_to_index_map:
+        c = {s: int(k) for s, k in enumerate(row) if k >= 0}
+        if not c:
+            continue
+        cid = len(clusters)
+        clusters.append(c)
+        for s, k in c.items():
+            parent[(s, k)] = cid
+
+    corr_cache: dict[tuple, float] = {}
+
+    def pair_psame(s, k, sm, km) -> float:
+        d = float(np.hypot(aligned_cents[s][k][0] - aligned_cents[sm][km][0],
+                           aligned_cents[s][k][1] - aligned_cents[sm][km][1]))
+        key = (s, k, sm, km) if (s, k) <= (sm, km) else (sm, km, s, k)
+        cc = corr_cache.get(key)
+        if cc is None:
+            cc = float(_spatial_corr(aligned_fps[s][k], aligned_fps[sm][km]))
+            corr_cache[key] = cc
+        return float(model.p_same(np.array([d]), np.array([cc]))[0])
+
+    def similarity(s, k, cluster) -> float:
+        vals = [pair_psame(s, k, sm, km) for sm, km in cluster.items() if sm != s]
+        return float(np.mean(vals)) if vals else -1.0
+
+    radius = cluster_distance_factor * max_distance_px
+    cells = [(s, k) for s in range(n_sessions)
+             for k in range(len(aligned_cents[s]))]
+
+    for _ in range(max_iters):
+        cent = np.full((len(clusters), 2), np.nan)
+        for ci, c in enumerate(clusters):
+            if c:
+                pts = np.array([aligned_cents[s][k] for s, k in c.items()])
+                cent[ci] = pts.mean(axis=0)
+        valid = np.flatnonzero(~np.isnan(cent[:, 0]))
+        tree = cKDTree(cent[valid]) if valid.size else None
+
+        changes = 0
+        for (s, k) in cells:
+            cu = parent[(s, k)]
+            my = aligned_cents[s][k]
+            cand = set()
+            if tree is not None:
+                for idx in tree.query_ball_point(my, r=radius):
+                    cand.add(int(valid[idx]))
+            cand.add(cu)
+            best_cid, best_sim = cu, similarity(s, k, clusters[cu])
+            for cid in cand:
+                if cid == cu:
+                    continue
+                c = clusters[cid]
+                if s in c and c[s] != k:           # one-per-session conflict
+                    continue
+                sim = similarity(s, k, c)
+                if sim > best_sim + 1e-9:
+                    best_cid, best_sim = cid, sim
+
+            if best_sim < p_same_thr:
+                if len(clusters[cu]) > 1:          # split off into a singleton
+                    del clusters[cu][s]
+                    clusters.append({s: k})
+                    parent[(s, k)] = len(clusters) - 1
+                    changes += 1
+                continue
+            if best_cid != cu:                     # move to a better cluster
+                del clusters[cu][s]
+                clusters[best_cid][s] = k
+                parent[(s, k)] = best_cid
+                changes += 1
+
+        if changes < num_changes_thresh:
+            break
+
+    rows = [[c.get(s, -1) for s in range(n_sessions)] for c in clusters if c]
+    if not rows:
+        return np.empty((0, n_sessions), dtype=int)
+    return np.asarray(rows, dtype=int)
+
+
+# ---------------------------------------------------------------------------
 # Result container
 # ---------------------------------------------------------------------------
 
@@ -561,6 +1105,12 @@ class CellRegResult:
     dims: tuple[int, int]
     p_same_threshold: float | None = None
     params: dict = field(default_factory=dict)
+    # Registration-confidence outputs (probabilistic_model path only; else None).
+    cell_scores: np.ndarray | None = None          # (n_global,) mean within-cluster P_same
+    p_same_registered_pairs: np.ndarray | None = None  # flat P_same of registered pairs
+    uncertain_fraction: float | None = None        # frac registered pairs w/ 0.05<P_same<0.95
+    model_false_positive: float | None = None
+    model_false_negative: float | None = None
 
     @property
     def n_global(self) -> int:
@@ -588,6 +1138,11 @@ class CellRegResult:
         np.save(output_dir / "transforms.npy", self.transforms)
         np.savez(output_dir / "aligned_centroids.npz",
                  **{f"session_{s}": c for s, c in enumerate(self.aligned_centroids)})
+        if self.cell_scores is not None:
+            np.save(output_dir / "cell_scores.npy", self.cell_scores)
+        if self.p_same_registered_pairs is not None:
+            np.save(output_dir / "p_same_registered_pairs.npy",
+                    self.p_same_registered_pairs)
         info = {
             "n_sessions": self.n_sessions,
             "n_global": self.n_global,
@@ -595,6 +1150,9 @@ class CellRegResult:
             "p_same_threshold": self.p_same_threshold,
             "params": self.params,
             "K_per_session": [int(c.shape[0]) for c in self.aligned_centroids],
+            "uncertain_fraction": self.uncertain_fraction,
+            "model_false_positive": self.model_false_positive,
+            "model_false_negative": self.model_false_negative,
         }
         (output_dir / "cellreg_info.json").write_text(json.dumps(info, indent=2))
 
@@ -608,6 +1166,8 @@ class CellRegResult:
         with np.load(output_dir / "aligned_centroids.npz") as npz:
             n = info["n_sessions"]
             cents = [npz[f"session_{s}"] for s in range(n)]
+        cs_path = output_dir / "cell_scores.npy"
+        pp_path = output_dir / "p_same_registered_pairs.npy"
         return cls(
             cell_to_index_map=cmap,
             n_sessions=int(info["n_sessions"]),
@@ -616,6 +1176,11 @@ class CellRegResult:
             dims=tuple(info["dims"]),
             p_same_threshold=info.get("p_same_threshold"),
             params=info.get("params", {}),
+            cell_scores=np.load(cs_path) if cs_path.exists() else None,
+            p_same_registered_pairs=np.load(pp_path) if pp_path.exists() else None,
+            uncertain_fraction=info.get("uncertain_fraction"),
+            model_false_positive=info.get("model_false_positive"),
+            model_false_negative=info.get("model_false_negative"),
         )
 
 
@@ -641,6 +1206,13 @@ def register_sessions(
     probabilistic: bool = False,
     model: str = "spatial",
     p_same_thr: float = 0.5,
+    # CellReg-style probabilistic model with a data-driven threshold.
+    # DEFAULT (like CellReg): fit the P_same model and auto-select corr vs
+    # distance; falls back to threshold matching (corr_thr/dist_thr) when the
+    # model can't be fit (too few candidates / degenerate single-mode field).
+    registration_approach: str = "probabilistic_model",
+    psame_feature: str = "auto",
+    clustering: str = "iterative",
     # alignment knobs
     max_shift_px: int = 20,
     angle_range_deg: float = 10.0,
@@ -711,7 +1283,24 @@ def register_sessions(
     # Stage 3b — optional P_same model.
     psame = None
     p_same_threshold = None
-    if probabilistic:
+    cellreg_model = None
+    if registration_approach == "probabilistic_model":
+        # CellReg-style: fit lognormal/beta (corr) or lognormal/linear*sigmoid
+        # (distance) on the pooled candidate metrics; the decision boundary is
+        # the data-driven P_same=0.5 crossing (p_same_thr default 0.5), NOT a
+        # hand-set corr_thr/dist_thr.
+        all_dist = (np.concatenate([m.dist for m in pair_metrics.values()])
+                    if pair_metrics else np.empty(0))
+        all_corr = (np.concatenate([m.corr for m in pair_metrics.values()])
+                    if pair_metrics else np.empty(0))
+        cellreg_model = fit_cellreg_model(
+            all_dist, all_corr, feature=psame_feature,
+            microns_per_pixel=microns_per_pixel, max_distance_px=max_distance_px)
+        if cellreg_model is not None:
+            psame = cellreg_model
+            p_same_threshold = p_same_thr
+        # else: fall back to threshold matching (too few candidates / fit failed)
+    elif probabilistic:
         psame = fit_psame_model(list(pair_metrics.values()), model=model,
                                 max_distance_px=max_distance_px)
         if psame is not None:
@@ -730,8 +1319,23 @@ def register_sessions(
         for mt in matches:
             edges.append((a, mt.i, b, mt.j, mt.score))
 
-    # Stage 4 — cluster into the map.
+    # Stage 4 — cluster into the map (greedy single-pass), then optionally
+    # refine with the CellReg iterative joint clustering on the model path.
     cell_to_index_map = build_cell_map(n, K_per, edges)
+    if (registration_approach == "probabilistic_model" and cellreg_model is not None
+            and clustering == "iterative"):
+        cell_to_index_map = cluster_cells_iterative(
+            cell_to_index_map, aligned_fps, aligned_cents, cellreg_model,
+            max_distance_px=max_distance_px, p_same_thr=p_same_thr)
+
+    # Stage 5 — registration-confidence scores (model path only).
+    cell_scores = p_same_pairs = uncertain_fraction = None
+    model_fp = model_fn = None
+    if cellreg_model is not None:
+        cell_scores, p_same_pairs, uncertain_fraction = compute_registration_scores(
+            cell_to_index_map, aligned_fps, aligned_cents, cellreg_model)
+        model_fp = cellreg_model.false_positive
+        model_fn = cellreg_model.false_negative
 
     params = {
         "microns_per_pixel": microns_per_pixel,
@@ -745,6 +1349,14 @@ def register_sessions(
         "probabilistic": probabilistic,
         "model": model if probabilistic else None,
         "p_same_thr": p_same_thr if probabilistic else None,
+        "registration_approach": registration_approach,
+        "clustering": (clustering if registration_approach == "probabilistic_model"
+                       and cellreg_model is not None else "greedy"),
+        "psame_feature": (cellreg_model.feature if cellreg_model is not None
+                          else (psame_feature if registration_approach
+                                == "probabilistic_model" else None)),
+        "data_driven_threshold": (float(cellreg_model.threshold)
+                                  if cellreg_model is not None else None),
     }
 
     return CellRegResult(
@@ -755,4 +1367,9 @@ def register_sessions(
         dims=dims0,
         p_same_threshold=p_same_threshold,
         params=params,
+        cell_scores=cell_scores,
+        p_same_registered_pairs=p_same_pairs,
+        uncertain_fraction=uncertain_fraction,
+        model_false_positive=model_fp,
+        model_false_negative=model_fn,
     )

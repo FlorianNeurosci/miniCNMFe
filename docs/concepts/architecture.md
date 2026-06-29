@@ -11,7 +11,7 @@ tags: [minicnmfe, architecture, modules]
 ## Repository Layout
 
 ```
-D:\code\claude_cnmfe\
+simpler_cnmfe/
 ├── minicnmfe/                        # Main package
 │   ├── __init__.py               # Public re-exports: CNMFe, CNMFeParams, load_movie
 │   ├── _utils.py                 # Shared low-level helpers (no algorithm logic)
@@ -42,9 +42,7 @@ D:\code\claude_cnmfe\
 ├── generate_demo_movies.py       # Generate demo_movies/*.avi with ground-truth NPZ sidecars
 ├── convert_to_zarr.py            # Batch-convert demo_movies/*.avi -> *.zarr
 ├── full_pipeline.py              # CLI: load zarr, run full pipeline, save results to disk
-├── tutorial.ipynb                # End-to-end walkthrough notebook
-├── tutorial_demo.ipynb           # Realistic lazy-load AVI workflow demo
-├── todo/speedup.md               # Guide for future speed improvements
+├── demo_notebooks/               # Tutorial notebooks (load+MC, extraction, old_demos/)
 └── pyproject.toml
 ```
 
@@ -195,4 +193,4 @@ Functions dispatched by `joblib.Parallel` (e.g. `_filter_estimate_apply`, `_deco
 ### Bayesian-prior path for AR coefficient `g`
 `estimate_ar_params` has two shrinkage paths. The legacy path multiplies the Yule-Walker estimate by `fudge_factor` (default `0.96`) — a unitless prior toward zero. The prior path takes `g_prior = exp(-1 / (fps · τ_ms / 1000))` derived from `CNMFeParams.decay_time_ms` + `frame_rate_hz` and shrinks toward it: `g = (1 - g_prior_weight) · g_yw + g_prior_weight · g_prior`. `fudge_factor` is bypassed on the prior path.
 
-`g_target` is computed once in `CNMFe.fit` and threaded into every estimator: pipeline-init pooled estimate, per-component init estimate (greedy `extract_spatial_temporal`), and the `update_temporal` fallback when the cache is empty. With this, the same shrinkage target governs the AR coefficient end-to-end across init → BCD → final pass. See [todo/oasis_oversmoothing.md](https://github.com/FlorianNeurosci/simpler_cnmfe/blob/master/todo/oasis_oversmoothing.md) for the diagnostic that motivated the path.
+`g_target` is computed once in `CNMFe.fit` and threaded into every estimator: pipeline-init pooled estimate, per-component init estimate (greedy `extract_spatial_temporal`), and the `update_temporal` fallback when the cache is empty. With this, the same shrinkage target governs the AR coefficient end-to-end across init → BCD → final pass.

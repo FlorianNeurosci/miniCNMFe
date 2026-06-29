@@ -20,7 +20,9 @@ class CNMFeParams:
     # Motion correction
     max_shift: tuple[int, int] = (20, 20)     # Max (dy, dx) shift in pixels
     upsample_factor: int = 10                  # Subpixel precision = 1/upsample_factor
-    mc_n_iter: int = 1                         # Number of correction passes (CaImAn default is 1)
+    mc_n_iter: int = 1                         # Number of full-movie correction passes
+    mc_converge_tol: float | None = None       # Stop passes early once template sharpness plateaus (None = run mc_n_iter exactly)
+    mc_sharpen_template: bool = True           # Auto-sharpen template on the in-RAM sample (full amplitude at 1 pass); False = legacy smeared median
     mc_gSig_filt: float | None = None          # High-pass Gaussian radius for MC (None = use sigma)
     mc_batch_size: int = 200                   # Frames per streaming/parallel MC batch
     mc_template_max_frames: int = 2000         # Cap on frames sampled to build the MC template
@@ -76,7 +78,7 @@ class CNMFeParams:
     ar_order: int = 1                          # AR model order (1 or 2)
     global_ar: bool = True                     # True = one g from pooled C_raw; False = per-neuron g
     n_iter_temporal: int = 2                   # BCD iterations per temporal update
-    skip_first_deconv: bool = True             # Skip OASIS on the first temporal pass (speed; see todo/speedup)
+    skip_first_deconv: bool = True             # Skip OASIS on the first temporal pass (speed)
     fudge_factor: float = 0.96                 # Yule-Walker shrinkage (legacy path; bypassed when prior is set)
 
     # Bayesian-prior on g (preferred over fudge_factor when known)
@@ -386,6 +388,9 @@ def motion_correction_rigid(
     output_dtype: str = "float32",
     compression: bool = True,
     verbose: bool = True,
+    converge_tol: float | None = None,
+    sharpen_template: bool = True,
+    sharpen_max_iters: int = 10,
 ) -> tuple[zarr.Array | np.ndarray, np.ndarray]
 ```
 
@@ -405,12 +410,23 @@ Uses `cv2.filter2D` high-pass filtering and `cv2.warpAffine` to apply shifts
 substitute). The template is built from a strided sample of up to
 `template_max_frames` frames, bin-median-reduced over `bin_window`.
 
+- `sharpen_template` (default `True`) first aligns the in-RAM sample to
+  convergence and builds the template from the aligned frames, so a single pass
+  recovers the full drift amplitude (a smeared median under-tracks large drift);
+  the expensive full-movie sweep then runs once. `False` = legacy
+  CaImAn-equivalent smeared median. Skipped when an explicit `template` is given.
+- `converge_tol` (e.g. `0.01`) early-stops a multi-pass run once the template
+  sharpness plateaus; `niter_rig` then acts as an upper bound.
+
 **Returns:** `(corrected, shifts)` — `corrected` is a `zarr.Array` handle (zarr
 path) or `(T, H, W)` numpy array (in-memory path); `shifts` is `(T, 2)`.
 
-> `CNMFe.fit_mc(movie, output_dir=...)` is the convenience entry for big movies;
-> pass a `zarr.Array` + `output_dir` and the corrected movie is written to
-> `<output_dir>/mc.zarr` without materialising T frames in RAM.
+> `CNMFe.fit_mc(movie, output_dir=..., template=None, template_window=None)` is
+> the convenience entry for big movies; pass a `zarr.Array` + `output_dir` and
+> the corrected movie is written to `<output_dir>/mc.zarr` without materialising
+> T frames in RAM. Supply `template` (an `(H, W)` array) or
+> `template_window=(t0, t1)` (build it from the mean of a short low-motion frame
+> window) to override the auto-built template.
 
 ---
 
