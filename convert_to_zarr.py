@@ -17,7 +17,6 @@ def main() -> None:
     from minicnmfe.io import avi_to_zarr
 
     demo_dir = Path("demo_movies")
-    demo_dir = Path('real_vids')
     if not demo_dir.exists():
         print("demo_movies/ not found. Run generate_demo_movies.py first.")
         return

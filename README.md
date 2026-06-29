@@ -227,10 +227,13 @@ convert_to_zarr.py         # Batch-convert demo_movies/*.avi -> *.zarr
 full_pipeline.py           # CLI: load zarr, run full pipeline, save results to disk
 ```
 
-Tutorial notebooks live in `demo_notebooks/`:
+Tutorial notebooks live in `demo_notebooks/`. They run on the reproducible
+simulated movies from `generate_demo_movies.py`, so you can execute them
+end-to-end after a fresh clone:
 
-- `01_load_and_motion_correct.ipynb` — load an AVI/zarr and run motion correction
-- `02_extract_components.ipynb` — full extraction pipeline + result inspection
+- `01_load_and_motion_correct.ipynb` — AVI → zarr, streaming motion correction, and a check of the recovered shifts against the simulated ground-truth drift
+- `02_extract_components.ipynb` — full extraction pipeline on a clean movie, validated against ground-truth footprints and traces (recall + trace correlation)
+- `03_advanced_features.ipynb` — production knobs: `nrg` footprint tightening, region cutouts, downsample-once + upsample, the rank-1 global background, and fused AVI → motion correction
 - `old_demos/` — earlier walkthroughs (CaImAn comparison, realistic simulator, etc.)
 
 ---
@@ -268,10 +271,11 @@ thresholds without re-extracting). To pick good parameters for a session, use
 To generate demo movies and try the pipeline end-to-end:
 
 ```bash
-python generate_demo_movies.py   # creates demo_movies/*.avi
+python generate_demo_movies.py   # creates demo_movies/*.avi (+ ground-truth sidecars)
 python convert_to_zarr.py        # creates demo_movies/*.zarr
 # then open demo_notebooks/01_load_and_motion_correct.ipynb
-# followed by   demo_notebooks/02_extract_components.ipynb
+#           demo_notebooks/02_extract_components.ipynb
+#           demo_notebooks/03_advanced_features.ipynb
 ```
 
 ---
@@ -288,7 +292,7 @@ Full documentation lives in [`docs/`](docs/index.md) and renders directly on Git
 | [`docs/guides/`](docs/guides/index.md) | Per-stage implementation walkthroughs (motion correction → evaluation) |
 | [`docs/tuning/`](docs/tuning/index.md) | Automated parameter-tuning workflow + the [tuning guide](docs/tuning/guide.md) |
 
-The `demo_notebooks/01_load_and_motion_correct.ipynb` and `demo_notebooks/02_extract_components.ipynb` walk through the full pipeline end-to-end. Earlier walkthroughs are preserved in `demo_notebooks/old_demos/`.
+The `demo_notebooks/` notebooks (`01_load_and_motion_correct`, `02_extract_components`, `03_advanced_features`) walk through the full pipeline end-to-end on the reproducible simulated movies. Earlier walkthroughs are preserved in `demo_notebooks/old_demos/`.
 
 ---
 
