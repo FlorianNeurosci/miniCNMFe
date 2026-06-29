@@ -76,7 +76,7 @@ class CNMFeParams:
     ar_order: int = 1                          # AR model order (1 or 2)
     global_ar: bool = True                     # True = one g from pooled C_raw; False = per-neuron g
     n_iter_temporal: int = 2                   # BCD iterations per temporal update
-    skip_first_deconv: bool = True             # Skip OASIS on the first temporal pass (speed; see todo/speedup)
+    skip_first_deconv: bool = True             # Skip OASIS on the first temporal pass (speed)
     fudge_factor: float = 0.96                 # Yule-Walker shrinkage (legacy path; bypassed when prior is set)
 
     # Bayesian-prior on g (preferred over fudge_factor when known)

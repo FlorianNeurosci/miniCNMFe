@@ -51,18 +51,21 @@ AVI / zarr movie  (T × H × W)
 Requires Python ≥ 3.10.
 
 ```bash
-git clone https://github.com/yourname/minicnmfe.git
-cd minicnmfe
+git clone https://github.com/FlorianNeurosci/simpler_cnmfe.git
+cd simpler_cnmfe
 pip install -e .
 ```
 
-**Optional — faster AR deconvolution:**
+**AR deconvolution (`oasis-deconv`)** ships as a core dependency, so a plain
+`pip install -e .` already gets the fast compiled OASIS path. The `[oasis]` extra
+is kept only for back-compat:
 
 ```bash
-pip install -e ".[oasis]"
+pip install -e ".[oasis]"   # equivalent — oasis-deconv is already a core dep
 ```
 
-Without it the package falls back to a pure-Python PAVA implementation for AR(1).
+If `oasis-deconv` is unavailable, the package falls back to a pure-Python PAVA
+implementation for AR(1).
 
 **Optional — GPU acceleration (CuPy):**
 
@@ -194,7 +197,7 @@ pip install -e ".[test]"
 pytest tests/ -v
 ```
 
-A comprehensive pytest suite (127 tests at the time of writing) covers every module plus end-to-end pipeline, motion correction streaming, multiprocessing correctness, and auto-evaluation. All tests use synthetic ground-truth movies generated in `tests/conftest.py` and `tests/miniscope_simulator.py`.
+A comprehensive pytest suite (300+ tests) covers every module plus end-to-end pipeline, motion correction streaming, multiprocessing correctness, and auto-evaluation. All tests use synthetic ground-truth movies generated in `tests/conftest.py` and `tests/miniscope_simulator.py`.
 
 ---
 
@@ -215,7 +218,7 @@ minicnmfe/
 ├── evaluate.py            # Auto-evaluation: ghost-component quality filter
 └── pipeline.py            # CNMFeParams dataclass + CNMFe.fit() orchestrator
 
-tests/                     # pytest suite (~282 tests) — synthetic ground-truth data
+tests/                     # pytest suite (300+ tests) — synthetic ground-truth data
 docs/                      # Documentation (getting-started, concepts, api, guides, tuning)
 demo_movies/               # Generated demo AVIs + zarr stores (created by scripts)
 demo_notebooks/            # Tutorial notebooks (see below)
@@ -324,7 +327,8 @@ All algorithms are reimplemented from scratch. The CaImAn repository is used as 
 | `imageio` / `imageio-ffmpeg` | AVI/MP4 reading and writing |
 | `matplotlib` | Plotting (tutorial notebooks) |
 | `tqdm` | Progress bars |
-| `oasis-deconv` *(`[oasis]` extra)* | Fast compiled OASIS AR deconvolution |
+| `oasis-deconv` | Fast compiled OASIS AR deconvolution (core dep; pure-Python PAVA fallback if unavailable) |
+| `numba` | GIL-free per-pixel coordinate descent in the spatial update |
 | `cupy` *(`[gpu]` extra)* | GPU acceleration |
 | `pytest`, `pytest-cov` *(`[test]` extra)* | Test runner |
 | `jupyter`, `ipywidgets` *(`[tutorial]` extra)* | Demo notebooks |

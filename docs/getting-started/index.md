@@ -70,7 +70,7 @@ model = CNMFe(params).fit(movie, output_dir="/tmp/cnmfe_out/")
 
 ### Run on a large zarr (RAM-bounded extraction)
 
-The extraction path is streaming-aware after the Phase 1 refactors (May 2026):
+The extraction path is streaming-aware:
 
 - `fit()` accepts a `zarr.Array` directly. The corrected movie is held once
   as a pixel-major `(H·W, T)` float32 array; downstream steps allocate
@@ -242,7 +242,7 @@ Behaviour observed on a real 37k-frame miniscope recording (not autotested):
   Over a long recording the mean projection is dominated by static
   background/vasculature; the transient neurons are dim in it, so good footprints
   look "off the bright spots." Overlay contours on a `correlation_pnr` `cn` image
-  instead (the `live_runs/cutout_*` notebooks do this).
+  instead.
 
 ---
 

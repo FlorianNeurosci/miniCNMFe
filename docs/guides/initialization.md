@@ -40,8 +40,7 @@ current `v_search`. For each candidate seed (highest score first):
      stays clean and the soma's PSF sidelobes don't re-seed ghosts.
 6. **Suppress** the neuron's own support: mark `ai > ai.max()/2` pixels in
    `ind_search` (CaImAn-style support mask). *(The `seed_suppress_factor` /
-   suppression-disk parameter is deprecated and ignored — see
-   `todo/doc_comment_code_mismatches.md`.)*
+   suppression-disk parameter is deprecated and ignored.)*
 7. **Refresh CORR/PNR locally** on the `2·gSiz` box against the cached
    `noise_pixel` (`_local_cn_pnr_box`) and update `v_search` there.
 

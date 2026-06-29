@@ -3,8 +3,7 @@
 The `tuning/` package + the `tune.py` front door pick good CNMF-E parameters for a
 recording you've never seen, and produce a report you can judge by eye. As with
 the [algorithm guides](../guides/index.md), every page here is written from the
-source; comment/code mismatches are recorded in
-`todo/doc_comment_code_mismatches.md`.
+source.
 
 The central honesty caveat (stated in `tuning/metrics.py`): on a real recording
 there is **no ground truth**, so the quality numbers are **proxies, not
@@ -23,7 +22,7 @@ It resolves the frame rate (flag → `metaData.json` → 20 Hz default) and the
 indicator decay τ (`--indicator` shortcut → `--decay-time-ms`), builds a
 `TunerConfig`, and calls `tuning.validate.tune_then_validate`. Batch mode
 (`--sessions list.txt`) delegates to `batch_tune` (one BLAS-capped background
-process). The `/tune-session` skill wraps the same entry point.
+process).
 
 ## The workflow (`tuning.tuner.run_tuning`)
 
@@ -66,7 +65,7 @@ rescale at run time.
 ## The "good defaults" base
 
 `tuning.validate.good_defaults` is the long-real-recording starting point the
-tuner builds on (rationale in `live_runs/tuning_picast/LEARNINGS.md`):
+tuner builds on:
 `global_bg_rank=1` (absorb slow drift), `min_pixel=60` as a floor with the SNR
 check doing ghost rejection, the physical-decay `g` prior, pinned `init_stride=2`,
 `n_iter_main=2`. The tuner overwrites only the fields it has data-driven values

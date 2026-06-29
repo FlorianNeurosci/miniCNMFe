@@ -16,8 +16,7 @@ tags: [minicnmfe, tuning, workflow, parameters]
 package: it runs the heuristics + graded sweep, then (by default, for AVI input)
 full-recording validation, and writes both an HTML and a Markdown report.
 `validate_session.py` (validate one session) and `batch_tune.py` (a list of
-sessions in one background process) are internal stages it composes; a thin
-notebook viewer lives at `live_runs/tune.ipynb`.
+sessions in one background process) are internal stages it composes.
 
 ---
 
@@ -180,17 +179,15 @@ truth on a real recording.
 > is transparent and re-derivable from the table; re-rank with your own weights if
 > you prefer.
 
-These proxies are the seam the roadmap's validation harness
-([C1/C2](https://github.com/FlorianNeurosci/simpler_cnmfe/blob/master/todo/future_improvements_roadmap.md)) could later reuse for true cross-method /
-paired-ephys validation.
+These proxies are the seam a future validation harness could reuse for true
+cross-method / paired-ephys validation.
 
 ---
 
 ## Gotcha checklist
 
-**This is the single source of truth for interpreting a tuning run** (the
-`/tune-session` skill and per-session `LEARNINGS.md` files point here rather than
-re-stating it). Apply every item when reading a `comparison.md` / `report.html`:
+**This is the single source of truth for interpreting a tuning run.** Apply every
+item when reading a `comparison.md` / `report.html`:
 
 - **Long recording → `global_bg_rank=1`.** On a long movie slow drift /
   photobleaching makes traces collinear and `update_spatial` smears footprints
@@ -272,7 +269,7 @@ re-validate an existing recommendation or to add threshold sets.
 > [!CAVEAT]
 > See the [Gotcha checklist](#gotcha-checklist) above — in particular the drift-inflated
 > `decay_time_ms` and the full-vs-cutout recall caveats — when reading the
-> comparison. `live_runs/tuning_picast/LEARNINGS.md` is the worked example.
+> comparison.
 
 ## Batch — many sessions in one background process
 
@@ -286,28 +283,12 @@ python tune.py --sessions sessions.txt -o runs/batch \
 This delegates to `batch_tune.run_batch`, which runs **one `tune.py --validate`
 subprocess per session** under bounded concurrency (`--jobs`), each pinned to
 `--cores` and BLAS-capped so `jobs·cores` threads don't oversubscribe (keep
-`jobs·cores ≤ nproc−2`; see CLAUDE.md *Running many sessions concurrently*). Each
+`jobs·cores ≤ nproc−2`). Each
 session is tuned **independently** (its own measured `sigma`/`ssub`/thresholds —
 assume different animals/scopes). It writes per-session folders + a
 `batch_summary.md`. `tuning.validate.resolve_session_paths` parses the list
 (multiple args or a `.txt`; dedups, skips missing). `batch_tune.py` is the same
 thing as a standalone CLI.
-
-## The `/tune-session` skill
-
-`/tune-session <session-path>` packages the whole judgement workflow for the AI:
-read the session metadata → run `tune.py` → interpret against the
-[Gotcha checklist](#gotcha-checklist) → write a per-session `LEARNINGS.md` and a verdict. Flags:
-`--quick` (tuner only, no full run), `--no-lowthr`, `--figs`/`--no-figs`,
-`--indicator <name>`. Multiple paths / a `.txt` run via the batch process above
-(not sub-agents). Defined in `.claude/skills/tune-session/SKILL.md`.
-
-## Interactive use
-
-`live_runs/tune.ipynb` is a thin viewer over the same `tuning.*` functions: an
-automated section (`run_tuning`) plus a stage-by-stage section that displays each
-`report.fig_*` inline so you can tweak inputs and re-judge. No tuning logic lives
-in the notebook.
 
 ## Relation to other docs
 
