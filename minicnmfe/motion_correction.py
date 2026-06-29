@@ -460,6 +460,103 @@ def _build_template_streaming(
     return template
 
 
+def _read_sample_frames(source, idx, batch_size):
+    """Read the frames at sorted indices ``idx`` into an in-RAM (n, H, W) float32 array.
+
+    Reads ``source`` (zarr or numpy) in contiguous batches so each chunk is
+    touched at most once — the same access pattern as ``_build_template_streaming``.
+    """
+    T, H, W = source.shape[0], source.shape[1], source.shape[2]
+    idx_set = {int(t) for t in idx}
+    out = np.empty((len(idx_set), H, W), dtype=np.float32)
+    fill = 0
+    for start in range(0, T, batch_size):
+        end = min(start + batch_size, T)
+        in_batch = [t for t in range(start, end) if t in idx_set]
+        if not in_batch:
+            continue
+        batch = np.asarray(source[start:end], dtype=np.float32)
+        for t in in_batch:
+            out[fill] = batch[t - start]
+            fill += 1
+    return out[:fill]
+
+
+# The in-RAM sample loop always aligns to its own sharpness convergence with
+# this fixed tolerance — independent of the full-pass `converge_tol`, so the
+# sharpened template is deterministic regardless of how the outer passes stop.
+_SHARPEN_SAMPLE_TOL = 0.01
+
+
+def _build_sharpened_template(
+    source, gSig_filt, bin_window, batch_size, template_max_frames,
+    max_shift, upsample_factor, n_jobs, sharpen_max_iters, verbose,
+):
+    """Build a sharp template by aligning only the strided *sample* in RAM.
+
+    The multi-pass MC loop's sole job is to sharpen the template (each full pass
+    realigns frames so the next median is sharper). That sharpening only needs
+    the template *sample*, not the whole movie — so we run the in-memory MC loop
+    on the ~``template_max_frames``-frame sample (cheap, no streaming IO, fixed
+    size regardless of T) and take the median of the aligned sample. A single
+    full-movie pass with this template then matches a multi-pass run at roughly
+    one-pass cost — the dominant win on long recordings.
+
+    Returns an ``(H, W)`` template on the same footing as
+    ``_build_template_streaming`` (built from the aligned sample the same way).
+    """
+    T = source.shape[0]
+    idx = _sample_frame_indices(T, template_max_frames)
+    if verbose:
+        print(
+            f"Sharpening template on a {len(idx)}-frame in-RAM sample "
+            f"(<= {sharpen_max_iters} alignment rounds)..."
+        )
+    sample = _read_sample_frames(source, idx, batch_size)
+    # Align the sample to convergence; sharpen_template=False prevents recursion.
+    corrected, _ = _motion_correction_in_memory(
+        sample, max_shift, gSig_filt, upsample_factor,
+        niter_rig=max(1, sharpen_max_iters), bin_window=bin_window, template=None,
+        batch_size=batch_size, n_jobs=n_jobs, template_max_frames=template_max_frames,
+        verbose=False, in_place=True, converge_tol=_SHARPEN_SAMPLE_TOL,
+        sharpen_template=False,
+    )
+    return _build_template_streaming(
+        corrected, gSig_filt, bin_window, batch_size, template_max_frames, verbose=False,
+    )
+
+
+def _template_sharpness(template, gSig_filt):
+    """GT-free alignment/sharpness proxy: variance of the high-pass template.
+
+    As inter-frame alignment improves across iterations, the (bin-median)
+    template retains more high-frequency structure instead of blurring it out,
+    so this variance rises and then plateaus once the registration has
+    converged. Used by the ``converge_tol`` early-stop. For ``gSig_filt=None``
+    (2p) it falls back to the raw template variance, which still tracks
+    alignment (a sharper template preserves more contrast), just less cleanly.
+    """
+    t = (
+        high_pass_filter_space(template, gSig_filt)
+        if gSig_filt is not None else template
+    )
+    return float(np.var(np.asarray(t, dtype=np.float32)))
+
+
+def _converged(prev_sharp, new_sharp, converge_tol, iteration, verbose):
+    """True when the per-pass relative sharpness gain drops below converge_tol.
+
+    Returns (converged, new_sharp_for_next_compare). Prints a one-line trace.
+    """
+    rel = (new_sharp - prev_sharp) / max(abs(prev_sharp), 1e-12)
+    if verbose:
+        print(
+            f"  template sharpness {new_sharp:.4g} "
+            f"(rel. gain {rel:+.3%} vs previous pass)"
+        )
+    return rel < converge_tol, new_sharp
+
+
 def _create_output_zarr(path, shape, chunks, dtype, compression):
     """Create an empty output zarr store via the project's _open_array."""
     from minicnmfe.io import _open_array
@@ -523,6 +620,9 @@ def _motion_correction_streaming(
     output_dtype,
     compression,
     verbose,
+    converge_tol=None,
+    sharpen_template=True,
+    sharpen_max_iters=10,
 ):
     output_path = Path(output_path)
     T, H, W = src.shape[0], src.shape[1], src.shape[2]
@@ -535,11 +635,17 @@ def _motion_correction_streaming(
     chunks_out = (chunk_t, H, W)
 
     if template is None:
-        if verbose:
-            print("Building template from strided sample...")
-        template = _build_template_streaming(
-            src, gSig_filt, bin_window, batch_size, template_max_frames, verbose=verbose,
-        )
+        if sharpen_template:
+            template = _build_sharpened_template(
+                src, gSig_filt, bin_window, batch_size, template_max_frames,
+                max_shift, upsample_factor, n_jobs, sharpen_max_iters, verbose,
+            )
+        else:
+            if verbose:
+                print("Building template from strided sample...")
+            template = _build_template_streaming(
+                src, gSig_filt, bin_window, batch_size, template_max_frames, verbose=verbose,
+            )
 
     shifts_total = np.zeros((T, 2), dtype=np.float32)
 
@@ -571,6 +677,12 @@ def _motion_correction_streaming(
 
     current_src = src
     final_scratch = None
+    # Sharpness of the template feeding the first pass; the early-stop compares
+    # each rebuilt template against the previous one (converge_tol only).
+    prev_sharp = (
+        _template_sharpness(template, gSig_filt)
+        if converge_tol is not None else None
+    )
     for iteration in range(niter_rig):
         dst_path = scratch_a if (iteration % 2 == 0) else scratch_b
         if dst_path.exists():
@@ -590,6 +702,8 @@ def _motion_correction_streaming(
             desc=f"MC pass {iteration + 1}/{niter_rig}",
         )
         shifts_total += shifts_iter
+        current_src = dst
+        final_scratch = dst_path
 
         if iteration < niter_rig - 1:
             if verbose:
@@ -598,8 +712,18 @@ def _motion_correction_streaming(
                 dst, gSig_filt, bin_window, batch_size, template_max_frames,
                 verbose=verbose,
             )
-        current_src = dst
-        final_scratch = dst_path
+            if converge_tol is not None:
+                stop, prev_sharp = _converged(
+                    prev_sharp, _template_sharpness(template, gSig_filt),
+                    converge_tol, iteration, verbose,
+                )
+                if stop:
+                    if verbose:
+                        print(
+                            f"  converged after {iteration + 1} pass(es) "
+                            f"(< converge_tol={converge_tol:g}); stopping early"
+                        )
+                    break
 
     # Move the last scratch to output_path and clean up the other.
     other = scratch_a if final_scratch == scratch_b else scratch_b
@@ -649,6 +773,9 @@ def _motion_correction_in_memory(
     template_max_frames,
     verbose,
     in_place=False,
+    converge_tol=None,
+    sharpen_template=True,
+    sharpen_max_iters=10,
 ):
     """In-memory rigid MC with bounded peak RAM.
 
@@ -667,15 +794,25 @@ def _motion_correction_in_memory(
     T, H, W = movie.shape
 
     if template is None:
-        # Sample-based template (same builder the streaming path uses, so the two
-        # paths agree). Allocates ~template_max_frames*H*W*4, not T*H*W*4.
-        template = _build_template_streaming(
-            movie, gSig_filt, bin_window, batch_size, template_max_frames,
-            verbose=verbose,
-        )
+        if sharpen_template:
+            template = _build_sharpened_template(
+                movie, gSig_filt, bin_window, batch_size, template_max_frames,
+                max_shift, upsample_factor, n_jobs, sharpen_max_iters, verbose,
+            )
+        else:
+            # Sample-based template (same builder the streaming path uses, so the
+            # two paths agree). Allocates ~template_max_frames*H*W*4, not T*H*W*4.
+            template = _build_template_streaming(
+                movie, gSig_filt, bin_window, batch_size, template_max_frames,
+                verbose=verbose,
+            )
 
     corrected = movie if in_place else np.empty_like(movie)
     shifts_total = np.zeros((T, 2), dtype=np.float32)
+    prev_sharp = (
+        _template_sharpness(template, gSig_filt)
+        if converge_tol is not None else None
+    )
 
     for iteration in range(niter_rig):
         if verbose:
@@ -720,6 +857,18 @@ def _motion_correction_in_memory(
                 corrected, gSig_filt, bin_window, batch_size, template_max_frames,
                 verbose=verbose,
             )
+            if converge_tol is not None:
+                stop, prev_sharp = _converged(
+                    prev_sharp, _template_sharpness(template, gSig_filt),
+                    converge_tol, iteration, verbose,
+                )
+                if stop:
+                    if verbose:
+                        print(
+                            f"  converged after {iteration + 1} pass(es) "
+                            f"(< converge_tol={converge_tol:g}); stopping early"
+                        )
+                    break
 
     return corrected, shifts_total
 
@@ -745,6 +894,9 @@ def motion_correction_rigid(
     compression: bool = True,
     verbose: bool = True,
     in_place: bool = False,
+    converge_tol: "float | None" = None,
+    sharpen_template: bool = True,
+    sharpen_max_iters: int = 10,
 ):
     """CaImAn-compatible rigid motion correction.
 
@@ -767,7 +919,29 @@ def motion_correction_rigid(
             correlation. Required for 1-photon data; set to None for 2p.
         upsample_factor: Subpixel refinement factor (10 = 0.1 px precision).
         niter_rig: Number of rigid passes. Each pass re-estimates the template
-            from the previously corrected frames.
+            from the previously corrected frames. When ``converge_tol`` is set,
+            this is the *maximum* number of passes (the upper bound).
+        converge_tol: If set (e.g. ``0.01``), stop iterating early once a pass
+            improves the template's high-pass sharpness by less than this
+            relative amount — a ground-truth-free convergence check, so you can
+            set a generous ``niter_rig`` cap and let MC stop itself instead of
+            guessing the right pass count. ``None`` (default) runs exactly
+            ``niter_rig`` passes (unchanged behaviour). Ignored when
+            ``niter_rig <= 1``.
+        sharpen_template: When True (default) and no ``template`` is supplied,
+            build the registration template by aligning only the strided
+            *sample* of frames in RAM (iteratively, to convergence) instead of
+            taking a smeared median over the raw, drifted sample. A smeared
+            template under-tracks large drift, so this recovers full amplitude
+            even at ``niter_rig=1``. The sample is fixed-size (``<=
+            template_max_frames``) and aligned in RAM with no streaming IO, so
+            on long recordings a single full-movie pass now matches a multi-pass
+            run at ~one-pass cost. Set False for the legacy smeared-median
+            template (exact CaImAn-equivalent behaviour). No effect when an
+            explicit ``template`` is given.
+        sharpen_max_iters: Cap on the in-RAM sample alignment rounds when
+            ``sharpen_template`` is on (the sample loop stops early on its own
+            sharpness convergence; default 10).
         bin_window: Frame-binning window for the median template (CaImAn default
             10).
         template: Optional precomputed (H, W) template. When None, built from a
@@ -807,13 +981,15 @@ def motion_correction_rigid(
             movie, output_path, max_shift, gSig_filt, upsample_factor,
             niter_rig, bin_window, template, batch_size, n_jobs,
             template_max_frames, output_chunk_t, output_dtype, compression,
-            verbose,
+            verbose, converge_tol=converge_tol,
+            sharpen_template=sharpen_template, sharpen_max_iters=sharpen_max_iters,
         )
 
     return _motion_correction_in_memory(
         movie, max_shift, gSig_filt, upsample_factor, niter_rig, bin_window,
         template, batch_size, n_jobs, template_max_frames, verbose,
-        in_place=in_place,
+        in_place=in_place, converge_tol=converge_tol,
+        sharpen_template=sharpen_template, sharpen_max_iters=sharpen_max_iters,
     )
 
 

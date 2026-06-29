@@ -64,6 +64,7 @@ def mc_result():
         gSig_filt=7,
         upsample_factor=10,
         niter_rig=1,    # matches CaImAn's default
+        sharpen_template=False,  # validate the CaImAn-equivalent plain template
     )
     shifts_caiman = np.load(CAIMAN_SHIFTS_PATH)
     return shifts_ours, shifts_caiman
