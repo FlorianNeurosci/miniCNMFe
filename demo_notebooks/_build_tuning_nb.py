@@ -33,6 +33,17 @@ co(r"""import json, tempfile, contextlib, io, dataclasses
 from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
+from IPython.display import display, Image   # run_tuning below switches matplotlib
+                                             # to the non-interactive Agg backend, so
+                                             # we render figures via savefig + Image
+                                             # (below), not plt.show().
+
+def show(fig):
+    # Backend-independent figure display (Agg-safe, unlike plt.show).
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+    plt.close(fig)
+    display(Image(data=buf.getvalue()))
 
 from minicnmfe.io import open_zarr
 from minicnmfe.pipeline import CNMFe, CNMFeParams
@@ -158,7 +169,7 @@ for ax, (g_, r, cy) in zip(axes.flat, pairs):
     ax.set_title(f"real #{g_}  r={r:.2f}", fontsize=9); ax.set_yticks([])
 axes.flat[0].legend(fontsize=7)
 fig.suptitle(f"Tuner seed params + init_stride=1: {len(pairs)}/{Kt} real vs recovered transients", y=1.01)
-plt.tight_layout(); plt.show()""")
+plt.tight_layout(); show(fig)""")
 
 md(r"""## 4. Verdict — is the tuning pipeline valid?
 
