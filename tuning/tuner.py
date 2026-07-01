@@ -290,26 +290,22 @@ def run_tuning(cfg: TunerConfig) -> dict:
         sources["merge_thr_corr"] = "data"
 
         snr_thr, ev = H.suggest_snr_thr(stage4_model)
-        stages["snr"] = ev
-        recommended["auto_eval_snr_amp_thr"] = snr_thr
-        sources["auto_eval_snr_amp_thr"] = "data"
-        rationale["auto_eval_snr_amp_thr"] = "largest gap in the low-SNR (ghost) region"
+        stages["snr"] = ev                                  # kept for the report (informational)
+        recommended["auto_eval_snr_amp_thr"] = 0.0          # acceptance gate OFF (report-only)
+        sources["auto_eval_snr_amp_thr"] = "default (gate off)"
+        rationale["auto_eval_snr_amp_thr"] = (
+            f"gate off; SNR-gap suggestion was {snr_thr:.1f} but ghosts are controlled "
+            "upstream by min_corr/min_pnr, not a post-hoc cut")
 
     # -- Fold swept/stage values into native-unit recommended params --
-    # Prefer min_pixel from the winning candidate's REALIZED footprint area (25th
-    # pct), which reflects the actual (nrg-thresholded) BCD footprints, over the
-    # greedy-init heuristic (suggest_min_pixel) — greedy-init footprints don't see
-    # the thresholding method, so with nrg they over-estimate min_pixel and the
-    # auto-eval would reject the (now smaller) footprints. Falls back to the
-    # heuristic when the sweep didn't run or the winner has no footprints.
-    min_pixel_source = "heuristic"
-    if sweep_result and sweep_result.get("rows"):
-        _p25 = sweep_result["rows"][0].get("npix_p25")
-        if _p25 and _p25 > 0:
-            min_pixel_ds = _p25
-            min_pixel_source = "data"
+    # The acceptance gate is OFF (report-only), so `min_pixel` is now ONLY the
+    # greedy-init floor — keep it small so it can never reject real cells. (It
+    # used to be the winning candidate's 25th-pct footprint area, which by
+    # construction rejected the smallest quartile of cells once it also fed the
+    # auto-eval gate — the cause of the lost-cell problem.)
+    min_pixel_source = "default (init floor; gate off)"
     recommended["sigma"] = float(best_swept["sigma"]) * ssub
-    recommended["min_pixel"] = max(1, int(min_pixel_ds) * ssub * ssub)
+    recommended["min_pixel"] = int(base.min_pixel)
     recommended["min_corr"] = float(best_swept["min_corr"])
     recommended["min_pnr"] = float(best_swept["min_pnr"])
     recommended["merge_thr_corr"] = float(best_swept["merge_thr_corr"])
@@ -328,9 +324,7 @@ def run_tuning(cfg: TunerConfig) -> dict:
     else:
         rationale["min_corr"] = rationale["min_pnr"] = (
             "image-threshold morphology (max # cell-like blobs)")
-    rationale["min_pixel"] = (
-        "25th-pct realized footprint area (×ssub² → native)" if min_pixel_source == "data"
-        else "25th-pct greedy-init footprint area (×ssub² → native)")
+    rationale["min_pixel"] = "small greedy-init floor (acceptance gate off; not a quality cut)"
 
     # One merged CNMFeParams: the long-recording base with the tuner's data-driven
     # native-unit fields layered on. This is the single source of truth — it is

@@ -1,18 +1,27 @@
 # Auto-evaluation
 
 Source: `minicnmfe/evaluate.py` (`auto_evaluate_components`, `spatial_r_values`)
-and `pipeline.py:CNMFe.evaluate`. The final extraction step tags each component
-with a quality verdict.
+and `pipeline.py:CNMFe.evaluate`. The final extraction step records per-component
+quality metrics.
 
-**Nothing is ever dropped.** Evaluation writes a boolean `model.accepted_mask`
-`(K,)` and a per-component `model.eval_info`; you filter downstream yourself
+**Report-only by default; the gate is opt-in.** `evaluate()` always writes the
+per-component `model.eval_info` (`snr_amp`, `pixel_count`) for inspection, but the
+acceptance *gate* is **off by default** (`auto_eval_snr_amp_thr = 0.0`), so
+`model.accepted_mask` is all-True — every extracted component is accepted. The
+rationale: with seed thresholds (`min_corr`/`min_pnr`) set to the recording's noise
+floor you don't get ghosts, so a default gate mostly produces false negatives
+(rejecting real dim cells). Control ghosts upstream; raise `auto_eval_snr_amp_thr`
+(~`3`) and/or `min_pixel` only to **opt in** to filtering on a noisy recording.
+
+**Nothing is ever dropped.** Even with the gate on, evaluation only writes the
+boolean `model.accepted_mask` `(K,)`; you filter downstream yourself
 (`model.A[:, model.accepted_mask]`, and likewise for `C`/`S`/`YrA`/`C_raw`). This
 keeps the step non-destructive and re-runnable on a loaded model to retune
 thresholds without re-extracting.
 
-## The two checks
+## The two checks (when opted in)
 
-A component is accepted only if it passes **both**
+With the gate enabled, a component is accepted only if it passes **both**
 (`auto_evaluate_components`):
 
 1. **Pixel-count floor** — footprint has at least `min_pixel` non-zero pixels.
@@ -25,7 +34,7 @@ A component is accepted only if it passes **both**
 
    i.e. the mean squared footprint amplitude over its support, divided by the
    mean pixel-noise variance over the same support, thresholded at
-   `auto_eval_snr_amp_thr` (default 3.0). A real `sigma=3` Gaussian footprint
+   `auto_eval_snr_amp_thr` (default `0.0` = off; use ~`3.0` when opting in). A real `sigma=3` Gaussian footprint
    scores ~10–70; a **ghost** component (born from a background-noise seed under
    loose init thresholds) sits at or below ~2 *even when it has many pixels* — so
    a pure pixel-count filter cannot separate them, but this SNR check can. Set the

@@ -38,7 +38,7 @@ AVI / zarr movie  (T × H × W)
                merge_components()    — merge spatially overlapping + correlated pairs
                compute_W()           — refresh b0 (W cached)
         │
-        ▼  auto_evaluate_components() — drop ghost components (pixel-count + amplitude SNR)
+        ▼  auto_evaluate_components() — record per-component quality (gate OFF by default; opt-in ghost tagging)
         ▼  update_temporal()        — final deconvolution pass
         │
         A, C, S
@@ -156,8 +156,8 @@ GPU speedup is most significant for large recordings (≥ 256 × 256, T ≥ 1000
 | `sigma` | `3.0` | Neuron Gaussian radius in pixels — **set this first** |
 | `min_corr` | `0.8` | Minimum local correlation to accept a seed (lower → more neurons) |
 | `min_pnr` | `10.0` | Minimum peak-to-noise ratio for a seed (lower → more neurons) |
-| `min_pixel` | `3` | Hard floor on footprint pixel count (auto-eval check) |
-| `auto_eval_snr_amp_thr` | `3.0` | Mean(a²)/mean(sn²) threshold; drops ghost components |
+| `min_pixel` | `3` | Greedy-init footprint pixel floor (also the gate's pixel check when opted in) |
+| `auto_eval_snr_amp_thr` | `0.0` | Acceptance-gate SNR threshold; **`0` = gate off** (report-only). Raise (~`3`) to opt in to ghost tagging |
 | `n_iter_main` | `2` | Full spatial + temporal + merge cycles |
 | `ar_order` | `1` | AR model order for calcium dynamics (1 or 2) |
 | `ring_size_factor` | `1.5` | Ring radius = factor × (2σ + 1) |
@@ -215,7 +215,7 @@ minicnmfe/
 ├── spatial.py             # Spatial footprint update (elastic-net coordinate descent per pixel)
 ├── temporal.py            # Temporal update + OASIS AR deconvolution
 ├── merging.py             # Component merging (overlap + correlation)
-├── evaluate.py            # Auto-evaluation: ghost-component quality filter
+├── evaluate.py            # Auto-evaluation: per-component quality metrics (opt-in gate)
 └── pipeline.py            # CNMFeParams dataclass + CNMFe.fit() orchestrator
 
 tests/                     # pytest suite (300+ tests) — synthetic ground-truth data

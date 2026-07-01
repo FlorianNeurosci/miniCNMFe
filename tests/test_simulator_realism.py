@@ -1,11 +1,13 @@
 """Realism regression tests for the miniscope simulator.
 
-These guard the calibration that brings ``make_miniscope_movie`` into the
-detectability regime of a real clean 1p recording (demo_movies/demo_session):
-median local-correlation CORR ≈ 0.92 and median PNR ≈ 10 (vs the old
-noise-dominated 0.53 / 3.5), using the same metric the pipeline keys on
-(``minicnmfe.preprocess.correlation_pnr``). They also pin the F0+ΔF baseline
-invariants and the ``realism=False`` escape hatch.
+These guard the calibration that puts ``make_miniscope_movie`` into the
+*detectability* regime measured on real 1p recordings (``tests/data/real_0.zarr``
+plus two PICAST sessions; see ``simulator_calibration.py``): the CORR/PNR seed
+maps, intensity range, and photobleach all fall inside the real envelope —
+CORR median ~0.5–0.75, PNR median ~3–4 with a detectable tail to ~10, no 8-bit
+clipping, ~flat (no photobleach). The OLD sim sat far outside this at CORR ≈ 0.95
+/ PNR ≈ 18 with 32% bleaching — a clean, unrealistically easy regime. They also
+pin the F0+ΔF baseline invariants and the ``realism=False`` escape hatch.
 """
 
 from __future__ import annotations
@@ -17,16 +19,31 @@ from minicnmfe.preprocess import correlation_pnr
 
 
 def test_realism_corr_pnr_in_real_like_band():
-    """Default (realism, difficulty=0) sim lands in the real clean-recording
-    CORR/PNR band, not the old noise-dominated regime."""
-    d = make_miniscope_movie(n_neurons=20, dims=(128, 128), T=1000, fps=20.0, seed=0)
-    cn, pnr = correlation_pnr(d["movie"], sigma=5.0, center_psf=True)
+    """Default (realism, difficulty=0) sim lands in the detectability band
+    measured on real 1p data, not the old clean/oversaturated regime.
+
+    Real envelope (real_0 + two PICAST sessions): CORR median 0.47–0.76, PNR
+    median 3.2–4.3 with p99 6.7–19.2, intensity mean ~52–75 with no 8-bit
+    clipping, photobleach ~0. The old sim was CORR 0.95 / PNR 18 / 32% bleach.
+    """
+    d = make_miniscope_movie(n_neurons=15, dims=(128, 128), T=1000, fps=20.0, seed=0)
+    mov = d["movie"]
+    cn, pnr = correlation_pnr(mov, sigma=5.0, center_psf=True)
     corr_p50 = float(np.nanpercentile(cn, 50))
     pnr_p50 = float(np.nanpercentile(pnr, 50))
-    # Real target: CORR p50 ≈ 0.92, PNR p50 ≈ 10.2 (old sim was 0.53 / 3.5).
-    assert corr_p50 > 0.85, f"CORR p50 {corr_p50:.3f} too low (noise-dominated regime?)"
-    assert corr_p50 < 0.999, f"CORR p50 {corr_p50:.3f} pathologically uniform"
-    assert pnr_p50 > 7.0, f"PNR p50 {pnr_p50:.2f} too low vs real ~10"
+    pnr_p99 = float(np.nanpercentile(pnr, 99))
+    # CORR seed map must discriminate (not saturated ~1) yet stay in the real band.
+    assert 0.45 < corr_p50 < 0.80, f"CORR p50 {corr_p50:.3f} outside real band [0.45, 0.80]"
+    # Background noise floor realistic, with a tail that keeps cells detectable.
+    assert 2.5 < pnr_p50 < 5.5, f"PNR p50 {pnr_p50:.2f} outside real band [2.5, 5.5]"
+    assert 6.0 < pnr_p99 < 22.0, f"PNR p99 {pnr_p99:.2f} outside real band (cells un/over-detectable)"
+    # No 8-bit saturation; intensity in the real range.
+    assert (mov >= 255).mean() < 1e-3, "8-bit clipping at 255 (unrealistic)"
+    assert 40.0 < float(mov.mean()) < 90.0, f"intensity mean {mov.mean():.0f} outside real range"
+    # Real recordings are ~flat (no strong photobleach).
+    fm = mov.reshape(mov.shape[0], -1).mean(1)
+    drop = float((fm[:100].mean() - fm[-100:].mean()) / max(fm[:100].mean(), 1e-6))
+    assert abs(drop) < 0.12, f"photobleach {drop:+.2f} too strong vs ~0 in real data"
 
 
 def test_realism_baseline_positive_and_uint8_like():

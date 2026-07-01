@@ -93,8 +93,12 @@ def test_good_defaults_overrides():
     assert p.global_bg_rank == 1
     assert p.decay_time_ms == 180.0
     assert p.g_prior_weight == 0.6
-    assert p.init_stride == 2
-    assert p.auto_eval_snr_amp_thr == 20.0
+    # PNR-safe init: full-T greedy (no peak loss); speed from the CORR-only stride.
+    assert p.init_stride == 1
+    assert p.init_corrpnr_stride == 3
+    # Acceptance gate is OFF by default (report-only); ghosts handled upstream.
+    assert p.auto_eval_snr_amp_thr == 0.0
+    assert p.min_pixel == 10
 
 
 def test_validate_two_thresholds(session_folder, tmp_path):

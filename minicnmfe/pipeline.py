@@ -526,18 +526,21 @@ class CNMFeParams:
     #   decompression, IO-bound only — costs ~H*W*T*4 bytes of disk).
     yflat_compression: bool = True
 
-    # --- Auto evaluation (post-BCD quality tagging — non-destructive) ---
-    # [NON-STANDARD] `min_pixel` above is reused as a hard floor on footprint extent.
-    # `auto_eval_snr_amp_thr` is the threshold on the mean-amplitude SNR
-    # mean(a^2) / mean(sn_pixel^2) — a scale-invariant check that catches
-    # ghost components whose footprint sits at the pixel-noise floor.
-    # Components below this score (or below `min_pixel` non-zero pixels) are
-    # flagged in ``model.accepted_mask`` but are NOT removed from the model;
-    # filter post-hoc with ``model.A[:, model.accepted_mask]`` (and similarly
-    # for C, S, YrA, C_raw). Per-component stats live in ``model.eval_info``.
-    # Set to 0 to mark every component as accepted on the SNR check.
-    # Standard CNMF-E has no comparable post-BCD quality filter.
-    auto_eval_snr_amp_thr: float = 3.0
+    # --- Auto evaluation (post-BCD quality tagging — report-only, OPT-IN gate) ---
+    # `evaluate()` ALWAYS computes per-component quality metrics into
+    # ``model.eval_info`` (``snr_amp`` = mean(a^2)/mean(sn_pixel^2), a
+    # scale-invariant SNR, and ``pixel_count``) for inspection. The acceptance
+    # *gate* — flagging components in ``model.accepted_mask`` — is **off by
+    # default** (`auto_eval_snr_amp_thr = 0.0` → every component accepted on the
+    # SNR check; the `min_pixel` floor is the init floor and real cells clear it).
+    # Rationale: with seed thresholds tuned to the noise floor you don't get
+    # ghosts, so a default gate mostly produces false negatives (rejects real
+    # dim cells). Ghost control belongs upstream in `min_corr`/`min_pnr`.
+    # To opt back IN (e.g. loose-seeding workflows with ghosts): raise
+    # `auto_eval_snr_amp_thr` (~3 separates real σ=3 cells from noise seeds)
+    # and/or `min_pixel`, then filter with ``model.A[:, model.accepted_mask]``.
+    # Nothing is ever removed from the model; the gate is purely a mask.
+    auto_eval_snr_amp_thr: float = 0.0
 
     # --- Cutout (crop the movie before extraction; NATIVE coordinates) ---
     # Applied ONCE at ingestion, before motion correction (see minicnmfe/cutout.py).
@@ -1104,13 +1107,14 @@ class CNMFe:
         )
 
     def evaluate(self) -> "CNMFe":
-        """Tag components with per-component quality results (non-destructive).
+        """Compute per-component quality metrics (non-destructive, report-only).
 
-        Combines a pixel-count floor with a scale-invariant mean-amplitude SNR
-        check (mean(a^2)/mean(sn^2)); see ``minicnmfe/evaluate.py``. The mask
-        catches ghost components born from background-noise seeds under loose
-        init thresholds — their footprints can be wide but sit at the
-        pixel-noise floor.
+        Always populates ``self.eval_info`` (per-component ``snr_amp`` =
+        mean(a^2)/mean(sn^2) and ``pixel_count``) for inspection. The acceptance
+        *gate* (``self.accepted_mask``) is **off by default**
+        (``auto_eval_snr_amp_thr=0.0`` → all accepted); raise that threshold
+        (and/or ``min_pixel``) to opt in to ghost filtering. See
+        ``minicnmfe/evaluate.py``.
 
         Reads only ``self.A``, ``self.sn`` and ``self.A_norm`` (the cached
         original footprint norms, used to recover the un-normalized SNR after
@@ -1498,7 +1502,12 @@ class CNMFe:
         # the temporal traces are then re-projected at full T below.
         init_stride = p.init_stride
         if init_stride is None:
-            init_stride = max(1, T // 5000)
+            # PNR-safe default: do NOT sub-sample the movie. init_stride shrinks
+            # the whole movie before init, which sub-samples the PNR peak (a
+            # max-over-time statistic) and silently drops cells. We keep full-T
+            # detection and take the long-movie speed-up from the CORR-only
+            # stride (init_corrpnr_stride) below instead, which never touches PNR.
+            init_stride = 1
 
         if init_stride > 1:
             # In deferred mode movie_arr is a zarr handle; `[::init_stride]`
@@ -1528,7 +1537,11 @@ class CNMFe:
         # CN sweep on very long movies.
         corrpnr_stride = p.init_corrpnr_stride
         if corrpnr_stride is None:
-            corrpnr_stride = 1
+            # Auto speed-up for long movies: stride ONLY the CORR sweep (PNR keeps
+            # full T → no cells lost), leaving ~2000 frames for the correlation —
+            # plenty for a stable CN, and the per-seed CN refresh is the init hot
+            # spot. Short movies (T <= 2000) get stride 1 = bit-for-bit unchanged.
+            corrpnr_stride = max(1, T_init // 2000)
 
         if init_stride > 1 or corrpnr_stride > 1:
             print(

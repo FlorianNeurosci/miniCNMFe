@@ -1060,54 +1060,55 @@ class TestCNMFePipeline:
             assert min(rs_proj) > 0.80, f"Min r(C+YrA) = {min(rs_proj):.3f}"
 
     def test_auto_evaluation_rejects_ghosts(self, synth):
-        """Auto-evaluation mask must flag ghost components.
+        """Acceptance gate: OFF by default (report-only), still rejects ghosts opt-in.
 
-        Regression: with min_corr=0.7, min_pnr=3.0 on the 6-neuron synthetic
-        fixture the pipeline produces ~26 raw components — 6 real neurons
-        plus ~20 ghost components at scattered background-noise locations
-        7-26 px from any true neuron. Ghosts have tiny footprints (~11-29 px)
-        compared to real sigma=3 Gaussians (~130 px after threshold_footprint
-        at max_thr=0.1).
+        With min_corr=0.7, min_pnr=3.0 on the 6-neuron synthetic fixture the
+        pipeline produces ~26 raw components — 6 real neurons plus ~20 ghost
+        components at scattered background-noise locations. Ghosts have tiny
+        footprints / low mean-amplitude SNR vs the real sigma=3 Gaussians.
 
-        Auto-eval (minicnmfe.evaluate.auto_evaluate_components, called from
-        CNMFe.fit after the BCD loop) flags such components on
-        ``model.accepted_mask`` so they can be filtered post-hoc. All
-        components remain on the model so the user can also inspect the
-        rejected ones.
+        Default (``auto_eval_snr_amp_thr=0.0``): the per-component metrics are
+        computed (``eval_info``) but the gate accepts everything. Opt in by
+        raising ``auto_eval_snr_amp_thr`` and re-running ``evaluate()``: the SNR
+        check then flags the ghosts while keeping every real neuron. No
+        components are ever removed from the model.
         """
+        import dataclasses
+
         params = CNMFeParams(
             sigma=3.0, min_corr=0.7, min_pnr=3.0,
             n_iter_main=2, n_iter_temporal=2,
         )
         model = CNMFe(params).fit(synth["movie"], do_motion_correction=False)
-
+        K = model.A.shape[1]
         K_true = synth["A_true"].shape[1]
 
+        # --- default: gate OFF -> all accepted, but metrics still computed ---
         assert model.accepted_mask is not None
-        assert model.accepted_mask.shape == (model.A.shape[1],)
+        assert model.accepted_mask.shape == (K,)
         assert model.accepted_mask.dtype == bool
+        assert int(model.accepted_mask.sum()) == K, (
+            "default acceptance gate should accept ALL components (report-only)"
+        )
         assert model.eval_info is not None
         for key in ("pixel_count", "snr_amp", "pixel_pass", "snr_pass"):
             assert key in model.eval_info
 
+        # --- opt in to the SNR gate -> ghosts flagged, real neurons kept ---
+        model.params = dataclasses.replace(model.params, auto_eval_snr_amp_thr=3.0)
+        model.evaluate()
         n_accepted = int(model.accepted_mask.sum())
-        # Pre-mask: ~26 raw components for K_true=6. Mask should retain
-        # roughly the real neurons (6-7) and flag the rest as rejected.
+        assert n_accepted < K, "opt-in SNR gate should reject some ghosts"
         assert n_accepted <= K_true + 2, (
-            f"Auto-eval mask did not catch ghosts: accepted {n_accepted} "
-            f"components for K_true={K_true} (raw K={model.A.shape[1]})."
+            f"opt-in gate did not catch ghosts: accepted {n_accepted} "
+            f"components for K_true={K_true} (raw K={K})."
         )
-
-        # Ghost rejection must not trade away real neurons. Match against
-        # the accepted subset of A only — well-matched real neurons should
-        # all be among the accepted.
         A_accepted = model.A[:, model.accepted_mask]
         matches = match_components(A_accepted, synth["A_true"])
         well_matched = sum(1 for m in matches if m[2] > 0.7)
         assert well_matched == K_true, (
-            f"Lost real neurons: only {well_matched}/{K_true} matched with "
-            f"spatial r > 0.7 among accepted components. Per-neuron r: "
-            f"{[round(m[2], 3) for m in matches]}"
+            f"opt-in gate lost real neurons: only {well_matched}/{K_true} matched "
+            f"with spatial r > 0.7. Per-neuron r: {[round(m[2], 3) for m in matches]}"
         )
 
 class TestGlobalBgRank1:

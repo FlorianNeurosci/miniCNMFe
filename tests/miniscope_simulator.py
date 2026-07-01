@@ -159,17 +159,17 @@ def make_miniscope_movie(
     npil_strength: float = 1.8,           # MUCH lower than before — texture, not cloud
     npil_neuron_coupling: float = 0.04,   # very small contamination skirt
     # ---- background ----
-    bg_strength: float = 4.0,
+    bg_strength: float = 8.0,
     bg_n_components: int = 5,
-    bg_spatial_sigma_range: tuple[float, float] = (15.0, 35.0),
+    bg_spatial_sigma_range: tuple[float, float] = (25.0, 55.0),
     bg_temporal_sigma: float = 30.0,
     n_ghost_cells: int = 8,
     ghost_sigma_range: tuple[float, float] = (8.0, 15.0),
     # ---- baseline / scale (F0) ----
     realism_baseline: bool | None = None,
-    f0_base: float = 42.0,
+    f0_base: float = 80.0,
     # ---- GRIN aperture ----
-    aperture: bool | None = None,         # None => realism
+    aperture: bool | None = False,        # calibrated default off (real recordings are cropped inside the GRIN, no black corners); set True for a visible aperture
     aperture_radius_factor: float = 0.96,
     aperture_edge_px: float = 2.5,
     # ---- vasculature ----
@@ -183,7 +183,7 @@ def make_miniscope_movie(
     vasc_strength: float = 0.5,           # legacy path only
     # ---- imaging artefacts ----
     vignette_strength: float = 0.4,
-    photobleach_tau_factor: float | None = 3.0,
+    photobleach_tau_factor: float | None = None,   # calibrated default off: the real recordings checked show ~0 bleach (often pre-corrected); set e.g. 3.0 for a bleaching session
     # ---- noise / quantisation ----
     shot_noise: bool = True,
     photon_scale: float | None = None,    # None => realism-dependent
@@ -238,9 +238,12 @@ def make_miniscope_movie(
     if sigma_neuron_range is None:
         sigma_neuron_range = (4.0, 6.5) if realism else (2.5, 4.5)
     if photon_scale is None:
-        photon_scale = 25.0 if realism else 80.0
+        # Calibrated to real 1p data: low photon budget -> realistic noise so the
+        # CORR/PNR seed maps match real recordings (see simulator_calibration.py).
+        photon_scale = 3.0 if realism else 80.0
     if neuron_gain is None:
-        neuron_gain = 2.6 if realism else 1.0
+        # Calibrated: cells stand out above the (now realistic) noise floor.
+        neuron_gain = 7.0 if realism else 1.0
 
     # Difficulty knob (realism only): make neurons dimmer, neuropil stronger,
     # photons fewer (more noise), and add more ghost distractors.

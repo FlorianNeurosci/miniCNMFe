@@ -130,12 +130,13 @@ def good_defaults(*, frame_rate_hz: float, decay_time_ms: float = 180.0,
     return CNMFeParams(
         sigma=sigma, max_shift=tuple(max_shift), mc_gSig_filt=mc_gSig_filt,
         min_corr=min_corr, min_pnr=min_pnr,
-        min_pixel=60,                 # floor only; SNR is the ghost discriminator
+        min_pixel=10,                 # small greedy-init floor only (the acceptance gate is off)
         global_bg_rank=1,             # absorb slow drift on long recordings
-        auto_eval_snr_amp_thr=20.0,   # long-recording override of the CNMFeParams default (3.0); a harder ghost cut given typical SNR spreads on long sessions
+        auto_eval_snr_amp_thr=0.0,    # acceptance gate OFF (report-only); ghosts controlled upstream by min_corr/min_pnr, not a post-hoc SNR cut
         decay_time_ms=decay_time_ms,  # physical τ, NOT the drift-inflated estimate
         frame_rate_hz=frame_rate_hz, g_prior_weight=0.6,
-        init_stride=2,                # auto under-seeds long movies
+        init_stride=1,                # full-T greedy init (no PNR-peak loss)
+        init_corrpnr_stride=3,        # take init speed from the CORR-only stride (PNR-safe)
         n_iter_main=2, n_jobs=n_jobs,
     )
 

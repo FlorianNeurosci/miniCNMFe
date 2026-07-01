@@ -99,8 +99,8 @@ class CNMFeParams:
     n_iter_main: int = 2                       # Full spatial+temporal+merge cycles
     sample_frames: int = 1000                  # Frames sampled for noise/CORR-PNR summaries
 
-    # Auto-evaluation (non-destructive tagging)
-    auto_eval_snr_amp_thr: float = 3.0         # Mean-amplitude SNR threshold (0 = disable SNR check)
+    # Auto-evaluation (non-destructive; gate OFF by default, report-only)
+    auto_eval_snr_amp_thr: float = 0.0         # SNR gate; 0 = OFF (metrics still recorded). Raise (~3) to opt in to ghost tagging
 
     # Parallelism
     n_jobs: int = 1                            # Workers (-1 = all CPUs, 1 = serial)
@@ -1073,7 +1073,7 @@ Two checks must both pass:
 
 `sn_flat` is the same per-pixel noise std produced by `minicnmfe.preprocess.estimate_noise(...).ravel()` — the pipeline reuses its own `self.sn` for this call.
 
-Pipeline-level knob: `CNMFeParams.auto_eval_snr_amp_thr` (default `3.0`). Setting it to `0.0` disables the SNR check; `min_pixel` continues to apply.
+Pipeline-level knob: `CNMFeParams.auto_eval_snr_amp_thr` (**default `0.0` → gate OFF**). `evaluate()` still records `eval_info` (snr_amp, pixel_count) for inspection, but `accepted_mask` is all-True. Raise it (~`3.0`) to **opt in** to ghost tagging; `min_pixel` continues to apply as the gate's pixel floor. Ghosts are best controlled upstream via `min_corr`/`min_pnr`.
 
 ---
 
