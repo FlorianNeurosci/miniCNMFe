@@ -42,7 +42,7 @@ simpler_cnmfe/
 ├── generate_demo_movies.py       # Generate demo_movies/*.avi with ground-truth NPZ sidecars
 ├── convert_to_zarr.py            # Batch-convert demo_movies/*.avi -> *.zarr
 ├── full_pipeline.py              # CLI: load zarr, run full pipeline, save results to disk
-├── demo_notebooks/               # Tutorial notebooks (load+MC, extraction, old_demos/)
+├── demo_notebooks/               # Tutorial notebooks (01 load+MC, 02 tune, 03 extract, 04 advanced)
 └── pyproject.toml
 ```
 

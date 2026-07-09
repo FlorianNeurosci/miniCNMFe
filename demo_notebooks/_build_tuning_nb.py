@@ -1,4 +1,4 @@
-"""Build demo_notebooks/04_tuning.ipynb (disposable builder; run then nbconvert).
+"""Build demo_notebooks/02_tuning.ipynb (disposable builder; run then nbconvert).
 
 Runs the ACTUAL automated tuner (tuning.tuner.run_tuning) on the calibrated
 simulator movie and validates its recommendation against ground truth.
@@ -11,9 +11,9 @@ C = []
 md = lambda s: C.append(nbf.v4.new_markdown_cell(s))
 co = lambda s: C.append(nbf.v4.new_code_cell(s))
 
-md(r"""# CNMF-E pipeline — part 4: does the automated tuner actually work?
+md(r"""# CNMF-E pipeline — part 2: pick parameters with the automated tuner
 
-Parts 1–3 ran with hand-picked parameters. The package also ships an **automated
+Part 1 motion-corrected a movie. Before extraction you need parameters. The package ships an **automated
 tuning pipeline** (`tuning/`, `tune.py`, the `/tune-session` skill): it reads a
 recording, runs heuristics → a graded **extraction sweep** scored by
 ground-truth-**free** quality proxies → full-recording validation, and writes a
@@ -59,7 +59,7 @@ def find_repo_root() -> Path:
 REPO = find_repo_root()
 DEMO = REPO / "demo_movies"
 MC_ZARR = DEMO / "realistic_medium_out" / "mc.zarr"
-assert MC_ZARR.exists(), "run parts 1-3 (or 03_advanced_features) first to build mc.zarr"
+assert MC_ZARR.exists(), "run part 1 first to build mc.zarr"
 
 mc = np.asarray(open_zarr(MC_ZARR), dtype=np.float32)
 meta = np.load(DEMO / "realistic_medium_meta.npz")
@@ -197,6 +197,6 @@ GT-free quality report (`tuning/metrics.py`) that stands in for the ground-truth
 check we were able to run here.""")
 
 nb["cells"] = C
-out = Path(__file__).parent / "04_tuning.ipynb"
+out = Path(__file__).parent / "02_tuning.ipynb"
 nbf.write(nb, out)
 print(f"wrote {out} ({len(C)} cells)")

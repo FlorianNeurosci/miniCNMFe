@@ -1,12 +1,17 @@
-# Disclaimer: This pipeline is an experiment and written almost exclusively by an AI agent under human supervision. It is still under construction and the documentation so far has been written by AI. The results have been validated against Caiman and on synthetic data. However, use it under your own risk and assess results for plausibility. If you find errors please raise an issue so that they can be fixed! Enjoy and stay tuned for changes :)
+> ⚠️ **Disclaimer** — This pipeline is an experiment and written almost exclusively by an AI agent under human supervision. It is still under construction and the documentation so far has been written by AI. The results have been validated against Caiman and on synthetic data. However, use it under your own risk and assess results for plausibility. If you find errors please raise an issue so that they can be fixed! Enjoy and stay tuned for changes :)
 
 # minicnmfe
 
-Minicnmfe is a clean Python implementation of **CNMF-E** (Constrained Non-negative Matrix Factorization for Endoscopic data) for 1-photon **miniscope** calcium imaging — the standard algorithm for extracting neurons from miniscope recordings. It is heavily inspired by CaImAn (https://github.com/flatironinstitute/caiman) but does not import anything from the caiman library. 
+Minicnmfe is a clean Python implementation of **CNMF-E** (Constrained Non-negative Matrix Factorization for Endoscopic data) for 1-photon **miniscope** calcium imaging — the standard algorithm for extracting neurons from miniscope recordings. It is heavily inspired by CaImAn (https://github.com/flatironinstitute/caiman) but does not import anything from the caiman library.
 
-Apart from it being an experiment, the focus of this pipeline is on automatic parameter estimation from raw videos, the tuning library in this repository.
+Apart from it being an experiment, the focus of this pipeline is on **automatic parameter estimation from raw videos** — the `tuning/` library in this repository.
 
-Follow Demonotebooks 1 - 4 to understand typical workflows.
+> **The notebooks are the intended way to learn this pipeline.** Everything under
+> [`docs/`](docs/index.md) is AI-written and has not been reviewed line-by-line — treat it
+> as a convenience reference, not ground truth. The four numbered notebooks in
+> [`demo_notebooks/`](demo_notebooks/) run end-to-end on generated demo movies and
+> validate their own output, so they are the reliable place to understand how to use the
+> pipeline. Read [Notebooks — start here](#notebooks--start-here) first.
 
 ---
 
@@ -21,32 +26,6 @@ Given a raw miniscope recording, CNMFe returns:
 | `S` | `(K, T)` | Inferred spike trains |
 
 The pipeline handles the core challenge of 1-photon imaging: a large, spatially-correlated background that swamps individual neuron signals. It uses a **ring-model background** — per-pixel ridge regression on a ring of surrounding pixels — to separate neural signal from diffuse background before source extraction.
-
----
-
-## Pipeline
-
-```
-AVI / zarr movie  (T × H × W)
-        │
-        ▼  motion_correction_rigid() — cv2 filter2D high-pass + DFT shift estimation
-        │                              + cv2 warpAffine apply (matches CaImAn)
-        ▼  estimate_noise()         — per-pixel noise std from high-freq PSD
-        ▼  greedy_corr_pnr()        — seed detection → extract → subtract → repeat
-        ▼  compute_W()              — ring-model background weights
-        │
-        └─ for n_iter_main:
-               BackgroundSubtractor  — lazy (Y − b0) − W(Y − b0), never materialised
-               update_spatial()      — per-pixel non-negative elastic-net CD
-               update_temporal()     — block coordinate descent + OASIS AR deconvolution
-               merge_components()    — merge spatially overlapping + correlated pairs
-               compute_W()           — refresh b0 (W cached)
-        │
-        ▼  auto_evaluate_components() — record per-component quality (gate OFF by default; opt-in ghost tagging)
-        ▼  update_temporal()        — final deconvolution pass
-        │
-        A, C, S
-```
 
 ---
 
@@ -89,7 +68,116 @@ pip install -e ".[dev]"          # test + tutorial + oasis + ruff
 
 ---
 
-## Quick start
+## Notebooks — start here
+
+The notebooks in [`demo_notebooks/`](demo_notebooks/) are the primary way to learn the
+pipeline. They run end-to-end on the reproducible simulated movies, so after a fresh clone
+you can execute them from top to bottom without any data of your own:
+
+```bash
+python generate_demo_movies.py   # creates demo_movies/*.avi + ground-truth *_meta.npz
+python convert_to_zarr.py        # creates demo_movies/*.zarr
+```
+
+Then work through them **in order** — this is the real-data workflow: load & motion-correct
+→ tune → extract → advanced.
+
+| # | Notebook | What it covers |
+|---|----------|----------------|
+| 1 | [`01_load_and_motion_correct.ipynb`](demo_notebooks/01_load_and_motion_correct.ipynb) | Ingest a session (numbered AVIs → one zarr) and run **streaming rigid motion correction**; verify the recovered shifts against the simulated ground-truth drift. |
+| 2 | [`02_tuning.ipynb`](demo_notebooks/02_tuning.ipynb) | **Pick parameters** (`sigma`, seed thresholds, downsample factors) with the automated tuner, validated against ground truth on a calibrated movie. Run this *before* extraction. |
+| 3 | [`03_extract_components.ipynb`](demo_notebooks/03_extract_components.ipynb) | The **full extraction** (seeding → ring background → spatial/temporal updates → merging → auto-eval) on a clean movie, scored against ground-truth footprints and traces. |
+| 4 | [`04_advanced_features.ipynb`](demo_notebooks/04_advanced_features.ipynb) | **Production knobs** for real recordings: `nrg` footprint tightening, region cutouts, downsample-once + upsample, the rank-1 global background, and fused AVI → motion correction. |
+
+Plus a cautionary walkthrough:
+
+- [`common_mistakes/01_too_many_components.ipynb`](demo_notebooks/common_mistakes/01_too_many_components.ipynb) — why chasing component count (loosening thresholds) adds junk and degrades traces.
+
+---
+
+## Analyze your own data
+
+A miniscope session is typically a folder of sequentially numbered AVI files. The
+recommended path mirrors the notebook order — **motion-correct → tune → extract → refine**:
+
+1. **Load & motion-correct** (notebook 1) — concatenate the AVIs and run streaming rigid
+   motion correction, producing a corrected `mc.zarr`. The fused
+   `CNMFe.fit_mc_from_avis(folder, output_dir=...)` does decode + MC in one pass.
+2. **Tune** (notebook 2) — let the automated tuner pick `sigma`, seed thresholds and
+   downsample factors for *your* recording, rather than guessing. From the CLI:
+
+   ```bash
+   python tune.py /path/to/session   # heuristics + extraction sweep + validation -> report.html + recommended_params.json
+   ```
+
+   (The `/tune-session` skill wraps the same workflow.) **Set the seed thresholds from the
+   recording's own CORR/PNR distribution** — the single most important habit on real data.
+3. **Extract** (notebook 3) — run the full pipeline with those parameters and save `A`,
+   `C`, `S`, `YrA`.
+4. **Refine** (notebook 4) — reach for the production knobs (footprint tightening, rank-1
+   global background, cutouts) on long, dense or drifting recordings.
+
+### Scripted / CLI equivalents
+
+For batch or headless runs the same workflow is available as scripts:
+
+```bash
+# One-shot: concatenate AVIs, run the full pipeline, save results/
+python -m minicnmfe.concat_avis_to_zarr /path/to/recording/
+python full_pipeline.py /path/to/recording/movie.zarr --sigma 3.0 --n-jobs -1
+```
+
+Results are written to `/path/to/recording/results/`:
+
+```
+A.npz         spatial footprints (scipy CSC, H*W x K)
+C.npy         OASIS-deconvolved traces (K x T)
+S.npy         spike trains (K x T)
+YrA.npy       residuals; C + YrA is the noisy projected trace (K x T)
+shifts.npy    per-frame motion correction shifts (T x 2)
+sn.npy        per-pixel noise std (H x W)
+params.json   all pipeline parameters
+```
+
+For finer control, the pipeline is split into **staged CLIs** with a disk handoff between
+each step (`--params p.json` carries a `CNMFeParams` between stages):
+`run_preprocess.py` (downsample) → `run_mc.py` (motion correction) → `run_extract.py`
+(extraction) → `run_evaluate.py` (re-run auto-eval / retune thresholds without
+re-extracting). See [`docs/getting-started/`](docs/getting-started/index.md) and
+[`docs/tuning/`](docs/tuning/index.md).
+
+---
+
+## Pipeline
+
+```
+AVI / zarr movie  (T × H × W)
+        │
+        ▼  motion_correction_rigid() — cv2 filter2D high-pass + DFT shift estimation
+        │                              + cv2 warpAffine apply (matches CaImAn)
+        ▼  estimate_noise()         — per-pixel noise std from high-freq PSD
+        ▼  greedy_corr_pnr()        — seed detection → extract → subtract → repeat
+        ▼  compute_W()              — ring-model background weights
+        │
+        └─ for n_iter_main:
+               BackgroundSubtractor  — lazy (Y − b0) − W(Y − b0), never materialised
+               update_spatial()      — per-pixel non-negative elastic-net CD
+               update_temporal()     — block coordinate descent + OASIS AR deconvolution
+               merge_components()    — merge spatially overlapping + correlated pairs
+               compute_W()           — refresh b0 (W cached)
+        │
+        ▼  auto_evaluate_components() — record per-component quality (gate OFF by default; opt-in ghost tagging)
+        ▼  update_temporal()        — final deconvolution pass
+        │
+        A, C, S
+```
+
+---
+
+## Minimal API example
+
+The notebooks above are the recommended, guided way to run the pipeline. This is the
+minimal programmatic form:
 
 ```python
 from minicnmfe import CNMFe, CNMFeParams
@@ -172,6 +260,8 @@ GPU speedup is most significant for large recordings (≥ 256 × 256, T ≥ 1000
 | `n_jobs` | `1` | CPU workers (`-1` = all cores) |
 | `device` | `"cpu"` | `"cpu"` or `"cuda"` |
 
+Pick these automatically for a recording with `tune.py` (see [Analyze your own data](#analyze-your-own-data)).
+
 ---
 
 ## Experimental features (use with care)
@@ -223,70 +313,23 @@ minicnmfe/
 └── pipeline.py            # CNMFeParams dataclass + CNMFe.fit() orchestrator
 
 tests/                     # pytest suite (300+ tests) — synthetic ground-truth data
-docs/                      # Documentation (getting-started, concepts, api, guides, tuning)
+docs/                      # AI-written documentation (getting-started, concepts, api, guides, tuning)
 demo_movies/               # Generated demo AVIs + zarr stores (created by scripts)
-demo_notebooks/            # Tutorial notebooks (see below)
+demo_notebooks/            # Tutorial notebooks (see "Notebooks — start here" above)
 generate_demo_movies.py    # Generate demo_movies/*.avi with ground-truth sidecars
 convert_to_zarr.py         # Batch-convert demo_movies/*.avi -> *.zarr
 full_pipeline.py           # CLI: load zarr, run full pipeline, save results to disk
-```
-
-Tutorial notebooks live in `demo_notebooks/`. They run on the reproducible
-simulated movies from `generate_demo_movies.py`, so you can execute them
-end-to-end after a fresh clone:
-
-- `01_load_and_motion_correct.ipynb` — AVI → zarr, streaming motion correction, and a check of the recovered shifts against the simulated ground-truth drift
-- `02_extract_components.ipynb` — full extraction pipeline on a clean movie, validated against ground-truth footprints and traces (recall + trace correlation)
-- `03_advanced_features.ipynb` — production knobs: `nrg` footprint tightening, region cutouts, downsample-once + upsample, the rank-1 global background, and fused AVI → motion correction
-- `old_demos/` — earlier walkthroughs (CaImAn comparison, realistic simulator, etc.)
-
----
-
-## Real-data workflow (AVI files)
-
-Miniscope recordings are typically a folder of sequentially numbered AVI files. The recommended workflow:
-
-```bash
-# 1. Concatenate 0.avi ... 65.avi into one lazy zarr store
-python -m minicnmfe.concat_avis_to_zarr /path/to/recording/
-
-# 2. Run the full pipeline and save all results
-python full_pipeline.py /path/to/recording/movie.zarr --sigma 3.0 --n-jobs -1
-
-# Results written to /path/to/recording/results/:
-#   A.npz         spatial footprints (scipy CSC, H*W x K)
-#   C.npy         OASIS-deconvolved traces (K x T)
-#   S.npy         spike trains (K x T)
-#   YrA.npy       residuals; C + YrA is the noisy projected trace (K x T)
-#   shifts.npy    per-frame motion correction shifts (T x 2)
-#   sn.npy        per-pixel noise std (H x W)
-#   params.json   all pipeline parameters
-```
-
-For more control, the pipeline is also split into **staged CLIs** with a disk
-handoff between each step (a `--params p.json` carries a `CNMFeParams` between
-stages): `run_preprocess.py` (downsample) → `run_mc.py` (motion correction) →
-`run_extract.py` (extraction) → `run_evaluate.py` (re-run auto-eval / retune
-thresholds without re-extracting). To pick good parameters for a session, use
-`tune.py <path>` (heuristics + extraction sweep + full-recording validation →
-`report.html`). See [`docs/getting-started/`](docs/getting-started/index.md) and
-[`docs/tuning/`](docs/tuning/index.md).
-
-To generate demo movies and try the pipeline end-to-end:
-
-```bash
-python generate_demo_movies.py   # creates demo_movies/*.avi (+ ground-truth sidecars)
-python convert_to_zarr.py        # creates demo_movies/*.zarr
-# then open demo_notebooks/01_load_and_motion_correct.ipynb
-#           demo_notebooks/02_extract_components.ipynb
-#           demo_notebooks/03_advanced_features.ipynb
 ```
 
 ---
 
 ## Documentation
 
-Full documentation lives in [`docs/`](docs/index.md) and renders directly on GitHub:
+> The prose docs below were written by AI and have not been reviewed line-by-line. They
+> are a convenience reference — the [notebooks](#notebooks--start-here) are the trusted,
+> executable source of truth for how to use the pipeline.
+
+Documentation lives in [`docs/`](docs/index.md) and renders directly on GitHub:
 
 | Page | Contents |
 |------|----------|
@@ -295,8 +338,6 @@ Full documentation lives in [`docs/`](docs/index.md) and renders directly on Git
 | [`docs/concepts/`](docs/concepts/algorithm-math.md) | Algorithm math + ELI5, architecture, ring background, CaImAn comparison |
 | [`docs/guides/`](docs/guides/index.md) | Per-stage implementation walkthroughs (motion correction → evaluation) |
 | [`docs/tuning/`](docs/tuning/index.md) | Automated parameter-tuning workflow + the [tuning guide](docs/tuning/guide.md) |
-
-The `demo_notebooks/` notebooks (`01_load_and_motion_correct`, `02_extract_components`, `03_advanced_features`) walk through the full pipeline end-to-end on the reproducible simulated movies. Earlier walkthroughs are preserved in `demo_notebooks/old_demos/`.
 
 ---
 

@@ -1,7 +1,0 @@
-/media/server/archive/projects/2023_intercontext/PICAST/data/0_raw/20260528_m0010798_wt_1344/miniscope_video
-/media/server/archive/projects/2023_intercontext/PICAST/data/0_raw/20260528_m0010800_wt_1334/miniscope_video
-/media/server/archive/projects/2023_intercontext/PICAST/data/0_raw/20260528_m0000159_som_1532/miniscope_video
-/media/server/archive/projects/2023_intercontext/PICAST/data/0_raw/20260528_m0000161_som_1542/miniscope_video
-
-
-

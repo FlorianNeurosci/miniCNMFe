@@ -305,10 +305,10 @@ To generate synthetic demo recordings and try the full workflow:
 ```bash
 python generate_demo_movies.py   # creates demo_movies/*.avi + *_meta.npz
 python convert_to_zarr.py        # creates demo_movies/*.zarr
-jupyter notebook tutorial_demo.ipynb
+jupyter notebook demo_notebooks/01_load_and_motion_correct.ipynb
 ```
 
-The `tutorial_demo.ipynb` notebook opens a zarr lazily, runs the full pipeline, and scores extraction quality against the ground-truth.
+The `demo_notebooks/` series — `01_load_and_motion_correct` → `02_tuning` → `03_extract_components` → `04_advanced_features` — walks the full workflow end-to-end on these movies, scoring extraction quality against the ground-truth sidecars.
 
 ### `python -m minicnmfe.concat_avis_to_zarr` options
 

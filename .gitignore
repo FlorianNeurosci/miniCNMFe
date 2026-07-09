@@ -117,5 +117,12 @@ site/
 # Kept on disk locally for development; never published.
 CLAUDE.md
 .claude/
+
+# ── Local reference material (never publish) ──────────────────────────────────
+# Reference implementations kept locally for algorithm comparison (suite2p,
+# minian, NoRMCorre) and the local working copy of the GitHub wiki (a separate
+# repo). A stray `git add -A` must never pull these into the package.
+inspiration/
+wiki/
 todo/
 live_runs/
