@@ -1,8 +1,12 @@
+# Disclaimer: This pipeline is an experiment and written almost exclusively by an AI agent. It is still under construction and the documentation so far has been written by AI. The results have been validated against Caiman and on synthetic data, so the results seem to be correct. Use it under your own risk and assess results for plausibility. If you find errors please raise an issue so that they can be fixed! Enjoy and stay tuned for changes :)
+
 # minicnmfe
 
-A clean Python implementation of **CNMF-E** (Constrained Non-negative Matrix Factorization for Endoscopic data) for 1-photon **miniscope** calcium imaging — the standard algorithm for extracting neurons from miniscope recordings.
+Minicnmfe is a clean Python implementation of **CNMF-E** (Constrained Non-negative Matrix Factorization for Endoscopic data) for 1-photon **miniscope** calcium imaging — the standard algorithm for extracting neurons from miniscope recordings. It is heavily inspired by CaImAn (https://github.com/flatironinstitute/caiman) but does not import anything from the caiman library. 
 
-No CaImAn code imported. The CaImAn source is used as an algorithmic reference only; all math is reimplemented from scratch using numpy / scipy / scikit-image / scikit-learn.
+Apart from it being an experiment, the focus of this pipeline is on automatic parameter estimation from raw videos, the tuning library in this repository.
+
+Follow Demonotebooks 1 - 4 to understand typical workflows.
 
 ---
 
