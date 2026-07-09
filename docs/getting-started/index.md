@@ -1,6 +1,6 @@
 # CNMFe — Usage Guide
 
-> See [API reference](../api/index.md) for full parameter docs. See [algorithm ELI5](../concepts/algorithm-eli5.md) for intuition.
+> See [API reference](../api/index.md) for full parameter docs. See [algorithm intuition](../concepts/algorithm-eli5.md) for intuition.
 
 ---
 

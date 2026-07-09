@@ -16,7 +16,7 @@
 
 | Page | What's in it |
 |------|--------------|
-| [Algorithm (ELI5)](concepts/algorithm-eli5.md) | Plain-English explanation with analogies — no equations |
+| [Algorithm (intuition)](concepts/algorithm-eli5.md) | Conceptual walkthrough for neuroscientists — analogies, no equations |
 | [Algorithm (math)](concepts/algorithm-math.md) | Full mathematical derivation of every pipeline step |
 | [Architecture](concepts/architecture.md) | Module map, dependency graph, data-flow |
 | [Ring background](concepts/ring-background.md) | The ring background model and the sum-to-one constraint |

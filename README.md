@@ -307,7 +307,7 @@ Documentation lives in [`docs/`](docs/index.md) and renders directly on GitHub:
 |------|----------|
 | [`docs/getting-started/`](docs/getting-started/index.md) | Install, quick-start, end-to-end workflow, CLI, troubleshooting |
 | [`docs/api/`](docs/api/index.md) | Every public function and `CNMFeParams` field — signatures, parameters, returns |
-| [`docs/concepts/`](docs/concepts/algorithm-math.md) | Algorithm math + ELI5, architecture, ring background, CaImAn comparison |
+| [`docs/concepts/`](docs/concepts/algorithm-math.md) | Algorithm math + intuition, architecture, ring background, CaImAn comparison |
 | [`docs/guides/`](docs/guides/index.md) | Per-stage implementation walkthroughs (motion correction → evaluation) |
 | [`docs/tuning/`](docs/tuning/index.md) | Automated parameter-tuning workflow + the [tuning guide](docs/tuning/guide.md) |
 

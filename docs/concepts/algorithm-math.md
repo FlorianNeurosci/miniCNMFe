@@ -4,7 +4,7 @@ tags: [minicnmfe, math, algorithm]
 
 # CNMFe — Mathematical Description
 
-> See also: [algorithm ELI5](./algorithm-eli5.md) for the intuitive version, [architecture](./architecture.md) for code locations.
+> See also: [algorithm intuition](./algorithm-eli5.md) for the conceptual walkthrough, [architecture](./architecture.md) for code locations.
 
 ## 1. Problem Statement
 

@@ -1,156 +1,257 @@
 ---
-tags: [minicnmfe, explainer, eli5]
+tags: [minicnmfe, explainer, concepts]
 ---
 
-# CNMFe — Explained Like You're Five
+# CNMFe — A Conceptual Walkthrough
 
-> For the equations behind each step, see [algorithm math](./algorithm-math.md). For where to find the code, see [architecture](./architecture.md).
-
----
-
-## What are we trying to do?
-
-Imagine you filmed hundreds of glowing fireflies in a dark field, but through frosted glass. Every frame of video shows blobs of light — some are individual fireflies flashing, but there's also a diffuse background glow from all the fireflies you can't quite see.
-
-Your job: figure out *which firefly is where* and *when exactly each one flashed*.
-
-In real life: you recorded neurons in a mouse brain. Each neuron is a tiny blob of light that gets brighter when it fires. The "frosted glass" is the tissue scattering — a messy background that varies slowly everywhere.
-
-**CNMFe** is the algorithm that separates the individual neuron signals from this noisy, correlated background.
+> Written for someone fluent in calcium imaging who would rather not wade through
+> linear algebra. Every step is explained by *what it does* and *why*, with the
+> statistical machinery described in words rather than equations. For the actual
+> equations, see [algorithm math](./algorithm-math.md); for where each step lives
+> in the code, see [architecture](./architecture.md).
 
 ---
 
-## Step 1 — Stabilise the video (Motion Correction)
+## The problem, stated cleanly
 
-The camera or the brain wiggles. So frame 1 and frame 2 might be shifted by a pixel or two.
+You have a one-photon movie: `T` frames of a field of view containing some unknown
+number of neurons, `K`. Each neuron has two things that don't change over the
+recording and one that does:
 
-> **Analogy:** Like stacking holiday photos — you line them all up before you start looking for differences.
+- a **spatial footprint** — the set of pixels it illuminates and how strongly each
+  pixel belongs to it (essentially its soma profile as seen through the tissue), and
+- a **fluorescence trace** — its baseline plus the transients it emits when it fires.
 
-We take each frame and find how far it drifted from a reference (the average of the first few hundred frames), then shift it back. We use a math trick called *phase correlation* (basically: compare patterns in frequency space) which gives subpixel accuracy — we can correct shifts of 0.3 pixels, not just whole pixels.
+What the camera records at a given pixel, over time, is a *sum*: every neuron whose
+footprint covers that pixel contributes its trace (scaled by how much that pixel
+belongs to it), on top of a large diffuse background, plus noise. The neurons are
+mixed together in the image, and worse, they're mixed into a background that dwarfs
+them.
 
----
-
-## Step 2 — Estimate the background noise level
-
-Every pixel has some random flicker even when nothing is happening. We measure how *noisy* each pixel is by looking at the high-frequency wiggles in its brightness over time (neurons change slowly; noise is fast).
-
-> **Analogy:** Tuning out the static on a radio to hear how strong the signal is.
-
----
-
-## Step 3 — Find where the neurons are (CORR and PNR images)
-
-We make two "summary pictures" to show us where neurons probably are:
-
-- **CORR (Correlation image):** At each pixel, how similar is its signal to its neighbours? Neurons are compact — a neuron pixel and its immediate neighbours all flash together. Random noise doesn't.
-
-- **PNR (Peak-to-Noise Ratio):** At each pixel, how tall is the biggest flash compared to the background noise? A real neuron flash is much bigger than random noise.
-
-> **Analogy:** CORR is like asking "does this pixel move in sync with the ones around it?" PNR is asking "does this pixel ever get *much* brighter than its usual noise level?"
-
-Multiplying CORR × PNR gives a score map. Bright spots in this map are likely neurons.
-
-We also run the video through a *center-surround filter* first — this sharpens neuron-shaped signals and suppresses the diffuse background (like sharpening a blurry photo before you look for faces).
+CNMFe's job is to invert that mixing — to recover the individual footprints and
+traces from the blended movie. This is a **source-separation** (demixing) problem,
+conceptually identical to recovering individual speakers from a single microphone
+that recorded a crowded room.
 
 ---
 
-## Step 4 — Find initial neurons, one by one (Greedy Initialization)
+## The one idea worth internalizing: the movie is a product of two small things
 
-We pick neurons one at a time, starting with the brightest (highest CORR×PNR score):
+CNMFe assumes the movie is well explained by a *small* number of sources, each of
+which is **one fixed spatial pattern multiplied by one time course**. Stack the `K`
+footprints into a set of images (call it `A`) and the `K` traces into a set of time
+series (call it `C`); the model says the movie ≈ `A` combined with `C` (each pixel's
+movie = sum over neurons of footprint-weight × trace), plus background and noise.
 
-1. Pick the top candidate pixel (the "seed").
-2. Look at a small patch around it. Find pixels whose brightness goes up and down together with the seed — those are probably part of the same neuron.
-3. Fit a small football-shaped blob (the "spatial footprint") to those pixels.
-4. Record the average brightness over time (the "trace").
-5. **Subtract** this neuron's signal from the video.
-6. Recompute the CORR/PNR map on the cleaned-up video.
-7. Repeat for the next brightest spot.
+That "a handful of sources generate the entire movie" claim is the whole trick.
+Instead of treating every pixel at every frame as an independent number, you commit
+to the idea that they are all generated by `K` footprints and `K` traces. Fitting the
+model means choosing the footprints and traces whose combination best reproduces what
+the camera actually saw. In the literature this is a **matrix factorization** — you're
+factoring the big movie into two much smaller pieces.
 
-> **Analogy:** Like peeling away the loudest instrument in a song one by one — after removing the drums, you can hear the bass more clearly; after removing the bass, the guitar emerges.
+Three assumptions turn this generic idea into something that recovers *neurons*
+specifically (this is the "constrained" in CNMFe):
 
-We stop when no pixels are bright enough to be a new neuron.
+- **Non-negativity.** Footprints and fluorescence can't be negative — light only adds.
+  Forcing the factors to be non-negative is what makes them come out looking like real
+  cells and real transients instead of abstract patterns that merely happen to fit.
+- **Sparsity and compactness.** A neuron occupies a small, connected patch, not the
+  whole frame. The fit actively prefers footprints that are small and local.
+- **Calcium dynamics.** Each trace should look like calcium — sharp rises, exponential
+  decays — not arbitrary wiggles. This constraint lives on the temporal side (see the
+  deconvolution step).
 
----
-
-## Step 5 — Model the background (Ring Background)
-
-Even after finding all neurons, there's still a spatially correlated background: the diffuse glow that drifts slowly across the whole field. CNMFe uses a clever model for this:
-
-For each pixel, predict its background from a **ring of pixels** around it (at distance ~1.5 × neuron size). Nearby pixels share the same diffuse glow, so a weighted sum of the ring neighbours is a good predictor.
-
-> **Analogy:** If all the streetlights on your block flicker together, you can predict how bright your window is from how bright your neighbours' windows are.
-
-We fit the ring weights using simple linear regression — once. The resulting "background model" can then be subtracted from every frame.
-
----
-
-## Step 6 — Refine everything (Iterative Updates)
-
-Our initial guesses for neuron shapes and traces aren't perfect. So we take turns improving them:
-
-### Update shapes (Spatial Update)
-
-Given the current traces, re-fit each neuron's shape. For each pixel: figure out which neurons overlap it, then solve "how much does each neuron contribute to this pixel's brightness?" This is a small LASSO regression (fancy least-squares that also pushes small weights to zero, keeping footprints sparse and clean).
-
-### Update traces (Temporal Update)
-
-Given the updated shapes, re-fit each neuron's trace. For each neuron: take everything left in the video after subtracting all the *other* neurons, and project it onto this neuron's footprint. Then denoise the trace using the AR(1) model (described below).
-
-### Merge duplicates (Merging)
-
-Sometimes two nearby seeds got picked for the same neuron. We check every pair of components: if their traces look nearly identical, *and* either their footprints overlap *or* their centres of mass sit close together, they're probably the same neuron — merge them.
-
-> **Why both rules?** After cleaning up footprints (we threshold-and-keep-the-largest-blob), two duplicates of the same neuron can end up with no spatial overlap at all — each kept just the bright core around its own peak. The centre-distance rule catches these: even when the cleaned blobs don't touch, their centroids are still right next to each other.
-
-We do this whole update cycle 2–3 times until things stabilise.
+The rest of the pipeline is machinery for fitting this model on messy 1p data:
+stabilize the movie → get a rough first guess of the sources → model the background →
+alternately sharpen the shapes and the traces → tidy up.
 
 ---
 
-## Step 6b — What's the AR(1) model?
+## Step 1 — Motion correction
 
-Calcium imaging measures a chemical (GCaMP) that glows when flooded with calcium. Neurons fire, calcium rushes in, glow rises sharply, then decays exponentially.
+The brain and the scope drift, so a pixel in frame 1 isn't the same tissue as that
+pixel in frame 500. Before you can claim a footprint is fixed, you have to make it
+*actually* fixed by registering every frame to a common reference (the average of the
+first few hundred frames).
 
-The AR(1) model says:
-
-> **brightness now** = (decay × brightness yesterday) + (this spike)
-
-The "decay" is a number slightly less than 1 (like 0.9). With this model, given a noisy brightness trace, we can work backwards to find the exact times the neuron spiked — this is *deconvolution*.
-
-> **Analogy:** If you know a bathtub drains at 10% per second, and you see the water level, you can calculate exactly when and how much water was poured in.
-
-We use an algorithm called **OASIS** (Online Active Set to Infer Spikes) — it's fast and gives an exact solution.
-
-### How do we know the "drain rate" of the bathtub?
-
-The decay number `g` depends on the indicator (which GCaMP variant you're using) and how fast you record. You can let the pipeline guess it from the data (fine on clean recordings), but on noisy 1-photon recordings the slow background drift makes the guess wrong — it usually says "the bathtub drains very slowly" even when it doesn't.
-
-The fix: tell the pipeline what you actually used. Set `decay_time_ms` (e.g. 140 for GCaMP6f, 180 for jGCaMP8m) and `frame_rate_hz`. The pipeline turns those into the right `g` and uses it as a Bayesian *prior* — the data gets to nudge `g` away from the target if it really disagrees, but mostly it just anchors `g` where biology says it should be. See the [API reference](../api/index.md) for the indicator table.
+The registration uses **phase correlation** — comparing frames in the frequency domain,
+which finds the translation between them with sub-pixel accuracy (it can detect and
+undo a 0.3-pixel shift, not just whole-pixel jumps). Sub-pixel matters here: an
+uncorrected drift of a pixel or two smears a soma across its neighbours and corrupts
+every downstream footprint.
 
 ---
 
-## What comes out?
+## Step 2 — A noise yardstick for every pixel
 
-After all this, you have:
+Each pixel flickers a little even when nothing is happening. We measure that
+per-pixel noise level from the *fast* fluctuations in its time course (calcium signals
+are slow; sensor and shot noise are fast, so the high-frequency content is essentially
+pure noise).
 
-- **A** — for each neuron: a map showing which pixels it covers (its "footprint")
-- **C** — for each neuron: its smooth calcium trace over time (denoised by OASIS into a clean AR(1) shape)
-- **S** — for each neuron: exactly when it fired (the spike train)
-- **YrA** — the *noisy* version of each calcium trace: what's left in the data at that footprint after subtracting all other neurons. `C + YrA` is the noisy-but-shape-faithful trace, useful when you want to compare against an external reference.
-
-> **Analogy:** Like unmixing a cocktail party recording into individual speakers (who is talking), when they spoke, and how loud each word was.
-
-### Wait, why two flavours of `C`?
-
-`C` is what OASIS *thinks* the calcium trace should look like, given the AR(1) decay model. It's clean, smooth, and ideal for spike analyses.
-
-`C + YrA` is what's actually *in the data* at that footprint. It's noisier, but its shape matches the underlying biology more faithfully — handy if you're correlating with another signal, or if your analysis cares about exact spike timing rather than smooth amplitude.
+This isn't cosmetic — it becomes the ruler used later to decide whether a candidate is
+a real cell or just a bright patch of noise. "How big is this signal *relative to this
+pixel's own noise*" is a far better question than "how bright is it."
 
 ---
 
-## Why is this hard for 1-photon imaging?
+## Step 3 — Where are the cells? (summary images)
 
-In 2-photon imaging, the laser only excites one thin focal plane, so background is small.
+Two summary images collapse the whole movie into a "where are the neurons" map:
 
-In 1-photon imaging, *everything* in the tissue fluoresces — nearby cells, axons, blood vessels, out-of-focus neurons. The background is huge and spatially correlated. Standard NMF methods confuse background with neurons.
+- **CORR (local correlation image).** At each pixel, how correlated is its time course
+  with its immediate neighbours? A soma spans several pixels that rise and fall
+  together, so it lights up as a compact correlated patch; uncorrelated noise does not.
+- **PNR (peak-to-noise ratio).** At each pixel, how tall is its largest transient
+  compared with the noise yardstick from Step 2? Real events tower over noise.
 
-CNMFe's ring-model background is specifically designed to separate this correlated background from the compact, structured neuron signals.
+Their product, `CORR × PNR`, is the seed map: pixels that are both locally correlated
+*and* have large transients. Before computing these, the movie is passed through a
+**center-surround filter** (a difference-of-Gaussians band-pass tuned to the cell
+scale) — this suppresses the smooth, low-spatial-frequency background and enhances
+blobs the size of a soma, so the summary images reflect cells rather than the glow.
+
+---
+
+## Step 4 — A rough first guess, one neuron at a time (greedy initialization)
+
+We build the initial set of sources by peeling neurons off the seed map greedily:
+
+1. Take the strongest remaining seed pixel.
+2. In a small patch around it, gather the pixels whose time courses co-vary with the
+   seed — that's a first estimate of this neuron's footprint.
+3. Read off its trace (roughly, the average of those pixels over time).
+4. **Subtract** this neuron's contribution from the movie.
+5. Recompute the seed map on what's left, and repeat.
+
+Removing each neuron before looking for the next is what prevents one bright cell from
+generating a cluster of false seeds around itself. We stop when nothing left in the
+residual is bright enough to be a cell. The result is a complete but rough guess — good
+enough to seed the refinement, not the final answer.
+
+> This peel-one-source-at-a-time strategy is the same instinct as un-mixing a band
+> recording by removing the loudest instrument first: once the drums are gone the bass
+> is obvious, and so on.
+
+---
+
+## Step 5 — Modelling the background (the ring — this is the heart of CNMFe)
+
+Even with the cells accounted for, a large, spatially smooth background remains: the
+diffuse fluorescence from out-of-focus cells, neuropil, and vasculature that drifts
+slowly across the whole field. Ordinary NMF has no defence against this and ends up
+describing the background as if it were extra "neurons."
+
+CNMFe's answer: predict each pixel's background from a **ring of pixels about one
+neuron-radius away** from it. The logic has two halves. Because the background is
+spatially smooth, a pixel's neighbours share almost the same background value — so a
+weighted combination of them is an excellent predictor. And because the *ring*
+deliberately skips the pixels immediately around the target (the ones that would belong
+to the pixel's own neuron), the background estimate captures the shared glow *without*
+soaking up genuine neural signal. The ring weights are fit once, as a straightforward
+best-linear-predictor regression, then used to subtract a background estimate from
+every frame.
+
+> If every window on your street brightens and dims together, you can predict your own
+> window's brightness from your neighbours' — while ignoring your own lamp.
+
+---
+
+## Step 6 — Sharpening shapes and traces by taking turns
+
+You can't solve for the footprints and the traces simultaneously — but if you *fix*
+one, solving for the other is a clean regression. So CNMFe alternates: hold the traces
+fixed and re-estimate every shape, then hold the shapes fixed and re-estimate every
+trace, and repeat. Each pass fits the movie strictly better than the last; two or three
+rounds are enough to settle.
+
+**Update the shapes (spatial update).** With the traces fixed, ask at each pixel: of the
+neurons whose footprints reach this pixel, how much of this pixel's time course does
+each one explain? That's a small regression per pixel. Crucially it carries a
+**sparsity penalty** (a LASSO) — a pressure that drives weak, uncertain pixel-to-neuron
+weights all the way to zero rather than leaving a faint smear. That's what keeps
+footprints tight and stops one cell's footprint from bleeding into its neighbours.
+
+**Update the traces (temporal update).** With the shapes fixed, re-estimate each
+neuron's trace: subtract *all the other* neurons from the movie, project what remains
+onto this neuron's footprint to read out its time course, then denoise that time course
+with the calcium-dynamics model (next section).
+
+**Merge duplicates (merging).** Two seeds sometimes land on the same cell. We merge a
+pair when their traces are nearly identical **and** either their footprints overlap
+**or** their centroids sit close together.
+
+> Why both spatial rules? After footprints are cleaned up (we keep each one's largest
+> connected blob), two duplicates of the same neuron can end up with *no* pixel overlap
+> at all — each kept only the bright core around its own peak. The centroid rule catches
+> those: the cleaned blobs don't touch, but their centres are still right on top of each
+> other.
+
+---
+
+## Step 7 — Calcium dynamics and deconvolution (the AR model)
+
+You already know the shape of a calcium transient: a fast rise when the cell fires,
+then an exponential decay as the indicator unbinds. The **AR(1)** ("autoregressive")
+model is just the compact way to state that: the fluorescence in each frame equals a
+fixed fraction `g` of the previous frame's fluorescence, plus whatever new spiking
+input arrived this frame. A fraction slightly below 1 (say 0.9) *is* an exponential
+decay; the added input is the spike.
+
+**Deconvolution** runs that model backwards. Given the smooth, noisy trace, it recovers
+the sparse set of spike times and amplitudes that best explains it — turning a blurry
+fluorescence curve into an estimate of the underlying activity. The solver is **OASIS**,
+which does this exactly and very fast.
+
+> If you know a bathtub drains at a fixed 10% per second, then from the water level over
+> time you can reconstruct exactly when, and how much, water was poured in.
+
+**Where does the decay rate `g` come from?** You can estimate it from the data, and on
+clean recordings that's fine. But on 1p data the slow background drift contaminates the
+estimate and biases it toward "the indicator decays very slowly" even when it doesn't —
+which over-smooths the traces and blurs spike timing. The robust fix is to *tell* the
+pipeline what you used: set `decay_time_ms` (e.g. ~140 for GCaMP6f, ~180 for jGCaMP8m)
+and `frame_rate_hz`. The pipeline converts those into the expected `g` and uses it as a
+**Bayesian prior** — it anchors `g` at the biologically sensible value and only lets the
+data pull it away if the recording strongly disagrees. (A "prior" here just means a
+belief you hold before seeing the data; the fit blends that belief with the evidence
+instead of trusting a noisy data estimate outright.) The indicator table is in the
+[API reference](../api/index.md).
+
+---
+
+## What you get out
+
+- **A** — each neuron's spatial footprint (which pixels it covers, and how strongly).
+- **C** — each neuron's denoised calcium trace: what OASIS believes the fluorescence
+  is, given the AR model. Clean, smooth, ideal for spike-based analyses.
+- **S** — each neuron's inferred spike train (the deconvolved events).
+- **YrA** — the *residual* at each footprint. `C + YrA` is the noisier but
+  shape-faithful trace: what is actually in the data at that footprint after removing
+  the other neurons.
+
+> The whole thing is a cocktail-party un-mixing: who is present (footprints), when each
+> spoke (spike trains), and the actual waveform of each voice (traces).
+
+**Two flavours of the trace, and when to use which.** `C` is the model's idealized
+version — smooth and AR-shaped, best when you care about spike timing and clean event
+detection. `C + YrA` is the empirical version — it keeps the real fluctuations in the
+data at that footprint, so its shape is more faithful to the underlying biology. Prefer
+it when you're correlating a trace against an external signal (behaviour, LFP, another
+imaging channel) and don't want the AR smoothing to distort the comparison.
+
+---
+
+## Why 1p imaging makes this hard
+
+In two-photon imaging, only a thin focal plane is excited, so the out-of-focus
+background is small and standard demixing methods cope.
+
+In one-photon (miniscope) imaging, the whole illuminated volume fluoresces at once —
+neuropil, axons, vasculature, out-of-focus somata — producing a background that is both
+*huge* and *spatially correlated*. Generic NMF cannot tell that correlated background
+apart from real cells and folds it into spurious sources. CNMFe's ring-background model
+is the piece built specifically to strip that correlated background away, leaving the
+compact, structured neural sources behind — which is exactly why it's the standard tool
+for miniscope data.
