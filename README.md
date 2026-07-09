@@ -50,14 +50,6 @@ pip install -e ".[oasis]"   # equivalent — oasis-deconv is already a core dep
 If `oasis-deconv` is unavailable, the package falls back to a pure-Python PAVA
 implementation for AR(1).
 
-**Optional — GPU acceleration (CuPy):**
-
-```bash
-pip install -e ".[gpu]"        # installs cupy-cuda12x
-# or for CUDA 11.x:
-pip install cupy-cuda11x
-```
-
 **Optional — tests / tutorials / dev:**
 
 ```bash
@@ -88,10 +80,6 @@ Then work through them **in order** — this is the real-data workflow: load & m
 | 2 | [`02_tuning.ipynb`](demo_notebooks/02_tuning.ipynb) | **Pick parameters** (`sigma`, seed thresholds, downsample factors) with the automated tuner, validated against ground truth on a calibrated movie. Run this *before* extraction. |
 | 3 | [`03_extract_components.ipynb`](demo_notebooks/03_extract_components.ipynb) | The **full extraction** (seeding → ring background → spatial/temporal updates → merging → auto-eval) on a clean movie, scored against ground-truth footprints and traces. |
 | 4 | [`04_advanced_features.ipynb`](demo_notebooks/04_advanced_features.ipynb) | **Production knobs** for real recordings: `nrg` footprint tightening, region cutouts, downsample-once + upsample, the rank-1 global background, and fused AVI → motion correction. |
-
-Plus a cautionary walkthrough:
-
-- [`common_mistakes/01_too_many_components.ipynb`](demo_notebooks/common_mistakes/01_too_many_components.ipynb) — why chasing component count (loosening thresholds) adds junk and degrades traces.
 
 ---
 
@@ -211,31 +199,16 @@ model = CNMFe(CNMFeParams(sigma=3.0)).fit(movie, do_motion_correction=False)
 
 ---
 
-## Parallelism and GPU
+## Parallelism
 
 ```python
-# Multi-core CPU
-params = CNMFeParams(sigma=3.0, n_jobs=-1)   # all available cores
-
-# GPU (requires CuPy + CUDA)
-params = CNMFeParams(sigma=3.0, device="cuda")
-
-# Both
-params = CNMFeParams(sigma=3.0, n_jobs=4, device="cuda")
+params = CNMFeParams(sigma=3.0, n_jobs=-1)   # use all available CPU cores
 ```
 
-**What runs on GPU** (`device="cuda"`):
-
-| Step | GPU operation |
-|------|--------------|
-| CORR / PNR images | Per-frame PSF convolution + FFT correlation |
-| Ring background | Batched `linalg.solve` grouped by ring size |
-| Temporal projection | `(H·W × T) @ (H·W × K)` matrix multiply |
-| Greedy init | Initial per-frame PSF convolution |
-
-Steps that stay on CPU regardless: motion correction (cv2 — bit-identical to CaImAn), OASIS deconvolution, the spatial elastic-net coordinate descent, the greedy loop.
-
-GPU speedup is most significant for large recordings (≥ 256 × 256, T ≥ 1000 frames). On small data the CPU↔GPU transfer overhead can outweigh the benefit.
+Every bottleneck step that can be parallelised — the ring-background solve, the
+per-pixel spatial elastic-net coordinate descent, temporal OASIS deconvolution,
+and the per-frame motion-correction / CORR-PNR work — respects `n_jobs`. The
+default is `1` (serial); `-1` uses all cores.
 
 > **Windows:** `n_jobs != 1` uses `spawn`-based multiprocessing. Wrap `CNMFe(...).fit(...)` calls inside `if __name__ == "__main__":` in scripts.
 
@@ -254,11 +227,10 @@ GPU speedup is most significant for large recordings (≥ 256 × 256, T ≥ 1000
 | `ar_order` | `1` | AR model order for calcium dynamics (1 or 2) |
 | `ring_size_factor` | `1.5` | Ring radius = factor × (2σ + 1) |
 | `init_stride` | auto | Temporal stride for greedy init (None = `max(1, T // 5000)`) |
-| `init_patches` | `True` | Parallelize the serial greedy seed loop across overlapping FOV patches (auto-skips for small FOV / GPU / streaming movies; see usage guide) |
+| `init_patches` | `True` | Parallelize the serial greedy seed loop across overlapping FOV patches (auto-skips for small FOV / streaming movies; see usage guide) |
 | `spatial_ridge` | `1e-2` | Elastic-net L2 on the per-pixel `update_spatial` LASSO; keeps the CD converging when components are correlated (`0.0` = pure LASSO) |
 | `spatial_max_iter` | `1000` | Per-pixel CD iteration cap (backstop; rarely hit with `spatial_ridge`) |
 | `n_jobs` | `1` | CPU workers (`-1` = all cores) |
-| `device` | `"cpu"` | `"cpu"` or `"cuda"` |
 
 Pick these automatically for a recording with `tune.py` (see [Analyze your own data](#analyze-your-own-data)).
 
@@ -378,6 +350,5 @@ All algorithms are reimplemented from scratch. The CaImAn repository is used as 
 | `tqdm` | Progress bars |
 | `oasis-deconv` | Fast compiled OASIS AR deconvolution (core dep; pure-Python PAVA fallback if unavailable) |
 | `numba` | GIL-free per-pixel coordinate descent in the spatial update |
-| `cupy` *(`[gpu]` extra)* | GPU acceleration |
 | `pytest`, `pytest-cov` *(`[test]` extra)* | Test runner |
 | `jupyter`, `ipywidgets` *(`[tutorial]` extra)* | Demo notebooks |
