@@ -34,8 +34,8 @@ The pipeline handles the core challenge of 1-photon imaging: a large, spatially-
 Requires Python ≥ 3.10.
 
 ```bash
-git clone https://github.com/FlorianNeurosci/simpler_cnmfe.git
-cd simpler_cnmfe
+git clone https://github.com/FlorianNeurosci/miniCNMFe.git
+cd miniCNMFe
 pip install -e .
 ```
 

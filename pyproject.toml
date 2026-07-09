@@ -58,9 +58,9 @@ docs = ["mkdocs-material >= 9.5", "pymdown-extensions >= 10.0"]
 dev = ["minicnmfe[test,tutorial,oasis]", "ruff"]
 
 [project.urls]
-Homepage = "https://github.com/FlorianNeurosci/simpler_cnmfe"
-Repository = "https://github.com/FlorianNeurosci/simpler_cnmfe"
-Documentation = "https://florianneurosci.github.io/simpler_cnmfe/"
+Homepage = "https://github.com/FlorianNeurosci/miniCNMFe"
+Repository = "https://github.com/FlorianNeurosci/miniCNMFe"
+Documentation = "https://florianneurosci.github.io/miniCNMFe/"
 
 [build-system]
 requires = ["setuptools >= 77", "wheel"]

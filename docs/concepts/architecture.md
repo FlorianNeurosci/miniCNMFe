@@ -11,7 +11,7 @@ tags: [minicnmfe, architecture, modules]
 ## Repository Layout
 
 ```
-simpler_cnmfe/
+miniCNMFe/
 ├── minicnmfe/                        # Main package
 │   ├── __init__.py               # Public re-exports: CNMFe, CNMFeParams, load_movie
 │   ├── _utils.py                 # Shared low-level helpers (no algorithm logic)

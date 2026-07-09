@@ -1,8 +1,8 @@
 site_name: minicnmfe
 site_description: Clean CNMF-E for 1-photon miniscope calcium imaging
-site_url: https://florianneurosci.github.io/simpler_cnmfe/
-repo_url: https://github.com/FlorianNeurosci/simpler_cnmfe
-repo_name: FlorianNeurosci/simpler_cnmfe
+site_url: https://florianneurosci.github.io/miniCNMFe/
+repo_url: https://github.com/FlorianNeurosci/miniCNMFe
+repo_name: FlorianNeurosci/miniCNMFe
 edit_uri: edit/master/docs/
 
 docs_dir: docs
