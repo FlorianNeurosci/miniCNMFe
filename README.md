@@ -1,4 +1,4 @@
-# Disclaimer: This pipeline is an experiment and written almost exclusively by an AI agent. It is still under construction and the documentation so far has been written by AI. The results have been validated against Caiman and on synthetic data, so the results seem to be correct. Use it under your own risk and assess results for plausibility. If you find errors please raise an issue so that they can be fixed! Enjoy and stay tuned for changes :)
+# Disclaimer: This pipeline is an experiment and written almost exclusively by an AI agent under human supervision. It is still under construction and the documentation so far has been written by AI. The results have been validated against Caiman and on synthetic data. However, use it under your own risk and assess results for plausibility. If you find errors please raise an issue so that they can be fixed! Enjoy and stay tuned for changes :)
 
 # minicnmfe
 
