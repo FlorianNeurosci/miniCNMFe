@@ -8,7 +8,7 @@ Apart from it being an experiment, the focus of this pipeline is on **automatic 
 
 > **The notebooks are the intended way to learn this pipeline.** Everything under
 > [`docs/`](docs/index.md) is AI-written and has not been reviewed line-by-line — treat it
-> as a convenience reference, not ground truth. The four numbered notebooks in
+> as a convenience reference, not ground truth. The notebooks in
 > [`demo_notebooks/`](demo_notebooks/) run end-to-end on generated demo movies and
 > validate their own output, so they are the reliable place to understand how to use the
 > pipeline. Read [Notebooks — start here](#notebooks--start-here) first.
@@ -62,6 +62,12 @@ pip install -e ".[dev]"          # test + tutorial + oasis + ruff
 
 ## Notebooks — start here
 
+**Just want to run miniCNMFe on your own recording?** Start with
+[`00_analyze_your_own_session.ipynb`](demo_notebooks/00_analyze_your_own_session.ipynb) — a
+copy-paste template that takes one session from raw AVIs to saved results. Set your paths,
+run it top to bottom. The numbered notebooks below teach each stage in depth on the bundled
+demo movies.
+
 The notebooks in [`demo_notebooks/`](demo_notebooks/) are the primary way to learn the
 pipeline. They run end-to-end on the reproducible simulated movies, so after a fresh clone
 you can execute them from top to bottom without any data of your own:
@@ -85,8 +91,10 @@ Then work through them **in order** — this is the real-data workflow: load & m
 
 ## Analyze your own data
 
-A miniscope session is typically a folder of sequentially numbered AVI files. The
-recommended path mirrors the notebook order — **motion-correct → tune → extract → refine**:
+The fastest route is the template notebook
+[`00_analyze_your_own_session.ipynb`](demo_notebooks/00_analyze_your_own_session.ipynb) —
+set your session path and run it top to bottom. Under the hood it follows the recommended
+path below, which mirrors the numbered notebooks — **motion-correct → tune → extract → refine**:
 
 1. **Load & motion-correct** (notebook 1) — concatenate the AVIs and run streaming rigid
    motion correction, producing a corrected `mc.zarr`. The fused
