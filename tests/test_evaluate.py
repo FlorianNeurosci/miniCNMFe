@@ -3,7 +3,14 @@
 import numpy as np
 import scipy.sparse as sp
 
-from minicnmfe.evaluate import auto_evaluate_components, spatial_r_values
+from minicnmfe.evaluate import (
+    auto_evaluate_components,
+    component_metrics,
+    compute_peak_snr,
+    compute_trace_skew,
+    footprint_morphology,
+    spatial_r_values,
+)
 
 
 def _disk_footprint(H: int, W: int, cy: int, cx: int,
@@ -125,3 +132,122 @@ class TestSpatialRValues:
         movie = np.zeros((H * W, 50), dtype=np.float32)
         r = spatial_r_values(A, C, movie, (H, W))
         assert np.isnan(r[0])
+
+
+def _make_traces(T=400, seed=0):
+    """A right-skewed transient trace + a symmetric-noise trace, with YrA noise."""
+    rng = np.random.default_rng(seed)
+    transient = np.clip(rng.standard_normal(T), 0, None)
+    transient[::25] += 6.0  # sparse positive spikes -> right-skewed, tall peaks
+    noise = rng.standard_normal(T)  # symmetric, no transients
+    C = np.stack([transient, np.zeros(T)])           # demixed
+    YrA = 0.2 * rng.standard_normal((2, T))          # residual ~ noise
+    YrA[1] = noise                                   # cell 1's "trace" is pure noise
+    return C, YrA
+
+
+class TestComputePeakSnr:
+    def test_transient_beats_noise(self):
+        C, YrA = _make_traces()
+        ps = compute_peak_snr(C, YrA)
+        assert ps[0] > ps[1]
+        assert ps[0] > 5.0          # a real transient towers over the noise floor
+        assert ps.shape == (2,)
+
+    def test_dead_trace_no_div_by_zero(self):
+        C = np.zeros((1, 100))
+        YrA = np.zeros((1, 100))    # degenerate noise floor
+        ps = compute_peak_snr(C, YrA)
+        assert ps.shape == (1,)
+        assert np.isfinite(ps[0]) and ps[0] == 0.0
+
+
+class TestComputeTraceSkew:
+    def test_right_skew_beats_symmetric(self):
+        C, YrA = _make_traces()
+        sk = compute_trace_skew(C, YrA)
+        assert sk[0] > sk[1]        # transient trace is right-skewed
+        assert sk[0] > 0.5
+        assert abs(sk[1]) < 0.5     # noise ~ symmetric
+
+
+class TestFootprintMorphology:
+    def _disk(self, H, W, cy, cx, r):
+        yy, xx = np.mgrid[0:H, 0:W]
+        return ((yy - cy) ** 2 + (xx - cx) ** 2 <= r ** 2).astype(np.float32).ravel()
+
+    def _line(self, H, W, cy, cx, length):
+        m = np.zeros((H, W), dtype=np.float32)
+        m[cy, cx:cx + length] = 1.0
+        return m.ravel()
+
+    def test_disk_compact_line_eccentric(self):
+        H = W = 40
+        disk = self._disk(H, W, 20, 20, 5.0)        # compact, round
+        line = self._line(H, W, 10, 5, 20)          # 1px-tall elongated streak
+        A = sp.csc_matrix(np.column_stack([disk, line]))
+        m = footprint_morphology(A, (H, W))
+        assert m["eccentricity"][0] < m["eccentricity"][1]
+        assert m["eccentricity"][1] > 0.9           # line is highly eccentric
+        assert m["solidity"][0] > 0.8               # disk ~ convex
+        assert m["aspect_ratio"][1] > m["aspect_ratio"][0]
+
+    def test_empty_is_nan(self):
+        H = W = 16
+        A = sp.csc_matrix((H * W, 1), dtype=np.float32)
+        m = footprint_morphology(A, (H, W))
+        for key in ("eccentricity", "solidity", "compactness", "aspect_ratio"):
+            assert np.isnan(m[key][0])
+
+
+class TestComponentMetrics:
+    EXPECTED_KEYS = {
+        "npix", "snr_amp", "r_value", "cn_corr",
+        "eccentricity", "solidity", "compactness", "aspect_ratio",
+        "peak_snr", "skew", "kurtosis", "cc_purity",
+        "autocorr_lag1", "max_amp", "mean_amp",
+    }
+
+    def _model_arrays(self, H=24, W=24, T=300, seed=1):
+        rng = np.random.default_rng(seed)
+        yy, xx = np.indices((H, W))
+        g = np.exp(-(((yy - 12) ** 2 + (xx - 12) ** 2) / (2 * 3.0 ** 2))).ravel()
+        g = g.astype(np.float32)
+        trace = np.clip(rng.standard_normal(T), 0, None)
+        trace[::20] += 5.0
+        movie = (np.outer(g, trace) + 0.1 * rng.standard_normal((H * W, T))).astype(np.float32)
+        A = sp.csc_matrix(g.reshape(-1, 1))
+        C = trace.reshape(1, -1).astype(np.float64)
+        YrA = (0.1 * rng.standard_normal((1, T))).astype(np.float64)
+        sn_flat = np.full(H * W, 0.1, dtype=np.float32)
+        return A, C, YrA, movie, sn_flat, (H, W)
+
+    def test_all_keys_present_with_movie(self):
+        A, C, YrA, movie, sn_flat, dims = self._model_arrays()
+        cn = np.zeros(dims, dtype=np.float32)
+        m = component_metrics(A, C, YrA, None, sn_flat, dims, movie=movie, cn=cn)
+        assert set(m.keys()) == self.EXPECTED_KEYS
+        for key, arr in m.items():
+            assert arr.shape == (1,), key
+        assert np.isfinite(m["r_value"][0])     # movie supplied
+        assert np.isfinite(m["cn_corr"][0])     # cn supplied
+
+    def test_movie_dependent_metrics_nan_without_movie(self):
+        A, C, YrA, _movie, sn_flat, dims = self._model_arrays()
+        m = component_metrics(A, C, YrA, None, sn_flat, dims, movie=None, cn=None)
+        assert set(m.keys()) == self.EXPECTED_KEYS
+        assert np.isnan(m["r_value"][0])
+        assert np.isnan(m["cn_corr"][0])
+        # Movie-free metrics still finite.
+        assert np.isfinite(m["peak_snr"][0])
+        assert np.isfinite(m["skew"][0])
+
+    def test_zero_components(self):
+        H = W = 16
+        A = sp.csc_matrix((H * W, 0), dtype=np.float32)
+        C = np.zeros((0, 50)); YrA = np.zeros((0, 50))
+        sn_flat = np.full(H * W, 0.1, dtype=np.float32)
+        m = component_metrics(A, C, YrA, None, sn_flat, (H, W))
+        assert set(m.keys()) == self.EXPECTED_KEYS
+        for arr in m.values():
+            assert arr.shape == (0,)
