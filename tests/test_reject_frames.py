@@ -111,3 +111,43 @@ def test_sidecar_persists_outliers(tmp_path):
         src, dest, k_mad=5.0, batch_t=32, verbose=False, skip_if_exists=True,
     )
     np.testing.assert_array_equal(outliers_2, outliers_1)
+
+
+def test_plan_replacement_splits_runs_and_guards_long_ones():
+    """Short runs may be interpolated; long ones must not be.
+
+    A linear blend across many frames moves every pixel together in a smooth ramp
+    — a globally correlated event, which is the artifact the rejection exists to
+    remove, only harder to spot, and it reads as a slow transient. Measured over
+    fifteen real recordings the longest run was 7 frames, so this guards a case
+    that does not arise routinely.
+    """
+    import numpy as np
+    from minicnmfe.reject_frames import plan_replacement
+
+    rng = np.random.default_rng(0)
+    means = rng.normal(10.0, 0.2, 400)
+    means[5] = 500.0            # 1-frame run
+    means[50:53] = 500.0        # 3-frame run
+    means[100:130] = 500.0      # 30-frame run
+
+    idx, run_id, interp_ok = plan_replacement(means, max_interp_run=10)
+    assert idx.size == 1 + 3 + 30
+    assert len(np.unique(run_id)) == 3
+    assert interp_ok[idx == 5][0]                       # short -> interpolate
+    assert interp_ok[idx == 51][0]
+    assert not interp_ok[idx == 115][0]                 # long  -> do not
+    assert int((~interp_ok).sum()) == 30
+
+
+def test_plan_replacement_degenerate_and_clean_inputs():
+    """A clean movie flags nothing; a zero-MAD movie does not divide by zero."""
+    import numpy as np
+    from minicnmfe.reject_frames import plan_replacement
+
+    rng = np.random.default_rng(1)
+    idx, _, _ = plan_replacement(rng.normal(10.0, 0.2, 300))
+    assert idx.size == 0, f"clean movie should flag nothing, flagged {idx.size}"
+
+    idx, _, _ = plan_replacement(np.full(100, 7.0))     # MAD == 0
+    assert idx.size == 0
