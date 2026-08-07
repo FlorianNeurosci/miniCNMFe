@@ -211,10 +211,37 @@ def _celllike_curve(img, thr_axis, a_min, a_max, min_solidity):
     return n_cell, largest_frac
 
 
+# Safe operating point used whenever a threshold search yields nothing usable —
+# either no cell-like blob was found at all, or the search peaked at the edge of
+# its axis (see _is_edge_solution). Conservative on purpose: over-pruning loses
+# cells, under-pruning shreds the field into thousands of noise fragments.
+SAFE_MIN_CORR = 0.8
+SAFE_MIN_PNR = 10.0
+
+
+def _is_edge_solution(idx: int, n_thr: int, edge_frac: float = 0.05) -> bool:
+    """True when a threshold search peaked in the first ``edge_frac`` of its axis.
+
+    An argmax that never moves off the bottom of the axis is not an optimum: the
+    objective was still rising at the most permissive threshold on offer, so the
+    returned value describes where the search had to stop, not the data. On
+    sparse, low-contrast fields (SOM/PV interneurons) every seed method does
+    this, and the resulting ``min_corr`` = ``corr_floor`` seed over-segments by
+    10-50x — 84-100% of SOM/PV sessions carried such a seed versus 0-14% of WT.
+
+    The band scales with the axis so a 30-point and a 60-point search agree on
+    what counts as the edge (first 2 and first 3 bins respectively).
+    """
+    import math
+
+    band = max(1, int(math.ceil(edge_frac * n_thr)))
+    return n_thr > band and int(idx) < band
+
+
 def suggest_corr_pnr(
     cn: np.ndarray, pnr: np.ndarray, sigma: float, *,
     corr_floor: float = 0.4, pnr_floor: float = 2.0, n_thr: int = 30,
-    min_solidity: float = 0.85,
+    min_solidity: float = 0.85, edge_frac: float = 0.05,
 ) -> "tuple[float, float, dict]":
     """``min_corr`` / ``min_pnr`` by image-threshold morphology.
 
@@ -225,6 +252,11 @@ def suggest_corr_pnr(
     threshold that maximises that count — most blobs visible = background gone, cells
     not yet lost. ``min_corr`` is read off the CORR image, ``min_pnr`` off the PNR
     image (independent, like the two sliders). Returns ``(min_corr, min_pnr, evidence)``.
+
+    A count curve that peaks at the bottom of its axis is reported as an edge
+    solution and replaced by the safe default — see :func:`_is_edge_solution`.
+    ``evidence["edge_corr"]`` / ``["edge_pnr"]`` record that, and
+    ``["min_corr_raw"]`` / ``["min_pnr_raw"]`` keep the un-substituted argmax.
     """
     import math
 
@@ -237,16 +269,28 @@ def suggest_corr_pnr(
     nc_corr, lf_corr = _celllike_curve(cn, corr_axis, a_min, a_max, min_solidity)
     nc_pnr, lf_pnr = _celllike_curve(pnr, pnr_axis, a_min, a_max, min_solidity)
 
-    # argmax ties -> lowest threshold (more permissive). Fall back to safe defaults
-    # when no cell-like blob is ever found (degenerate / empty image).
-    min_corr = float(corr_axis[int(np.argmax(nc_corr))]) if nc_corr.max() > 0 else 0.8
-    min_pnr = float(pnr_axis[int(np.argmax(nc_pnr))]) if nc_pnr.max() > 0 else 10.0
+    # argmax ties -> lowest threshold (more permissive).
+    i_corr, i_pnr = int(np.argmax(nc_corr)), int(np.argmax(nc_pnr))
+    found_corr, found_pnr = nc_corr.max() > 0, nc_pnr.max() > 0
+    min_corr_raw = float(corr_axis[i_corr]) if found_corr else None
+    min_pnr_raw = float(pnr_axis[i_pnr]) if found_pnr else None
+    edge_corr = found_corr and _is_edge_solution(i_corr, n_thr, edge_frac)
+    edge_pnr = found_pnr and _is_edge_solution(i_pnr, n_thr, edge_frac)
+
+    # Two ways for the search to come up empty-handed — no cell-like blob at any
+    # threshold, and a count curve that only ever falls — and one answer to both:
+    # the image carried no usable threshold, so don't pretend it did.
+    min_corr = SAFE_MIN_CORR if (not found_corr or edge_corr) else min_corr_raw
+    min_pnr = SAFE_MIN_PNR if (not found_pnr or edge_pnr) else min_pnr_raw
 
     evidence = {"cn": cn, "pnr": pnr, "sigma": float(sigma),
                 "corr_axis": corr_axis, "pnr_axis": pnr_axis,
                 "ncell_corr": nc_corr, "ncell_pnr": nc_pnr,
                 "largest_frac_corr": lf_corr, "largest_frac_pnr": lf_pnr,
                 "a_min": a_min, "a_max": a_max,
+                "edge_corr": bool(edge_corr), "edge_pnr": bool(edge_pnr),
+                "edge": bool(edge_corr or edge_pnr),
+                "min_corr_raw": min_corr_raw, "min_pnr_raw": min_pnr_raw,
                 "min_corr": min_corr, "min_pnr": min_pnr}
     return min_corr, min_pnr, evidence
 
@@ -301,14 +345,15 @@ def _separating_threshold(neuron_vals, bg_vals, thr_axis):
 def suggest_corr_pnr_separation(
     cn: np.ndarray, pnr: np.ndarray, sigma: float, *,
     corr_floor: float = 0.4, pnr_floor: float = 2.0, n_thr: int = 60,
-    min_blobs: int = 5,
+    min_blobs: int = 5, edge_frac: float = 0.05,
 ) -> "tuple[float, float, dict]":
     """``min_corr`` / ``min_pnr`` from neuron-vs-background separation (Youden's J).
 
     Detects neuron blobs on the CORR·PNR image and, for the CORR and PNR images
     independently, picks the threshold that best separates the values at neuron
     centres from the background (max Youden's J). Falls back to safe defaults when
-    too few neurons are detected. Returns ``(min_corr, min_pnr, evidence)``.
+    too few neurons are detected, or when J peaks at the edge of the axis (see
+    :func:`_is_edge_solution`). Returns ``(min_corr, min_pnr, evidence)``.
     """
     cn = np.asarray(cn, dtype=np.float64)
     pnr = np.asarray(pnr, dtype=np.float64)
@@ -316,19 +361,26 @@ def suggest_corr_pnr_separation(
     corr_axis = np.linspace(corr_floor, 0.95, n_thr)
     pnr_hi = float(np.percentile(pnr, 99.5))
     pnr_axis = np.linspace(pnr_floor, max(pnr_floor + 1.0, pnr_hi), n_thr)
+    min_corr_raw = min_pnr_raw = None
+    edge_corr = edge_pnr = False
     if len(rc) >= min_blobs and corr_bg.size and pnr_bg.size:
-        min_corr, j_corr = _separating_threshold(corr_neuron, corr_bg, corr_axis)
-        min_pnr, j_pnr = _separating_threshold(pnr_neuron, pnr_bg, pnr_axis)
-        min_corr = float(max(corr_floor, min_corr))
-        min_pnr = float(max(pnr_floor, min_pnr))
+        min_corr_raw, j_corr = _separating_threshold(corr_neuron, corr_bg, corr_axis)
+        min_pnr_raw, j_pnr = _separating_threshold(pnr_neuron, pnr_bg, pnr_axis)
+        edge_corr = _is_edge_solution(int(np.argmax(j_corr)), n_thr, edge_frac)
+        edge_pnr = _is_edge_solution(int(np.argmax(j_pnr)), n_thr, edge_frac)
+        min_corr = SAFE_MIN_CORR if edge_corr else float(max(corr_floor, min_corr_raw))
+        min_pnr = SAFE_MIN_PNR if edge_pnr else float(max(pnr_floor, min_pnr_raw))
     else:
-        min_corr, min_pnr = 0.8, 10.0
+        min_corr, min_pnr = SAFE_MIN_CORR, SAFE_MIN_PNR
         j_corr = j_pnr = np.zeros(n_thr)
     evidence = {"cn": cn, "pnr": pnr, "sigma": float(sigma), "blob_rc": rc,
                 "n_blobs": int(len(rc)), "corr_neuron": corr_neuron,
                 "pnr_neuron": pnr_neuron, "corr_bg": corr_bg, "pnr_bg": pnr_bg,
                 "thr_axis_corr": corr_axis, "thr_axis_pnr": pnr_axis,
                 "j_corr": j_corr, "j_pnr": j_pnr,
+                "edge_corr": bool(edge_corr), "edge_pnr": bool(edge_pnr),
+                "edge": bool(edge_corr or edge_pnr),
+                "min_corr_raw": min_corr_raw, "min_pnr_raw": min_pnr_raw,
                 "min_corr": min_corr, "min_pnr": min_pnr}
     return min_corr, min_pnr, evidence
 
@@ -342,20 +394,31 @@ def suggest_corr_pnr_percentile(
     detected neuron-blob centres**.
 
     A simple, robust operating point: keep ~``(100-pct)%`` of detected neurons.
-    Falls back to safe defaults when too few neurons are detected. Returns
+    Falls back to safe defaults when too few neurons are detected, or when the
+    percentile lands on (or below) the floor — the blob values are then so low
+    that the floor, not the data, is setting the threshold. Returns
     ``(min_corr, min_pnr, evidence)``.
     """
     cn = np.asarray(cn, dtype=np.float64)
     pnr = np.asarray(pnr, dtype=np.float64)
     rc, corr_neuron, pnr_neuron, _, _ = _neuron_bg_values(cn, pnr, sigma)
+    min_corr_raw = min_pnr_raw = None
+    edge_corr = edge_pnr = False
     if len(rc) >= min_blobs:
-        min_corr = float(max(corr_floor, np.percentile(corr_neuron, pct)))
-        min_pnr = float(max(pnr_floor, np.percentile(pnr_neuron, pct)))
+        min_corr_raw = float(np.percentile(corr_neuron, pct))
+        min_pnr_raw = float(np.percentile(pnr_neuron, pct))
+        edge_corr = min_corr_raw <= corr_floor
+        edge_pnr = min_pnr_raw <= pnr_floor
+        min_corr = SAFE_MIN_CORR if edge_corr else min_corr_raw
+        min_pnr = SAFE_MIN_PNR if edge_pnr else min_pnr_raw
     else:
-        min_corr, min_pnr = 0.8, 10.0
+        min_corr, min_pnr = SAFE_MIN_CORR, SAFE_MIN_PNR
     evidence = {"cn": cn, "pnr": pnr, "sigma": float(sigma), "blob_rc": rc,
                 "n_blobs": int(len(rc)), "corr_neuron": corr_neuron,
                 "pnr_neuron": pnr_neuron, "pct": float(pct),
+                "edge_corr": bool(edge_corr), "edge_pnr": bool(edge_pnr),
+                "edge": bool(edge_corr or edge_pnr),
+                "min_corr_raw": min_corr_raw, "min_pnr_raw": min_pnr_raw,
                 "min_corr": min_corr, "min_pnr": min_pnr}
     return min_corr, min_pnr, evidence
 

@@ -1075,9 +1075,15 @@ class TestCNMFePipeline:
         """
         import dataclasses
 
+        # seed_method="threshold" on purpose: this test is about the ACCEPTANCE
+        # gate, and it needs ghosts to reject. Loose min_corr/min_pnr manufacture
+        # them under threshold seeding (~26 components for 6 neurons). Mixture
+        # seeding ignores those thresholds and extracts only the 6 real neurons,
+        # leaving the gate nothing to flag — a better extraction, but it would
+        # silently void this test.
         params = CNMFeParams(
             sigma=3.0, min_corr=0.7, min_pnr=3.0,
-            n_iter_main=2, n_iter_temporal=2,
+            n_iter_main=2, n_iter_temporal=2, seed_method="threshold",
         )
         model = CNMFe(params).fit(synth["movie"], do_motion_correction=False)
         K = model.A.shape[1]

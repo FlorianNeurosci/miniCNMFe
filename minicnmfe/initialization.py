@@ -264,6 +264,50 @@ def _local_cn_pnr_box(
 # Greedy initialization
 # ---------------------------------------------------------------------------
 
+
+def mixture_seeds(cn: np.ndarray, pnr: np.ndarray, sigma: float,
+                  smooth_factor: float = 0.7) -> np.ndarray:
+    """Seed pixels as local maxima of a smoothed CORR-PNR, split by a 2-component fit.
+
+    Self-calibrating alternative to the ``min_corr``/``min_pnr`` gate. The CORR image
+    carries pixel-scale speckle that the PNR image does not, so the product is first
+    smoothed at the cell scale; ``blob_log`` on the unsmoothed product finds ~1000
+    noise maxima on a dim field. Local maxima (not thresholded components) keep the
+    seed count scaling with cell density: a global threshold either fuses a dense
+    field into one blob or reveals only its brightest few cells.
+
+    The mixture is fitted in LOG space because peak heights are multiplicative and
+    heavy-tailed; fitting raw heights splits a unimodal tail at its knee, which gave
+    1 seed on a dim PV session and far too few on a dense WT one.
+
+    Returns ``(N, 2)`` (row, col) seed pixels.
+    """
+    from scipy.ndimage import gaussian_filter
+    from sklearn.mixture import GaussianMixture
+
+    prod = gaussian_filter((cn * pnr).astype(np.float64), smooth_factor * float(sigma))
+    pk = peak_local_max(prod, min_distance=max(1, int(round(float(sigma)))))
+    if len(pk) < 8:
+        return pk
+    h = prod[pk[:, 0], pk[:, 1]]
+    ok = h > 0
+    if ok.sum() < 8:
+        return pk[ok]
+    x = np.log(h[ok]).reshape(-1, 1)
+    gm = GaussianMixture(2, random_state=0, n_init=5).fit(x)
+    hi = int(np.argmax(gm.means_.ravel()))
+    sel = pk[np.flatnonzero(ok)[gm.predict(x) == hi]]
+    # Degenerate-fit guard. A heavy tail can leave the "high" component holding a
+    # handful of extreme peaks (observed: 1 seed on a dim PV session when the fit
+    # ran in raw space), and seeding an extraction with one point is worse than any
+    # threshold. Fall back to the brightest decile, which is never catastrophic.
+    if len(sel) < max(3, int(0.01 * len(pk))):
+        n_keep = max(3, int(round(0.10 * len(pk))))
+        order = np.argsort(-prod[pk[:, 0], pk[:, 1]])
+        return pk[order[:n_keep]]
+    return sel
+
+
 def greedy_corr_pnr(
     movie: "zarr.Array | np.ndarray",
     sigma: float,
@@ -282,6 +326,8 @@ def greedy_corr_pnr(
     corrpnr_stride: int = 1,
     g_prior: float | None = None,
     g_prior_weight: float = 0.5,
+    seed_mode: str = "threshold",
+    seed_points: "np.ndarray | None" = None,
 ) -> tuple[sp.csc_matrix, np.ndarray, np.ndarray, np.ndarray]:
     """Find initial neurons using a greedy CORR-PNR strategy.
 
@@ -405,8 +451,27 @@ def greedy_corr_pnr(
     gSiz = patch_radius
 
     # ----- CaImAn-style search state -----
+    # `gate` marks pixels that may NOT be seeds. Normally that is the
+    # min_corr/min_pnr threshold; in "mixture" mode it is everything that is not a
+    # selected local maximum, so the two hand-set thresholds stop gating seeding.
+    if seed_mode == "mixture":
+        # seed_points is supplied by the patched driver, which fits the mixture ONCE
+        # on the whole FOV. Fitting it per patch is wrong: a 48x48 tile holds too few
+        # local maxima for a two-population fit, so every tile invents a "high"
+        # component and over-seeds (patched K=14 vs global K=8 on an 8-neuron synthetic).
+        seed_pts = mixture_seeds(cn, pnr, sigma) if seed_points is None else np.asarray(seed_points)
+        gate = np.ones(cn.shape, dtype=bool)
+        if len(seed_pts):
+            inb = ((seed_pts[:, 0] >= 0) & (seed_pts[:, 0] < cn.shape[0])
+                   & (seed_pts[:, 1] >= 0) & (seed_pts[:, 1] < cn.shape[1]))
+            seed_pts = seed_pts[inb]
+        if len(seed_pts):
+            gate[seed_pts[:, 0], seed_pts[:, 1]] = False
+    else:
+        gate = (cn < min_corr) | (pnr < min_pnr)
+
     v_search = (cn * pnr).astype(np.float32)
-    v_search[(cn < min_corr) | (pnr < min_pnr)] = 0.0
+    v_search[gate] = 0.0
     # ind_search: persistent (H, W) bitmask of pixels that won't be tried as
     # seeds. Initialised from sub-threshold v_search and the border mask;
     # accepted neurons add their `ai > ai.max()/2` support each iteration
@@ -418,7 +483,8 @@ def greedy_corr_pnr(
         ind_search[:, :border_px] = True
         ind_search[:, -border_px:] = True
 
-    min_v_search = float(min_corr) * float(min_pnr)
+    # in mixture mode the seed set is already chosen, so no product floor applies
+    min_v_search = 0.0 if seed_mode == "mixture" else float(min_corr) * float(min_pnr)
 
     A_cols: list[sp.csc_matrix] = []
     C_list: list[np.ndarray] = []
@@ -433,7 +499,7 @@ def greedy_corr_pnr(
         # peak_local_max we want a fresh scan after multiple accepts have
         # reshaped v_search; we don't break-and-rebuild per accept.
         score = v_search.copy()
-        score[ind_search | (cn < min_corr) | (pnr < min_pnr)] = 0.0
+        score[ind_search | gate] = 0.0
         peaks = peak_local_max(
             score,
             min_distance=max(1, int(sigma)),
@@ -647,6 +713,8 @@ def _greedy_patch_worker(
     corrpnr_stride: int,
     g_prior: "float | None",
     g_prior_weight: float,
+    seed_mode: str = "threshold",
+    seed_points: "np.ndarray | None" = None,
 ) -> "tuple[sp.csc_matrix, np.ndarray, np.ndarray, np.ndarray]":
     """Run `greedy_corr_pnr` on ONE patch; remap footprints/centres to global.
 
@@ -679,6 +747,8 @@ def _greedy_patch_worker(
             corrpnr_stride=corrpnr_stride,
             g_prior=g_prior,
             g_prior_weight=g_prior_weight,
+            seed_mode=seed_mode,
+            seed_points=seed_points,
         )
 
     k = A_p.shape[1]
@@ -727,6 +797,7 @@ def greedy_corr_pnr_patched(
     corrpnr_stride: int = 1,
     g_prior: "float | None" = None,
     g_prior_weight: float = 0.5,
+    seed_mode: str = "threshold",
     patch_size: int = 64,
     patch_overlap: int = 16,
     n_jobs: int = 1,
@@ -755,6 +826,23 @@ def greedy_corr_pnr_patched(
     # CNMFeParams policy cap is applied in pipeline; this protects direct callers.
     n_jobs = _resolve_patch_workers(n_jobs, os.cpu_count() or 1, len(tiles))
 
+    # Mixture seeding is a GLOBAL decision: fit it once on the whole FOV and give each
+    # tile the seeds that fall inside it (in patch-local coordinates). Fitting per tile
+    # over-seeds badly, because a tile holds too few local maxima to separate two
+    # populations.
+    global_seeds = None
+    if seed_mode == "mixture":
+        from minicnmfe.preprocess import correlation_pnr
+        cn_g, pnr_g = correlation_pnr(movie, sigma=sigma, stride=corrpnr_stride)
+        global_seeds = mixture_seeds(cn_g, pnr_g, sigma)
+
+    def _tile_seeds(r0, c0, r1, c1):
+        if global_seeds is None or not len(global_seeds):
+            return None
+        m = ((global_seeds[:, 0] >= r0) & (global_seeds[:, 0] < r1)
+             & (global_seeds[:, 1] >= c0) & (global_seeds[:, 1] < c1))
+        return global_seeds[m] - np.array([r0, c0])
+
     results = Parallel(n_jobs=n_jobs)(
         delayed(_greedy_patch_worker)(
             np.ascontiguousarray(movie[:, r0:r1, c0:c1]),
@@ -762,6 +850,7 @@ def greedy_corr_pnr_patched(
             sigma, min_corr, min_pnr, min_pixel, ar_order,
             min_corr_neuron, max_corr_bg, seed_suppress_factor,
             circular_max_dist_factor, corrpnr_stride, g_prior, g_prior_weight,
+            seed_mode, _tile_seeds(r0, c0, r1, c1),
         )
         for (r0, r1, c0, c1) in tiles
     )
