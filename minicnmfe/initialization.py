@@ -101,6 +101,11 @@ def detect_seeds(
 ) -> np.ndarray:
     """Find candidate seed pixels as local maxima of cn × pnr.
 
+    DEPRECATED and UNUSED -- FLAGGED FOR REMOVAL. Nothing calls this: greedy_corr_pnr
+    has its own inline seeding. It also gates on ``min_corr``/``min_pnr``, which no
+    longer affect extraction under the default ``seed_method="mixture"``. Kept only
+    so external callers do not break; use ``mixture_seeds`` instead.
+
     Args:
         cn: (H, W) local correlation image.
         pnr: (H, W) peak-to-noise ratio image.

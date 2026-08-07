@@ -30,6 +30,12 @@ class TunerConfig:
     input_path: Path
     output_dir: Path
     mode: str = "both"          # 'heuristic' | 'sweep' | 'both'
+    # 'mixture' (default): the sweep varies sigma ONLY. min_corr/min_pnr no longer
+    # reach anything under mixture seeding -- see CNMFeParams.seed_method -- so
+    # searching them multiplies candidates for no effect.
+    # 'threshold' (LEGACY, flagged for removal): restores the 3-method threshold-seed
+    # expansion for runs pinned to the old seeding.
+    seed_method: str = "mixture"
     region: str = "cutout"      # 'cutout' | 'full'
     frame_rate_hz: float = 20.0
     decay_time_ms: float = 180.0
@@ -229,6 +235,12 @@ def run_tuning(cfg: TunerConfig) -> dict:
         # This is not something the sweep can be left to sort out on its own: on
         # sparse fields the floor candidate wins on score, and the resulting
         # extraction over-segments by 10-50x.
+        # Under mixture seeding the thresholds are inert (initialization.py: the gate
+        # is bypassed and min_v_search is forced to 0), so one seed per sigma is
+        # enough and the sweep searches sigma alone -- 2-4 candidates instead of 6-12.
+        # The threshold values are still computed and recorded, because the report
+        # shows them and an edge-collapse is worth seeing even when it changes nothing.
+        legacy_threshold_seeds = (cfg.seed_method == "threshold")
         thr_seeds = []
         seen = set()
         n_edge = 0
@@ -242,6 +254,8 @@ def run_tuning(cfg: TunerConfig) -> dict:
             }
             for name, (mc_, mp_, ev_) in methods_s.items():
                 n_edge += bool(ev_.get("edge"))
+                if not legacy_threshold_seeds and name != "morphology":
+                    continue          # sigma-only sweep: one seed per sigma
                 key_ = (round(float(s), 3), round(float(mc_), 3), round(float(mp_), 2))
                 if key_ in seen:
                     continue

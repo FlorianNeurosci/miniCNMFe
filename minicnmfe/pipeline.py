@@ -290,7 +290,14 @@ class CNMFeParams:
     # only -> no OOM), and nested parallelism (the tuning sweep sets this False
     # for its candidates, since loky can't nest and candidates already run in
     # parallel). Set False to force the bit-for-bit serial greedy.
-    seed_method: str = "mixture"       # 'mixture' (self-calibrating local-maxima seeds) | 'threshold' (legacy min_corr/min_pnr gate)
+    # 'mixture' (default): local maxima of a smoothed CORR*PNR, split by a
+    #   two-component fit -- self-calibrating, needs no thresholds.
+    # 'threshold': DEPRECATED, kept only to reproduce pre-2026-08 results.
+    #   FLAGGED FOR REMOVAL. When it goes, min_corr/min_pnr go with it: they have
+    #   no other effect on extraction (initialization.py -- the only runtime uses
+    #   are the gate and min_v_search, both bypassed under 'mixture'), and the
+    #   tuner machinery that searched for them can be deleted too.
+    seed_method: str = "mixture"
     init_patches: bool = True
     init_patch_size: "int | None" = None     # patch side px; None -> max(int(12*sigma), 48)
     init_patch_overlap: "int | None" = None  # overlap px; None -> int(4*sigma) (> patch_radius ~3*sigma)

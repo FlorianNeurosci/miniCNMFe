@@ -799,3 +799,29 @@ def test_seed_method_default_and_legacy_path_reachable():
     for fn in (greedy_corr_pnr, greedy_corr_pnr_patched, _greedy_patch_worker):
         p = inspect.signature(fn).parameters["seed_mode"]
         assert p.default == "threshold", f"{fn.__name__} default is {p.default!r}"
+
+
+def test_sweep_searches_sigma_only_by_default(sim_zarr, tmp_path):
+    """Default sweep varies sigma alone; the legacy setting restores threshold seeds.
+
+    min_corr/min_pnr have no runtime effect under mixture seeding, so expanding the
+    sweep by three threshold methods per sigma multiplies candidates for nothing.
+    """
+    from tuning.tuner import TunerConfig, run_tuning
+
+    common = dict(input_path=sim_zarr, frame_rate_hz=20.0, decay_time_ms=180.0,
+                  mode="sweep", region="full", n_init_frames=200, max_candidates=12)
+
+    res_mix = run_tuning(TunerConfig(output_dir=tmp_path / "mix", **common))
+    seeds_mix = res_mix["stages"]["thr_grid"]["seeds"]
+    n_sigma = len({round(s["sigma"], 3) for s in seeds_mix})
+    assert len(seeds_mix) == n_sigma, (
+        f"sigma-only sweep should give one seed per sigma, got {len(seeds_mix)} "
+        f"for {n_sigma} sigma value(s)"
+    )
+    assert {s["thr_method"] for s in seeds_mix} == {"morphology"}
+
+    res_leg = run_tuning(TunerConfig(output_dir=tmp_path / "leg",
+                                     seed_method="threshold", **common))
+    seeds_leg = res_leg["stages"]["thr_grid"]["seeds"]
+    assert len(seeds_leg) >= len(seeds_mix), "legacy path should not shrink the grid"

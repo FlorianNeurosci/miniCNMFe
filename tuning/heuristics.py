@@ -253,6 +253,11 @@ def suggest_corr_pnr(
     not yet lost. ``min_corr`` is read off the CORR image, ``min_pnr`` off the PNR
     image (independent, like the two sliders). Returns ``(min_corr, min_pnr, evidence)``.
 
+    NOTE: under the default ``seed_method="mixture"`` the returned thresholds no
+    longer reach the extraction -- they are computed for the report and for the
+    legacy threshold path only. This function (and its two siblings) is FLAGGED FOR
+    REMOVAL together with that path.
+
     A count curve that peaks at the bottom of its axis is reported as an edge
     solution and replaced by the safe default — see :func:`_is_edge_solution`.
     ``evidence["edge_corr"]`` / ``["edge_pnr"]`` record that, and
