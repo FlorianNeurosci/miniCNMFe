@@ -290,6 +290,7 @@ class CNMFeParams:
     # only -> no OOM), and nested parallelism (the tuning sweep sets this False
     # for its candidates, since loky can't nest and candidates already run in
     # parallel). Set False to force the bit-for-bit serial greedy.
+    seed_method: str = "mixture"       # 'mixture' (self-calibrating local-maxima seeds) | 'threshold' (legacy min_corr/min_pnr gate)
     init_patches: bool = True
     init_patch_size: "int | None" = None     # patch side px; None -> max(int(12*sigma), 48)
     init_patch_overlap: "int | None" = None  # overlap px; None -> int(4*sigma) (> patch_radius ~3*sigma)
@@ -1624,6 +1625,7 @@ class CNMFe:
                 merge_thr_corr=p.merge_thr_corr,
                 merge_thr_overlap=p.merge_thr_overlap,
                 merge_centre_dist_factor=p.merge_centre_dist_factor,
+                seed_mode=p.seed_method,
             )
         else:
             A, C_init, C_raw_init, centers = greedy_corr_pnr(
@@ -1644,6 +1646,7 @@ class CNMFe:
                 corrpnr_stride=corrpnr_stride,
                 g_prior=g_target,
                 g_prior_weight=p.g_prior_weight,
+                seed_mode=p.seed_method,
             )
         timer.add("greedy init", time.perf_counter() - _t)
         # NOTE: the strided init movie is freed below, after it is reused to

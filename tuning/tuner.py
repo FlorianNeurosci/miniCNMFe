@@ -220,29 +220,48 @@ def run_tuning(cfg: TunerConfig) -> dict:
         # sigma (the center-surround PSF width), so a threshold estimated at one sigma
         # under-/over-seeds at another. For each sigma we recompute CORR/PNR and run the
         # 3 methods; each (sigma, method) is a self-consistent COUPLED candidate seed
-        # (carrying its own sigma). The sweep scores them head-to-head — a method that
-        # collapses to the floor at some sigma just scores poorly and is dropped.
+        # (carrying its own sigma).
+        #
+        # A method whose search peaks at the bottom of its axis reports the safe
+        # default instead of the floor (tuning.heuristics._is_edge_solution) — such
+        # seeds are all identical, so the dedup below collapses them to a single
+        # conservative seed rather than filling the sweep with floor candidates.
+        # This is not something the sweep can be left to sort out on its own: on
+        # sparse fields the floor candidate wins on score, and the resulting
+        # extraction over-segments by 10-50x.
         thr_seeds = []
         seen = set()
+        n_edge = 0
         for s in sigma_grid:
             cn_s, pnr_s = correlation_pnr(np.ascontiguousarray(mc_sample),
                                           sigma=float(s), n_jobs=cfg.n_jobs)
             methods_s = {
-                "morphology": H.suggest_corr_pnr(cn_s, pnr_s, float(s))[:2],
-                "separation": H.suggest_corr_pnr_separation(cn_s, pnr_s, float(s))[:2],
-                "percentile": H.suggest_corr_pnr_percentile(cn_s, pnr_s, float(s))[:2],
+                "morphology": H.suggest_corr_pnr(cn_s, pnr_s, float(s)),
+                "separation": H.suggest_corr_pnr_separation(cn_s, pnr_s, float(s)),
+                "percentile": H.suggest_corr_pnr_percentile(cn_s, pnr_s, float(s)),
             }
-            for name, (mc_, mp_) in methods_s.items():
+            for name, (mc_, mp_, ev_) in methods_s.items():
+                n_edge += bool(ev_.get("edge"))
                 key_ = (round(float(s), 3), round(float(mc_), 3), round(float(mp_), 2))
                 if key_ in seen:
                     continue
                 seen.add(key_)
                 thr_seeds.append({"sigma": float(s), "min_corr": float(mc_),
-                                  "min_pnr": float(mp_), "thr_method": name})
+                                  "min_pnr": float(mp_), "thr_method": name,
+                                  "edge_corr": bool(ev_.get("edge_corr")),
+                                  "edge_pnr": bool(ev_.get("edge_pnr")),
+                                  "min_corr_raw": ev_.get("min_corr_raw"),
+                                  "min_pnr_raw": ev_.get("min_pnr_raw")})
+        n_methods = 3 * len(sigma_grid)
+        if n_edge:
+            print(f"  thr seeds: {n_edge}/{n_methods} method fits hit the axis edge "
+                  f"-> safe default ({H.SAFE_MIN_CORR}/{H.SAFE_MIN_PNR}); "
+                  f"{len(thr_seeds)} distinct seeds")
         # sigma + thresholds are carried by the seeds now (no separate sigma grid).
         sweep = replace(sweep, sigma=None, min_corr=None, min_pnr=None)
         stages["sigma_grid"] = {"values": sigma_grid, "heuristic": float(sigma_ds)}
         stages["thr_grid"] = {"seeds": thr_seeds,
+                              "n_edge": int(n_edge), "n_methods": int(n_methods),
                               "morphology": (float(min_corr), float(min_pnr))}
         rows, best_params, best_model = run_sweep(
             mc_path, base_grid, sweep, region_crop=region_crop,

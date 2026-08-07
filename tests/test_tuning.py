@@ -662,3 +662,140 @@ def test_per_cell_spatial_corr_and_score():
     # missing spatialcorr (NaN) contributes 0 (legacy behaviour), not a crash
     none = composite_score({**base, "spatialcorr_median": float("nan")})
     assert none == composite_score({**base})
+
+
+def test_edge_solution_detector_scales_with_axis_length():
+    """An argmax in the bottom bins of the axis is an edge solution, and the band
+    scales so a 30-point and a 60-point search agree on what "the edge" means."""
+    assert H._is_edge_solution(0, 30) and H._is_edge_solution(1, 30)
+    assert not H._is_edge_solution(2, 30)
+    assert H._is_edge_solution(2, 60) and not H._is_edge_solution(3, 60)
+    # a genuine interior optimum is never an edge solution
+    assert not H._is_edge_solution(15, 30)
+
+
+def test_morphology_collapsing_to_floor_falls_back_to_safe_default():
+    """A CORR image whose cell-like count only ever falls must not return the
+    floor: that is where the search stopped, not what the data says. This is the
+    SOM/PV failure mode — a min_corr=0.4 seed over-segments by 10-50x."""
+    from scipy.ndimage import gaussian_filter
+
+    rng = np.random.default_rng(0)
+    H_ = W_ = 120
+    # Sparse, low-contrast field: faint texture only, no compact high-CORR blobs.
+    # Squaring pushes most of the image well below the floor, so the few blobs that
+    # survive at the most permissive threshold only ever thin out from there — the
+    # cell-like count peaks at bin 0 and decays.
+    noise = gaussian_filter(rng.standard_normal((H_, W_)).astype(np.float32), 3.0)
+    noise = (noise - noise.min()) / np.ptp(noise)
+    cn_img = (0.6 * noise ** 2).astype(np.float32)
+    pnr_img = (2.0 + 4.0 * cn_img).astype(np.float32)
+
+    mc, mp, ev = H.suggest_corr_pnr(cn_img, pnr_img, sigma=3.0)
+    assert int(np.argmax(ev["ncell_corr"])) == 0 and ev["ncell_corr"].max() > 0
+    assert ev["edge_corr"], "count curve peaking at the axis bottom must be flagged"
+    assert mc == H.SAFE_MIN_CORR
+    assert mc > 0.4, "must not hand back the corr_floor"
+    # the un-substituted argmax is kept for the report
+    assert ev["min_corr_raw"] is not None and ev["min_corr_raw"] < mc
+
+
+def test_morphology_interior_optimum_is_not_flagged():
+    """The healthy case (compact blobs on haze) keeps its data-driven threshold."""
+    from scipy.ndimage import gaussian_filter
+
+    rng = np.random.default_rng(1)
+    H_ = W_ = 120
+    cells = np.zeros((H_, W_), np.float32)
+    for _ in range(15):
+        y, x = rng.integers(15, H_ - 15), rng.integers(15, W_ - 15)
+        cells[y, x] = 1.0
+    cells = gaussian_filter(cells, 3.0); cells /= cells.max()
+    haze = gaussian_filter(rng.standard_normal((H_, W_)).astype(np.float32), 15.0)
+    haze = 0.4 * (haze - haze.min()) / (np.ptp(haze) + 1e-8)
+    cn_img = np.clip(cells + haze, 0, 1).astype(np.float32)
+    pnr_img = (2 + 18 * cn_img).astype(np.float32)
+
+    mc, mp, ev = H.suggest_corr_pnr(cn_img, pnr_img, sigma=3.0)
+    assert not ev["edge_corr"]
+    assert mc == ev["min_corr_raw"], "interior optimum must be returned unchanged"
+
+
+def test_percentile_and_separation_flag_floor_solutions():
+    """Methods B and C report an edge when the floor, not the data, sets the
+    threshold — previously they silently clamped to it."""
+    flat = np.zeros((64, 64), np.float32)
+    for fn in (H.suggest_corr_pnr_separation, H.suggest_corr_pnr_percentile):
+        mc, mp, ev = fn(flat, flat, sigma=3.0)
+        # too few blobs -> safe default, and the evidence dict still carries the keys
+        assert mc == H.SAFE_MIN_CORR and mp == H.SAFE_MIN_PNR
+        assert "edge" in ev and "min_corr_raw" in ev
+
+
+def test_mixture_seeds_scales_with_cell_density():
+    """Local maxima + a log-space mixture must track how many cells there are.
+
+    A global threshold cannot: on a dense field it fuses everything into one blob,
+    on a sparse one it only reveals the brightest few. That asymmetry is why the
+    thresholded-component detector returned ~25 blobs on a WT field holding ~300.
+    """
+    from scipy.ndimage import gaussian_filter
+    from minicnmfe.initialization import mixture_seeds
+
+    rng = np.random.default_rng(0)
+    H_ = W_ = 128
+    sigma = 3.0
+
+    def field(n_cells):
+        cn = np.abs(gaussian_filter(rng.standard_normal((H_, W_)).astype(np.float32), 1.0))
+        cn = 0.25 * cn / (cn.std() + 1e-8)
+        pos = rng.integers(12, H_ - 12, size=(n_cells, 2))
+        cells = np.zeros((H_, W_), np.float32)
+        for y, x in pos:
+            cells[y, x] = 1.0
+        cells = gaussian_filter(cells, sigma)
+        cells = 3.0 * cells / (cells.max() + 1e-8)
+        return np.clip(cn + cells, 0, None), np.full((H_, W_), 8.0, np.float32)
+
+    sparse = len(mixture_seeds(*field(8), sigma))
+    dense = len(mixture_seeds(*field(80), sigma))
+    assert dense > sparse, f"seed count must grow with density (sparse={sparse}, dense={dense})"
+    assert sparse >= 3, f"sparse field should still yield seeds, got {sparse}"
+
+
+def test_mixture_seeds_degenerate_fit_falls_back():
+    """One dominating peak must not collapse the seed set.
+
+    Fitting raw (not log) heights on a dim PV session put a single extreme peak in
+    the 'high' component and returned ONE seed — seeding an extraction with one
+    point is worse than any threshold, so the guard returns the brightest decile.
+    """
+    from minicnmfe.initialization import mixture_seeds
+
+    H_ = W_ = 96
+    sigma = 2.0
+    cn = np.full((H_, W_), 0.05, np.float32)
+    rng = np.random.default_rng(1)
+    for y in range(6, H_ - 6, 7):          # a regular lattice of weak maxima
+        for x in range(6, W_ - 6, 7):
+            cn[y, x] = 0.06 + 0.01 * rng.random()
+    cn[48, 48] = 50.0                       # one dominating peak
+    out = mixture_seeds(cn, np.full((H_, W_), 5.0, np.float32), sigma)
+    assert len(out) >= 3, f"degenerate fit must not collapse the seed set, got {len(out)}"
+
+
+def test_seed_method_default_and_legacy_path_reachable():
+    """Mixture seeding is the default; the legacy threshold gate stays reachable.
+
+    The function-level defaults stay "threshold" so any direct caller of the
+    initialization functions keeps its old behaviour; only the pipeline-level
+    CNMFeParams default moves."""
+    import inspect
+    from minicnmfe.initialization import (greedy_corr_pnr, greedy_corr_pnr_patched,
+                                          _greedy_patch_worker)
+
+    assert CNMFeParams().seed_method == "mixture"
+    assert CNMFeParams(seed_method="threshold").seed_method == "threshold"
+    for fn in (greedy_corr_pnr, greedy_corr_pnr_patched, _greedy_patch_worker):
+        p = inspect.signature(fn).parameters["seed_mode"]
+        assert p.default == "threshold", f"{fn.__name__} default is {p.default!r}"
