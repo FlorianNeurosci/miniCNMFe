@@ -87,6 +87,63 @@ def _numeric_key(path: Path) -> int:
     return int(m.group()) if m else -1
 
 
+_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}[_:-]\d{2}[_:-]\d{2}")
+
+
+def _timestamp_key(path: Path) -> "str | None":
+    """Sort key: the ISO-ish timestamp in the filename, or None if absent.
+
+    The FFV1 acquisition names its files ``ffv1<ISO timestamp>.avi``; ISO
+    timestamps sort chronologically as plain strings.
+    """
+    m = _TIMESTAMP_RE.search(path.stem)
+    return m.group() if m else None
+
+
+def discover_avis(folder: "str | Path", pattern: str = "*.avi") -> "list[Path]":
+    """AVIs in ``folder``, in concatenation order.
+
+    Three layouts are recognised, in priority order:
+
+    1. **Numbered chunks** (``0.avi, 1.avi, ... 10.avi``) — ordered by the
+       integer in the stem, so ``10`` follows ``9``. Any non-numeric names are
+       ignored when numeric ones exist.
+    2. **Timestamped files** (the FFV1 acquisition's
+       ``ffv1<ISO timestamp>.avi``) — ordered by that timestamp.
+    3. **A single file**, whatever it is called — one file has only one order.
+
+    Concatenating chunks in the wrong order silently corrupts the movie, so a
+    set that fits none of these raises rather than guessing.
+
+    Raises:
+        FileNotFoundError: no file matches ``pattern`` in ``folder``.
+        ValueError: several files with no derivable order.
+    """
+    folder = Path(folder)
+    candidates = sorted(folder.glob(pattern))
+    if not candidates:
+        raise FileNotFoundError(
+            f"No AVI files ({pattern}) found in {folder}"
+        )
+
+    numeric = [p for p in candidates if _numeric_key(p) >= 0]
+    if numeric:
+        return sorted(numeric, key=_numeric_key)
+
+    stamped = [p for p in candidates if _timestamp_key(p) is not None]
+    if len(stamped) == len(candidates):
+        return sorted(candidates, key=_timestamp_key)
+
+    if len(candidates) == 1:
+        return candidates
+
+    raise ValueError(
+        f"Cannot order the {len(candidates)} AVI files in {folder}: expected "
+        f"numbered chunks (0.avi, 1.avi, ...) or timestamped names, got "
+        f"{[p.name for p in candidates[:5]]}"
+    )
+
+
 def _spatial_bin(frame: np.ndarray, ssub: int) -> np.ndarray:
     """Block-mean a single (H, W) frame by ``ssub`` -> (H//ssub, W//ssub) float32.
 
