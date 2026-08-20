@@ -1238,12 +1238,18 @@ class CNMFe:
             # anyway, so streaming-to-zarr would only add disk IO. Use
             # fit_mc(zarr, output_dir=...) directly when the input is too big.
             movie_arr = np.asarray(movie, dtype=np.float32)
+            # Forward the same MC settings fit_mc uses — `fit` is documented as
+            # a thin wrapper over it, so any field it silently dropped would make
+            # fit() and the staged path disagree (converge_tol did exactly that
+            # once it stopped defaulting to None).
             movie_arr, self.shifts = motion_correction_rigid(
                 movie_arr,
                 max_shift=p.max_shift,
                 gSig_filt=p.mc_gSig_filt,
                 upsample_factor=p.upsample_factor,
                 niter_rig=p.mc_n_iter,
+                converge_tol=p.mc_converge_tol,
+                sharpen_template=p.mc_sharpen_template,
                 batch_size=p.mc_batch_size,
                 n_jobs=p.n_jobs,
                 template_max_frames=p.mc_template_max_frames,
