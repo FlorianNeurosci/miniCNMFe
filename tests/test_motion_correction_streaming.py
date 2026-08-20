@@ -289,8 +289,11 @@ class TestFitMcTemplate:
     """``CNMFe.fit_mc`` can take a precomputed template / build one from a window."""
 
     def _params(self):
+        # mc_converge_tol pinned to None: these tests compare fit_mc against a
+        # direct motion_correction_rigid call with a fixed niter_rig, so the
+        # early-stop (on by default) must be off on both sides.
         return CNMFeParams(max_shift=(6, 6), upsample_factor=10, mc_gSig_filt=3,
-                           mc_n_iter=2, n_jobs=1)
+                           mc_n_iter=2, mc_converge_tol=None, n_jobs=1)
 
     def test_fit_mc_template_matches_direct_call(self, tmp_path):
         movie, _ = _make_movie(T=30, H=48, W=48, seed=6)

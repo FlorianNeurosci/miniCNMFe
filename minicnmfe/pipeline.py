@@ -227,6 +227,135 @@ def _fit_global_bg_rank1(
 
     return bf, f
 
+def _fit_global_bg_rank(
+    Y_flat,
+    A: "sp.csc_matrix",
+    C: np.ndarray,
+    W_mat: "sp.csr_matrix",
+    b0: np.ndarray,
+    rank: int,
+    Bf: "np.ndarray | None" = None,
+    F: "np.ndarray | None" = None,
+    n_iter: int = 2,
+    n_outer: int = 3,
+) -> "tuple[np.ndarray, np.ndarray]":
+    """Rank-``r`` global background ``B_f · F`` — the rank-1 fit, generalised.
+
+    Returns ``(B_f, F)``. For ``r == 1`` these keep the historical **1-D**
+    shapes ``(H*W,)`` and ``(T,)`` so ``model.b_f`` / ``model.f`` and every
+    existing consumer are untouched; for ``r >= 2`` they are ``(H*W, r)`` and
+    ``(r, T)``. ``BackgroundSubtractor`` accepts either.
+
+    ``rank == 1`` delegates to :func:`_fit_global_bg_rank1` with exactly its
+    original arguments, so that path is unchanged bit-for-bit.
+
+    For ``r > 1`` this is block coordinate descent: each component is fitted by
+    the unchanged rank-1 routine while the others are held fixed. The held-fixed
+    components are folded into the ``A C`` term that routine already subtracts —
+    legitimate because both enter the residual
+
+        R = (I − W)(Y − b0) − A C − B_f F
+
+    the same way, outside ``(I − W)`` — so component ``j`` is always fitted
+    against the properly deflated residual.
+
+    Two details make the extra components meaningful rather than duplicates of
+    the first:
+
+    * **Seeding.** The rank-1 routine's cold-start init ignores the deflation,
+      so every component would otherwise start from the same global-mean drift
+      and converge back onto component 0. New components are instead seeded with
+      a deterministic pseudo-random temporal vector orthogonalised against the
+      components already fitted; the alternating LS that follows is then a power
+      iteration on the deflated residual and converges to the leading *remaining*
+      mode.
+    * **Re-orthogonalisation.** After each sweep the factorisation is rotated to
+      an orthonormal spatial basis (QR on ``B_f``, then a small SVD). The product
+      ``B_f F`` is unchanged; the components stay linearly independent instead of
+      drifting together, which keeps each subsequent per-component fit
+      well-conditioned.
+    """
+    n_pix = int(Y_flat.shape[0])
+    T = int(Y_flat.shape[1])
+    rank = int(rank)
+
+    if rank <= 1:
+        bf0 = None if Bf is None else np.asarray(Bf, dtype=np.float32).reshape(
+            n_pix, -1)[:, 0]
+        f0 = None if F is None else np.asarray(F, dtype=np.float32).reshape(
+            -1, T)[0]
+        return _fit_global_bg_rank1(
+            Y_flat, A, C, W_mat, b0, bf=bf0, f=f0, n_iter=n_iter,
+        )
+
+    A_csc = A.tocsc() if sp.issparse(A) else sp.csc_matrix(A)
+
+    if Bf is None or F is None:
+        Bf_w = np.zeros((n_pix, rank), dtype=np.float32)
+        F_w = np.zeros((rank, T), dtype=np.float32)
+    else:
+        Bf_w = np.asarray(Bf, dtype=np.float32).reshape(n_pix, -1).copy()
+        F_w = np.asarray(F, dtype=np.float32).reshape(-1, T).copy()
+        have = min(Bf_w.shape[1], F_w.shape[0], rank)
+        Bf_new = np.zeros((n_pix, rank), dtype=np.float32)
+        F_new = np.zeros((rank, T), dtype=np.float32)
+        Bf_new[:, :have] = Bf_w[:, :have]
+        F_new[:have] = F_w[:have]
+        Bf_w, F_w = Bf_new, F_new
+
+    rng = np.random.default_rng(0)
+
+    def _seed(j: int) -> np.ndarray:
+        """Deterministic temporal seed for component ``j``, orthogonal to the rest."""
+        v = rng.standard_normal(T).astype(np.float32)
+        for i in range(rank):
+            if i == j or not np.any(F_w[i]):
+                continue
+            fi = F_w[i]
+            v -= fi * (float(v @ fi) / max(float(fi @ fi), 1e-10))
+        v -= v.mean()
+        nrm = float(np.linalg.norm(v))
+        return v / nrm if nrm > 0 else v
+
+    for sweep in range(int(n_outer)):
+        for j in range(rank):
+            others = [i for i in range(rank) if i != j and np.any(F_w[i])]
+            if others:
+                A_aug = sp.hstack(
+                    [A_csc, sp.csc_matrix(Bf_w[:, others])], format="csc",
+                )
+                C_aug = np.vstack([C, F_w[others]])
+            else:
+                A_aug, C_aug = A_csc, C
+
+            if np.any(F_w[j]):
+                bf_in, f_in = Bf_w[:, j], F_w[j]
+            elif j == 0:
+                bf_in, f_in = None, None          # component 0: the usual init
+            else:
+                # Seeded power iteration on the deflated residual. bf is derived
+                # from f by the routine's first update, so only f needs seeding;
+                # a unit bf placeholder keeps it out of the cold-start branch.
+                f_in = _seed(j)
+                bf_in = np.ones(n_pix, dtype=np.float32)
+
+            bf_j, f_j = _fit_global_bg_rank1(
+                Y_flat, A_aug, C_aug, W_mat, b0,
+                bf=bf_in, f=f_in, n_iter=n_iter,
+            )
+            Bf_w[:, j], F_w[j] = bf_j, f_j
+
+        # Rotate to an orthonormal spatial basis; B_f F is preserved exactly.
+        keep = np.linalg.norm(Bf_w, axis=0) > 0
+        if keep.sum() > 1:
+            Q, Rm = np.linalg.qr(Bf_w[:, keep])
+            U, S, Vt = np.linalg.svd(Rm @ F_w[keep], full_matrices=False)
+            Bf_w[:, keep] = (Q @ U * S).astype(np.float32)
+            F_w[keep] = Vt.astype(np.float32)
+
+    return Bf_w, F_w
+
+
 if TYPE_CHECKING:
     import zarr
 
@@ -249,8 +378,17 @@ class CNMFeParams:
     # --- Motion correction ---
     max_shift: tuple[int, int] = (20, 20)
     upsample_factor: int = 10
-    mc_n_iter: int = 1                 # number of rigid MC passes (max passes when mc_converge_tol is set)
-    mc_converge_tol: "float | None" = None  # if set (e.g. 0.01), stop MC passes early once template sharpness gain falls below it (GT-free convergence; mc_n_iter is then just the cap)
+    # Iterate motion correction to convergence by default. A single pass builds
+    # its template from UNCORRECTED frames, so the template is smeared by the very
+    # motion it is measuring and every estimated shift is biased toward zero —
+    # measured on a real PICAST session as a systematic ~16% under-correction
+    # (corr(residual, applied) = +0.93, residual up to 0.8 px in the cell-dense
+    # region). Rebuilding the template from the corrected movie removes that bias.
+    # `mc_n_iter` is now the CAP and `mc_converge_tol` stops early once the
+    # per-pass template sharpness gain plateaus, so typical recordings cost only
+    # 2-4 passes. Set mc_n_iter=1, mc_converge_tol=None for the legacy behaviour.
+    mc_n_iter: int = 10                # max rigid MC passes (cap; converge_tol stops earlier)
+    mc_converge_tol: "float | None" = 0.005  # stop once the per-pass template sharpness gain falls below this (GT-free convergence). None = always run mc_n_iter passes.
     mc_sharpen_template: bool = True   # build the MC template by aligning the in-RAM frame sample (recovers full drift amplitude even at mc_n_iter=1, ~one-pass cost on long movies); False = legacy smeared-median template
     mc_gSig_filt: float | None = None  # 1p high-pass sigma; set ≈ sigma to enable
     mc_batch_size: int = 200           # frames per streaming/parallel batch in MC
@@ -319,13 +457,18 @@ class CNMFeParams:
     # unconstrained ridge LS (i.e. False). Negligible cost (one extra RHS in
     # the same per-pixel solve).
     ring_constrain_sum: bool = False
-    # [NON-STANDARD] Add a rank-1 temporal background ``b_f · f(t)`` on top of
-    # the ring (CNMF-style ``nb=1``). Captures *spatially-non-uniform* slow
+    # [NON-STANDARD] Add a rank-``r`` temporal background ``B_f · F`` on top of
+    # the ring (CNMF-style ``nb=r``). Captures *spatially-non-uniform* slow
     # drift (vignetting-coupled photobleaching, scope warmup) that the ring
     # cannot — the constrained ring only cancels spatially-uniform modes.
     # ``0`` = standard CNMF-E (ring only). ``1`` = one rank-1 term, fit via
-    # alternating non-negative LS in each BCD iteration. Higher ranks are
-    # deferred — ``1`` covers the typical bleach pattern.
+    # alternating LS in each BCD iteration — enough for the typical bleach
+    # pattern. ``>= 2`` adds further components by block coordinate descent
+    # (see ``_fit_global_bg_rank``); needed when the background *changes shape*
+    # rather than just amplitude — e.g. a head-mounted scope whose illumination
+    # gradient shifts across the tissue as the animal moves, which one global
+    # term cannot represent. Costs one extra pass over ``Y_flat`` per component
+    # per sweep. ``model.b_f`` is then ``(H*W, r)`` and ``model.f`` is ``(r, T)``.
     global_bg_rank: int = 0
 
     # --- Spatial update ---
@@ -1095,12 +1238,18 @@ class CNMFe:
             # anyway, so streaming-to-zarr would only add disk IO. Use
             # fit_mc(zarr, output_dir=...) directly when the input is too big.
             movie_arr = np.asarray(movie, dtype=np.float32)
+            # Forward the same MC settings fit_mc uses — `fit` is documented as
+            # a thin wrapper over it, so any field it silently dropped would make
+            # fit() and the staged path disagree (converge_tol did exactly that
+            # once it stopped defaulting to None).
             movie_arr, self.shifts = motion_correction_rigid(
                 movie_arr,
                 max_shift=p.max_shift,
                 gSig_filt=p.mc_gSig_filt,
                 upsample_factor=p.upsample_factor,
                 niter_rig=p.mc_n_iter,
+                converge_tol=p.mc_converge_tol,
+                sharpen_template=p.mc_sharpen_template,
                 batch_size=p.mc_batch_size,
                 n_jobs=p.n_jobs,
                 template_max_frames=p.mc_template_max_frames,
@@ -1835,16 +1984,19 @@ class CNMFe:
         )
         timer.add("compute_W", time.perf_counter() - _t)
 
-        # --- Step 5b: Rank-1 global background bf · f(t) (opt-in, NON-STANDARD) ---
+        # --- Step 5b: Rank-r global background B_f · F (opt-in, NON-STANDARD) ---
         bf: np.ndarray | None = None
         f_bg: np.ndarray | None = None
-        if p.global_bg_rank == 1:
-            print("Fitting rank-1 global background b_f · f(t) (initial)...")
+        if p.global_bg_rank >= 1:
+            print(f"Fitting rank-{p.global_bg_rank} global background "
+                  f"B_f · F (initial)...")
             _t_gbg = time.perf_counter()
-            bf, f_bg = _fit_global_bg_rank1(
-                Y_flat, A, C, W_mat, b0, bf=None, f=None, n_iter=2,
+            bf, f_bg = _fit_global_bg_rank(
+                Y_flat, A, C, W_mat, b0, p.global_bg_rank,
+                Bf=None, F=None, n_iter=2,
             )
-            timer.add("global bg rank-1", time.perf_counter() - _t_gbg)
+            timer.add(f"global bg rank-{p.global_bg_rank}",
+                      time.perf_counter() - _t_gbg)
 
         def _cache_after_merge(members_per_group: list[np.ndarray]) -> None:
             """Update g_per_k / sn_per_k after merge_components reorders K."""
@@ -1983,12 +2135,13 @@ class CNMFe:
             )
             timer.add("compute_W (b0 refresh)", time.perf_counter() - _t)
 
-            # Refresh the rank-1 global background warm-started from the
-            # previous iteration's (bf, f). Two alternating-LS sweeps converge
-            # fast since A, C are nearly converged here.
-            if p.global_bg_rank == 1:
-                bf, f_bg = _fit_global_bg_rank1(
-                    Y_flat, A, C, W_mat, b0, bf=bf, f=f_bg, n_iter=2,
+            # Refresh the global background warm-started from the previous
+            # iteration's (B_f, F). Two alternating-LS sweeps converge fast
+            # since A, C are nearly converged here.
+            if p.global_bg_rank >= 1:
+                bf, f_bg = _fit_global_bg_rank(
+                    Y_flat, A, C, W_mat, b0, p.global_bg_rank,
+                    Bf=bf, F=f_bg, n_iter=2,
                 )
 
         # BCD ended with no surviving components — skip the final temporal
