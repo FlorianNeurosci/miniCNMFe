@@ -682,12 +682,13 @@ class BackgroundSubtractor:
         Y_flat: (H*W, T) source movie. numpy array or zarr.Array.
         W: (H*W, H*W) sparse ring weight matrix.
         b0: (H*W,) per-pixel baseline.
-        bf, f: NON-STANDARD CNMF-E. Optional rank-1 temporal background
-            ``b_f · f(t)``: ``bf`` is ``(H*W,)`` and ``f`` is ``(T,)``. When
-            both are provided, ``slice`` and ``project_onto`` subtract
-            ``bf[:, None] · f[None, :]`` (in the appropriate projection) so
-            downstream consumers see the residual with this rank-1 background
-            also removed. Use with ``CNMFeParams.global_bg_rank=1``.
+        bf, f: NON-STANDARD CNMF-E. Optional rank-``r`` temporal background
+            ``B_f · F``: ``bf`` is ``(H*W,)`` / ``(H*W, r)`` and ``f`` is
+            ``(T,)`` / ``(r, T)`` (1-D is treated as ``r = 1``). When both are
+            provided, ``slice`` and ``project_onto`` subtract ``bf @ f`` (in the
+            appropriate projection) so downstream consumers see the residual
+            with this global background also removed. Use with
+            ``CNMFeParams.global_bg_rank >= 1``.
     """
 
     def __init__(
@@ -705,8 +706,17 @@ class BackgroundSubtractor:
         self.dtype = np.dtype(np.float32)
         if (bf is None) != (f is None):
             raise ValueError("BackgroundSubtractor: pass both `bf` and `f`, or neither")
-        self.bf = None if bf is None else np.asarray(bf, dtype=np.float32)
-        self.f = None if f is None else np.asarray(f, dtype=np.float32)
+        # Stored 2-D — (H*W, r) and (r, T) — so every consumer is one matmul,
+        # whatever the rank. 1-D inputs (rank 1, incl. older saved models) are
+        # promoted here rather than special-cased at each use site.
+        self.bf = None if bf is None else np.asarray(
+            bf, dtype=np.float32).reshape(self.shape[0], -1)
+        self.f = None if f is None else np.asarray(
+            f, dtype=np.float32).reshape(-1, self.shape[1])
+        if self.bf is not None and self.bf.shape[1] != self.f.shape[0]:
+            raise ValueError(
+                f"BackgroundSubtractor: bf rank {self.bf.shape[1]} != "
+                f"f rank {self.f.shape[0]}")
 
     def slice(self, start: int, end: int) -> np.ndarray:
         """Return ``Y_bg[start:end, :]`` as a fresh ``(end-start, T)`` array.
@@ -747,8 +757,8 @@ class BackgroundSubtractor:
         out = Y_chunk - self.b0[start:end, None] - W_Y
         out += W_b0[:, None]
         if self.bf is not None:
-            # Rank-1 temporal background: subtract bf[start:end, None] * f[None, :].
-            out -= self.bf[start:end, None] * self.f[None, :]
+            # Global temporal background: subtract B_f[start:end] @ F.
+            out -= self.bf[start:end] @ self.f
         return out
 
     def slice_rows(self, rows: np.ndarray, tsub: int = 1) -> np.ndarray:
@@ -800,8 +810,8 @@ class BackgroundSubtractor:
         out = Y_chunk - self.b0[rows, None] - W_Y
         out += W_b0[:, None]
         if self.bf is not None:
-            f_eff = self.f[::tsub] if tsub > 1 else self.f
-            out -= self.bf[rows, None] * f_eff[None, :]
+            f_eff = self.f[:, ::tsub] if tsub > 1 else self.f
+            out -= self.bf[rows] @ f_eff
         return out
 
     def __getitem__(self, key) -> np.ndarray:
@@ -851,10 +861,10 @@ class BackgroundSubtractor:
             YA = _gemm_threaded(self.Y_flat, B, n_jobs)                 # (T, K)
             YA -= (self.b0 @ B).astype(np.float32)
             if self.bf is not None:
-                # (bf · f).T @ A = f[:, None] · (bf @ A)[None, :]   — rank-1 in (T, K).
-                # Use A (not B) here: the rank-1 term sits *outside* (I − W).
-                bfA = np.asarray(self.bf @ A_csr, dtype=np.float32)     # (K,)
-                YA -= self.f[:, None] * bfA[None, :]
+                # (B_f F).T @ A = F.T @ (B_f.T @ A)  — rank r in (T, K).
+                # Use A (not B) here: the global term sits *outside* (I − W).
+                bfA = np.asarray(A_csr.T @ self.bf, dtype=np.float32).T  # (r, K)
+                YA -= self.f.T @ bfA
             return YA
 
         # Zarr / streaming path: per-pixel batches (independent, summed).
