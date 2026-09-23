@@ -449,7 +449,8 @@ def concat_avis_to_zarr(
 
     Raises:
         FileNotFoundError: `folder` is not a directory.
-        ValueError: no matching numerically-named AVIs found, or spatial
+        FileNotFoundError: no AVIs found (see ``discover_avis``).
+        ValueError: AVIs with no derivable order, or spatial
             dimensions disagree across files, or unknown ``grayscale_method``.
         FileExistsError: output exists and `skip_if_exists` is False.
     """
@@ -482,14 +483,8 @@ def concat_avis_to_zarr(
             f"Delete it or pass skip_if_exists=True to reuse it."
         )
 
-    # --- Collect AVI files, sort numerically --------------------------------
-    candidates = sorted(folder.glob(pattern), key=_numeric_key)
-    avis = [p for p in candidates if _numeric_key(p) >= 0]
-    if not avis:
-        raise ValueError(
-            f"No numerically-named AVI files found in {folder} "
-            f"matching '{pattern}'. Expected files like 0.avi, 1.avi, ..."
-        )
+    # --- Collect AVI files in concatenation order ---------------------------
+    avis = discover_avis(folder, pattern)
 
     if verbose:
         print(f"Found {len(avis)} AVI files: "

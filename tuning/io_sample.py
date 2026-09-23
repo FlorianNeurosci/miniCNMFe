@@ -17,19 +17,16 @@ import numpy as np
 
 
 def list_avis(folder: "str | Path", pattern: str = "*.avi") -> list[Path]:
-    """Numerically-sorted list of ``0.avi, 1.avi, ...`` in ``folder``.
+    """AVIs in ``folder``, in concatenation order.
 
-    Reuses ``concat_avis_to_zarr._numeric_key`` so the ordering matches the
-    rest of the pipeline (and drops non-numerically-named files).
+    Delegates to ``concat_avis_to_zarr.discover_avis`` so the tuner sees exactly
+    the files (and the order) the rest of the pipeline will use: numeric names
+    first, then the single-file / timestamped layouts written by the FFV1
+    acquisition.
     """
-    from minicnmfe.concat_avis_to_zarr import _numeric_key
+    from minicnmfe.concat_avis_to_zarr import discover_avis
 
-    folder = Path(folder)
-    avis = sorted(folder.glob(pattern), key=_numeric_key)
-    avis = [p for p in avis if _numeric_key(p) >= 0]
-    if not avis:
-        raise FileNotFoundError(f"No numerically-named AVIs ({pattern}) in {folder}")
-    return avis
+    return discover_avis(folder, pattern)
 
 
 def decode_strided_sample(avi_paths, n_avis: int, stride: int) -> np.ndarray:

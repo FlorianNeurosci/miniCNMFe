@@ -248,3 +248,73 @@ class TestInlineDownsampling:
         with pytest.raises(ValueError, match="requires grayscale"):
             concat_avis_to_zarr(src, output_path=tmp_path / "ds.zarr",
                                 ssub=2, grayscale=False, verbose=False)
+
+
+# --- AVI discovery ---------------------------------------------------------
+
+def test_discover_avis_prefers_numeric_order(tmp_path):
+    """Chunked recordings: the integer in the name IS the order, and 10 must sort
+    after 9 (a plain lexicographic sort would put it after 1)."""
+    from minicnmfe.concat_avis_to_zarr import discover_avis
+
+    for i in (0, 1, 2, 9, 10):
+        (tmp_path / f"{i}.avi").touch()
+    (tmp_path / "notes.avi").touch()          # non-numeric: ignored when numerics exist
+    got = [p.name for p in discover_avis(tmp_path)]
+    assert got == ["0.avi", "1.avi", "2.avi", "9.avi", "10.avi"]
+
+
+def test_discover_avis_accepts_a_single_non_numeric_file(tmp_path):
+    """The FFV1 acquisition writes ONE timestamp-named file per recording folder.
+    Requiring numeric names made those recordings look empty, which silently
+    excluded whole animals from the pipeline. One file has only one order."""
+    from minicnmfe.concat_avis_to_zarr import discover_avis
+
+    f = tmp_path / "ffv12025-05-12T11_36_25.avi"
+    f.touch()
+    (tmp_path / "fn2025-05-12T11_36_25.csv").touch()      # sidecars must not confuse it
+    (tmp_path / "metada2025-05-12T11_36_25.csv").touch()
+    assert discover_avis(tmp_path) == [f]
+
+
+def test_discover_avis_orders_several_timestamped_files(tmp_path):
+    from minicnmfe.concat_avis_to_zarr import discover_avis
+
+    names = ["ffv12025-05-12T11_36_25.avi",
+             "ffv12025-05-12T09_02_00.avi",
+             "ffv12025-05-12T23_15_59.avi"]
+    for n in names:
+        (tmp_path / n).touch()
+    got = [p.name for p in discover_avis(tmp_path)]
+    assert got == sorted(names, key=lambda n: n.split("ffv1")[1])
+
+
+def test_discover_avis_refuses_to_guess_an_order(tmp_path):
+    """Concatenating chunks in the wrong order corrupts the movie without failing,
+    so an unorderable set must raise rather than pick something."""
+    from minicnmfe.concat_avis_to_zarr import discover_avis
+
+    for n in ("alpha.avi", "beta.avi"):
+        (tmp_path / n).touch()
+    with pytest.raises(ValueError, match="Cannot order"):
+        discover_avis(tmp_path)
+
+
+def test_discover_avis_reports_an_empty_folder(tmp_path):
+    from minicnmfe.concat_avis_to_zarr import discover_avis
+
+    with pytest.raises(FileNotFoundError):
+        discover_avis(tmp_path)
+
+
+def test_concat_reads_a_single_ffv1_named_file(tmp_path):
+    """The 2024 PV recordings are one ``ffv1<timestamp>.avi`` per session. The
+    minicnmfe_ds step calls concat_avis_to_zarr directly, so the discovery fix
+    has to reach it and not only the MC / tuner readers."""
+    src = tmp_path / "miniscope_video"
+    src.mkdir()
+    _write_synthetic_avi(src / "ffv12024-09-17T18_34_45.avi", T=20, H=32, W=32, seed=0)
+    (src / "fn2024-09-17T18_34_45.csv").touch()
+    z = concat_avis_to_zarr(src, output_path=tmp_path / "ds.zarr", ssub=2,
+                            dtype="float32", n_jobs=2, verbose=False)
+    assert z.shape == (20, 16, 16)

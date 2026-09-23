@@ -45,7 +45,7 @@ from minicnmfe.concat_avis_to_zarr import (
     _DECODER_DONE,
     _count_and_shape,
     _decode_avi_worker,
-    _numeric_key,
+    discover_avis,
 )
 
 
@@ -145,13 +145,7 @@ def concat_avis_to_mc_zarr(
         )
 
     # --- Discover AVIs ------------------------------------------------------
-    candidates = sorted(folder.glob(pattern), key=_numeric_key)
-    avis = [p for p in candidates if _numeric_key(p) >= 0]
-    if not avis:
-        raise ValueError(
-            f"No numerically-named AVI files found in {folder} "
-            f"matching '{pattern}'."
-        )
+    avis = discover_avis(folder, pattern)
     if verbose:
         print(f"Found {len(avis)} AVI files: "
               f"{avis[0].name} ... {avis[-1].name}")
