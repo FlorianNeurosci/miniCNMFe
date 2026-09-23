@@ -29,6 +29,55 @@ def list_avis(folder: "str | Path", pattern: str = "*.avi") -> list[Path]:
     return discover_avis(folder, pattern)
 
 
+# Files at least this long are sampled by seeking instead of decoding every frame.
+# Chunked miniscope recordings (0.avi, 1.avi, ...) are ~1000 frames per file and keep
+# the original full-decode path; the FFV1 acquisition writes ONE file per recording
+# (51k frames on the 2024 PV cohort), where "decode 8 files" meant decoding the whole
+# movie on one thread -- 316 s of a 462 s MC-tuning.
+_SEEK_MIN_FRAMES = 5000
+
+
+def _n_frames(path) -> int:
+    """Frame count from the container header (0 if the container does not say)."""
+    import av
+
+    with av.open(str(path)) as c:
+        return int(c.streams.video[0].frames or 0)
+
+
+def _decode_frames_at(path, frame_idx) -> list:
+    """Decode the frames at ``frame_idx`` (0-based, ascending) by seeking.
+
+    Seeks to the keyframe at or before each target and decodes forward to it, so
+    the returned frames are exactly those a full sequential decode would give at
+    those indices. Consecutive targets inside one GOP reuse the open decoder
+    instead of seeking again.
+    """
+    import av
+
+    out = []
+    with av.open(str(path)) as c:
+        stream = c.streams.video[0]
+        stream.thread_type = "FRAME"
+        start = int(stream.start_time or 0)
+        # pts per frame in the stream's time base (1 for the FFV1 files: tb = 1/fps)
+        step = float(1 / (stream.average_rate * stream.time_base))
+        frames = None
+        cur = None
+        for i in frame_idx:
+            target = start + int(round(i * step))
+            if cur is None or cur.pts > target or target - cur.pts > 16 * step:
+                c.seek(target, stream=stream, backward=True, any_frame=False)
+                frames = c.decode(stream)
+                cur = next(frames)
+            while cur.pts < target:
+                cur = next(frames)
+            if cur.pts != target:
+                raise ValueError(f"{path}: seek for frame {i} (pts {target}) landed on pts {cur.pts}")
+            out.append(cur.to_ndarray(format="gray8"))
+    return out
+
+
 def decode_strided_sample(avi_paths, n_avis: int, stride: int) -> np.ndarray:
     """Decode a strided sample of frames from a strided subset of AVIs into RAM.
 
@@ -36,6 +85,10 @@ def decode_strided_sample(avi_paths, n_avis: int, stride: int) -> np.ndarray:
     ``decode_strided_sample`` helper). Returns a ``(T_sample, H, W)`` float32
     stack — enough to build std / median projections and a shift histogram
     without touching a zarr.
+
+    Every ``stride``-th frame of each picked file is kept. Files of at least
+    ``_SEEK_MIN_FRAMES`` frames are read by seeking to those frames rather than
+    decoding all of them; the frames returned are the same either way.
     """
     import av
 
@@ -43,7 +96,12 @@ def decode_strided_sample(avi_paths, n_avis: int, stride: int) -> np.ndarray:
     picks = np.linspace(0, len(avi_paths) - 1, k).astype(int)
     pool = []
     for i in picks:
-        container = av.open(str(avi_paths[int(i)]))
+        path = avi_paths[int(i)]
+        n = _n_frames(path)
+        if n >= _SEEK_MIN_FRAMES:
+            pool.extend(_decode_frames_at(path, range(0, n, stride)))
+            continue
+        container = av.open(str(path))
         try:
             stream = container.streams.video[0]
             stream.thread_type = "FRAME"
@@ -64,12 +122,34 @@ def decode_contiguous_clip(avi_paths, n_frames: int, start_frac: float = 0.4) ->
     successive frames. Starts ``start_frac`` of the way through the recording
     (avoids LED-warmup at the very start) and spans consecutive AVIs until
     ``n_frames`` are collected. Returns a ``(T<=n_frames, H, W)`` float32 stack.
+
+    Chunked recordings start at the first frame of file ``int(start_frac * n_files)``.
+    When the files are long (``_SEEK_MIN_FRAMES`` or more) that rounds to file 0 for a
+    single-file recording -- i.e. the LED warm-up -- so the start is instead
+    ``start_frac`` of the total frame count, reached by seeking.
     """
     import av
 
-    start_avi = min(len(avi_paths) - 1, int(start_frac * len(avi_paths)))
+    counts = [_n_frames(p) for p in avi_paths]
+    if counts and min(counts) >= _SEEK_MIN_FRAMES:
+        g = int(start_frac * sum(counts))
+        start_avi = 0
+        while g >= counts[start_avi]:
+            g -= counts[start_avi]
+            start_avi += 1
+        first_local = g
+    else:
+        start_avi = min(len(avi_paths) - 1, int(start_frac * len(avi_paths)))
+        first_local = 0
     pool: list = []
     for p in avi_paths[start_avi:]:
+        if first_local:
+            want = min(n_frames - len(pool), counts[start_avi] - first_local)
+            pool.extend(_decode_frames_at(p, range(first_local, first_local + want)))
+            first_local = 0
+            if len(pool) >= n_frames:
+                break
+            continue
         container = av.open(str(p))
         try:
             stream = container.streams.video[0]
