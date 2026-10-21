@@ -509,7 +509,14 @@ def fit_spatial_correlation_model(all_corr: np.ndarray, *, em_iters: int = 100
     threshold = float(2.0 * thr_t - 1.0)
 
     # model cost = FP + FN + MSE (choose_best_model). Same-cell sits at high t.
-    idx = int(np.argmin(np.abs(psame_g - 0.5)))
+    # Measure FP/FN at the SAME boundary the model decides on (thr_t). P_same is
+    # not monotonic in t -- it is ~1 at the left edge, where the "different"
+    # density vanishes faster than the "same" one, so it dips below 0.5 and
+    # crosses back up. argmin|P_same - 0.5| can therefore land on that spurious
+    # left-edge crossing instead of the real one (the two are equally close to
+    # 0.5 to within ~1e-3), which reports FP ~= 1 for a perfectly good fit and
+    # makes choose_best_model discard it.
+    idx = int(np.searchsorted(grid_t, thr_t))
     fp = float(diff_g[idx:].sum() / (diff_g.sum() + 1e-12))
     fn = float(same_g[:idx].sum() / (same_g.sum() + 1e-12))
     edges = np.linspace(0, 1, 52)
@@ -590,8 +597,11 @@ def fit_centroid_distance_model(all_dist_px: np.ndarray, *,
     psame_g = same_g / (same_g + diff_g + 1e-12)
     thr_u = _threshold_from_psame(grid, psame_g, increasing=False)
 
-    # model cost = FP + FN + MSE. Same-cell sits at small distance.
-    idx = int(np.argmin(np.abs(psame_g - 0.5)))
+    # model cost = FP + FN + MSE. Same-cell sits at small distance. As in
+    # fit_spatial_correlation_model, measure at the decision boundary itself --
+    # argmin|P_same - 0.5| can pick a spurious crossing where P_same is
+    # non-monotonic, inflating FP for an otherwise sound fit.
+    idx = int(np.searchsorted(grid, thr_u))
     fp = float(diff_g[:idx].sum() / (diff_g.sum() + 1e-12))
     fn = float(same_g[idx:].sum() / (same_g.sum() + 1e-12))
     mse = float(np.mean((_centroid_F(centers, *popt) - hist) ** 2))

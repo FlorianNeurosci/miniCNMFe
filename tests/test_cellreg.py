@@ -8,7 +8,9 @@ import scipy.sparse as sp
 
 from minicnmfe.cellreg import (
     CellRegResult,
+    _betapdf,
     _load_session,
+    _lognpdf,
     _PairMetrics,
     align_sessions,
     choose_best_model,
@@ -579,3 +581,47 @@ def test_mismatched_dims_raises():
     with pytest.raises(ValueError):
         register_sessions([_make_model([(20, 20)], (40, 40)),
                            _make_model([(20, 20)], (50, 50))], align="none")
+
+
+def test_spatial_cost_is_measured_at_the_decision_boundary():
+    """P_same is not monotonic in t: it is ~1 at the left edge (where the
+    "different" density vanishes faster than the "same" one), dips below 0.5,
+    then crosses back up at the real boundary. Scoring the fit at
+    argmin|P_same - 0.5| can therefore land on that spurious left-edge crossing
+    -- the two sit equally close to 0.5, to within ~1e-3 -- and report FP ~= 1
+    for a perfectly sound model. choose_best_model then discards it in favour of
+    a degenerate centroid model, and register_sessions silently falls back to
+    threshold matching. FP/FN must be measured at the model's own threshold.
+    """
+    rng = np.random.default_rng(5)
+    # heavy, compressed "different" population near the left edge -- the regime
+    # that produces the second crossing (matches real 1p footprint correlations,
+    # which sit around -0.5 because near-empty footprints anti-correlate)
+    corr = np.concatenate([
+        np.clip(rng.normal(0.35, 0.30, 2000), -1, 1),      # same-cell
+        np.clip(rng.normal(-0.52, 0.25, 60000), -1, 1),    # different-cell
+    ])
+    m = fit_spatial_correlation_model(corr)
+    assert m is not None
+
+    # the precondition: P_same really is non-monotonic here, so scoring by
+    # argmin|P_same - 0.5| has two crossings to choose between
+    above = m.grid_psame >= 0.5
+    n_crossings = int(np.count_nonzero(above[:-1] != above[1:]))
+    assert n_crossings >= 2, f"expected non-monotonic P_same, got {n_crossings} crossing(s)"
+
+    # FP must be the "different" mass on the same-cell side of the threshold.
+    # Recomputed here from the fitted parameters, at the model's own threshold.
+    t = m.grid_corr                       # the model grids over t = (corr+1)/2
+    ln_g, be_g = _lognpdf(t, m.mu, m.sigma), _betapdf(t, m.p, m.q)
+    same_g = m.pi_same * ln_g if m.same_is_lognormal else (1 - m.pi_same) * be_g
+    diff_g = (1 - m.pi_same) * be_g if m.same_is_lognormal else m.pi_same * ln_g
+    idx = int(np.searchsorted(t, 0.5 * (m.threshold + 1.0)))
+    expected_fp = float(diff_g[idx:].sum() / diff_g.sum())
+    expected_fn = float(same_g[:idx].sum() / same_g.sum())
+
+    assert m.false_positive == pytest.approx(expected_fp, abs=1e-3)
+    assert m.false_negative == pytest.approx(expected_fn, abs=1e-3)
+    # and concretely: scoring at the wrong crossing reported FP ~= 0.995 here
+    assert m.false_positive < 0.5, (
+        f"FP={m.false_positive:.3f} -- scored at the spurious crossing")
