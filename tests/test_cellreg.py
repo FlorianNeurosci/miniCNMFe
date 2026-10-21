@@ -1,627 +1,404 @@
-"""Tests for cross-session cell registration (minicnmfe.cellreg)."""
+"""Tests for the CellReg port (minicnmfe.cellreg): positive controls with known answers."""
 
 from __future__ import annotations
+
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import scipy.sparse as sp
 
-from minicnmfe.cellreg import (
-    CellRegResult,
-    _betapdf,
-    _load_session,
-    _lognpdf,
-    _PairMetrics,
-    align_sessions,
-    choose_best_model,
-    cluster_cells_iterative,
-    compute_nn_nnn_distributions,
-    compute_registration_scores,
-    fit_cellreg_model,
-    fit_centroid_distance_model,
-    fit_psame_model,
-    fit_spatial_correlation_model,
-    register_sessions,
-)
-from minicnmfe.pipeline import CNMFe
+from minicnmfe import cellreg as cr
+
+H, W = 128, 140
 
 
-# ---------------------------------------------------------------------------
-# Synthetic footprint helpers
-# ---------------------------------------------------------------------------
-
-def _gaussian(dims, cy, cx, sigma):
-    H, W = dims
-    yy, xx = np.mgrid[0:H, 0:W]
-    g = np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2.0 * sigma ** 2))
-    g[g < 0.02] = 0.0
-    return g.astype(np.float32)
+def blob(cy, cx, sigma=1.8, dims=(H, W)):
+    yy, xx = np.mgrid[:dims[0], :dims[1]]
+    img = np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * sigma ** 2))
+    img[img < 0.05] = 0
+    return img
 
 
-def _make_A(centers, dims, sigma=3.0, rng=None, amp_noise=0.0):
-    H, W = dims
-    cols = []
-    for cy, cx in centers:
-        g = _gaussian(dims, cy, cx, sigma)
-        if amp_noise and rng is not None:
-            g = np.clip(g + rng.normal(0, amp_noise, g.shape).astype(np.float32), 0, None)
-        cols.append(g.ravel())
-    A = np.stack(cols, axis=1) if cols else np.zeros((H * W, 0), np.float32)
-    return sp.csc_matrix(A.astype(np.float32))
+def model_from(centres, dims=(H, W), sigma=1.8):
+    cols = [blob(cy, cx, sigma, dims).ravel() for cy, cx in centres]
+    A = sp.csc_matrix(np.stack(cols, axis=1)) if cols else sp.csc_matrix((dims[0] * dims[1], 0))
+    return SimpleNamespace(A=A, dims=dims, accepted_mask=None)
 
 
-def _make_model(centers, dims, sigma=3.0, rng=None, amp_noise=0.0, accepted_mask=None):
-    m = CNMFe()
-    m.A = _make_A(centers, dims, sigma, rng, amp_noise)
-    m.dims = dims
-    if accepted_mask is not None:
-        m.accepted_mask = np.asarray(accepted_mask, dtype=bool)
-    return m
-
-
-def _sample_centers(n, dims, min_dist, rng, existing=None, margin=12):
-    H, W = dims
-    pts = list(existing) if existing else []
-    base_len = len(pts)
-    tries = 0
-    while len(pts) - base_len < n and tries < 50000:
-        p = (float(rng.uniform(margin, H - margin)),
-             float(rng.uniform(margin, W - margin)))
-        if all(np.hypot(p[0] - q[0], p[1] - q[1]) >= min_dist for q in pts):
+def random_centres(rng, K, margin=14, min_sep=7.0):
+    pts = []
+    while len(pts) < K:
+        p = rng.uniform([margin, margin], [H - margin, W - margin])
+        if all(np.hypot(*(p - q)) >= min_sep for q in pts):
             pts.append(p)
-        tries += 1
-    return pts[base_len:]
+    return np.asarray(pts)
 
 
-# ---------------------------------------------------------------------------
-# Loading
-# ---------------------------------------------------------------------------
-
-def test_load_session_recovers_centroids():
-    dims = (64, 64)
-    centers = [(20, 20), (20, 45), (45, 30)]
-    sess = _load_session(_make_model(centers, dims))
-    assert sess.K == 3
-    # centroids land on the gaussian peaks (integer argmax)
-    for (cy, cx), got in zip(centers, sess.centroids):
-        assert abs(got[0] - cy) <= 1
-        assert abs(got[1] - cx) <= 1
+def rotate_pts(pts, theta, center):
+    t = np.deg2rad(theta)
+    y, x = pts[:, 0] - center[0], pts[:, 1] - center[1]
+    return np.column_stack([np.cos(t) * y + np.sin(t) * x + center[0],
+                            -np.sin(t) * y + np.cos(t) * x + center[1]])
 
 
-def test_accepted_only_filters_components():
-    dims = (64, 64)
-    centers = [(20, 20), (20, 45), (45, 30)]
-    m = _make_model(centers, dims, accepted_mask=[True, False, True])
-    sess = _load_session(m, accepted_only=True)
-    assert sess.K == 2
+# --------------------------------------------------------------------------- primitives
+
+def test_normxcorr2_matches_bruteforce():
+    rng = np.random.default_rng(0)
+    T = rng.random((5, 6))
+    A = rng.random((7, 8))
+    A[:3, :3] = 0                      # a constant region -> zero-variance windows
+    C = cr.normxcorr2(T, A)
+    Ht, Wt = T.shape
+    Ap = np.pad(A, ((Ht - 1, Ht - 1), (Wt - 1, Wt - 1)))
+    ref = np.zeros(C.shape)
+    for i in range(C.shape[0]):
+        for j in range(C.shape[1]):
+            w = Ap[i:i + Ht, j:j + Wt]
+            a, t = w - w.mean(), T - T.mean()
+            d = np.sqrt((a * a).sum() * (t * t).sum())
+            ref[i, j] = (a * t).sum() / d if d > 1e-12 else 0.0
+    np.testing.assert_allclose(C, ref, atol=1e-9)
 
 
-# ---------------------------------------------------------------------------
-# Alignment
-# ---------------------------------------------------------------------------
+def test_normxcorr2_peak_position_is_the_shift():
+    img = blob(40, 50, 3, (90, 100)) + blob(60, 30, 3, (90, 100))
+    moved = cr.transform_image(img, 0.0, (-5, 7), (0, 0))     # content moved by (+5, -7)
+    C = cr.normxcorr2(img, moved)
+    i, j = np.unravel_index(np.argmax(C), C.shape)
+    assert (i - (90 - 1), j - (100 - 1)) == (5, -7)
+
+
+def test_gaussfit_recovers_mean():
+    x = np.arange(-10, 11)
+    y = np.exp(-(x - 1.3) ** 2 / (2 * 2.0 ** 2))
+    sigma, mu = cr.gaussfit(x, y / y.sum(), 1.0, 0.0)
+    assert abs(mu - 1.3) < 0.02 and abs(sigma - 2.0) < 0.05
+
+
+def test_corr2_equals_pearson_over_whole_image():
+    a, b = blob(30.2, 40.7), blob(31.5, 42.0)
+    s = cr._load_session(model_from([(30.2, 40.7), (31.5, 42.0)]))
+    r = cr._corr2(*[s.rows()[k] for k in (0, 1)], H * W)
+    assert abs(r - np.corrcoef(a.ravel(), b.ravel())[0, 1]) < 1e-9
+
+
+def test_corr2_of_non_overlapping_footprints_is_near_zero():
+    s = cr._load_session(model_from([(30, 40), (30, 60)]))
+    r = cr._corr2(s.rows()[0], s.rows()[1], H * W)
+    assert -0.01 < r <= 0.0
+
+
+def test_centroids_are_subpixel():
+    pts = np.array([[30.3, 40.7], [70.6, 90.2], [100.0, 20.45]])
+    s = cr._load_session(model_from(pts))
+    c = cr.compute_centroids(s, 7.0)
+    np.testing.assert_allclose(c, pts, atol=0.1)
+
+
+# --------------------------------------------------------------------------- alignment
+
+def _sessions(pts_list):
+    S = [cr._load_session(model_from(p)) for p in pts_list]
+    for s in S:
+        s.centroids = cr.compute_centroids(s, 7.0)
+    return S
+
 
 def test_alignment_recovers_translation():
-    dims = (90, 90)
-    centers = [(20, 20), (20, 60), (55, 30), (60, 65), (40, 45)]
-    shift = (5, -4)  # (dy, dx) applied to make session 2
-    centers2 = [(cy + shift[0], cx + shift[1]) for cy, cx in centers]
-    m1 = _make_model(centers, dims)
-    m2 = _make_model(centers2, dims)
-
-    res = register_sessions([m1, m2], align="translation",
-                            max_distance_px=10, dist_thr_px=3, corr_thr=0.5)
-
-    # the recovered transform should undo the applied shift (magnitude match)
-    dy, dx, theta = res.transforms[1]
-    assert theta == 0.0
-    assert abs(abs(dy) - abs(shift[0])) <= 1.5
-    assert abs(abs(dx) - abs(shift[1])) <= 1.5
-
-    # aligned session-2 centroids land back on the base centers
-    for got in res.aligned_centroids[1]:
-        nearest = min(np.hypot(got[0] - cy, got[1] - cx) for cy, cx in centers)
-        assert nearest <= 1.5
-
-    # all five cells register across both sessions, correct correspondence
-    assert res.n_registered(2) == 5
-    both = res.cell_to_index_map[(res.cell_to_index_map >= 0).all(axis=1)]
-    assert np.array_equal(np.sort(both[:, 0]), np.sort(both[:, 1]))
-    for i, j in both:
-        assert i == j  # same construction order => identity correspondence
-
-
-# ---------------------------------------------------------------------------
-# Matching: drop / add / jitter / noise
-# ---------------------------------------------------------------------------
-
-def test_matching_precision_recall():
-    dims = (110, 110)
     rng = np.random.default_rng(1)
-    base = _sample_centers(20, dims, 14, rng)
-    n_keep = 17
-
-    m1 = _make_model(base, dims, rng=rng, amp_noise=0.02)
-
-    kept = [(cy + rng.normal(0, 0.7), cx + rng.normal(0, 0.7))
-            for cy, cx in base[:n_keep]]
-    added = _sample_centers(2, dims, 14, rng, existing=base)
-    centers2 = kept + added                          # 17 kept + 2 new
-    m2 = _make_model(centers2, dims, rng=rng, amp_noise=0.02)
-
-    res = register_sessions([m1, m2], align="none",
-                            max_distance_px=8, dist_thr_px=4, corr_thr=0.5)
-
-    cmap = res.cell_to_index_map
-    both = cmap[(cmap >= 0).all(axis=1)]
-    # correct = same construction index AND a kept cell
-    correct = sum(1 for i, j in both if i == j and i < n_keep)
-    wrong = sum(1 for i, j in both if not (i == j and i < n_keep))
-
-    assert correct >= 15            # recall >= 15/17
-    assert wrong == 0               # precision: no false matches
-    # added cells (session-2 idx >= n_keep) never matched
-    for row in cmap:
-        if row[1] >= n_keep:
-            assert row[0] == -1
+    pts = random_centres(rng, 60)
+    shift = np.array([6.4, -4.2])
+    keep = np.all((pts + shift > 3) & (pts + shift < [H - 3, W - 3]), axis=1)
+    S = _sessions([pts, pts[keep] + shift])
+    out, al = cr.align_sessions(S, reference=0, cell_px=7.0, rotations=False)
+    assert al.bad_sessions == []
+    np.testing.assert_allclose(al.shifts[1], shift, atol=0.3)
+    np.testing.assert_allclose(out[1].centroids, pts[keep], atol=0.3)
 
 
-# ---------------------------------------------------------------------------
-# Conflict resolution (one-to-one per session pair)
-# ---------------------------------------------------------------------------
-
-def test_conflict_resolution_one_to_one():
-    dims = (60, 60)
-    # two session-1 cells, both overlapping one session-2 cell (so both are
-    # genuine candidates) — the matcher must pick exactly one.
-    m1 = _make_model([(30, 29), (30, 33)], dims)
-    m2 = _make_model([(30, 31)], dims)
-
-    res = register_sessions([m1, m2], align="none",
-                            max_distance_px=10, dist_thr_px=10, corr_thr=-1.0)
-
-    cmap = res.cell_to_index_map
-    both = cmap[(cmap >= 0).all(axis=1)]
-    assert both.shape[0] == 1                 # the session-2 cell matches exactly one
-    assert res.n_global == 2                  # one pair + one singleton
-
-
-# ---------------------------------------------------------------------------
-# N=3 transitive clustering
-# ---------------------------------------------------------------------------
-
-def test_three_session_clustering():
-    dims = (96, 96)
+def test_alignment_recovers_rotation():
     rng = np.random.default_rng(2)
-    base = _sample_centers(8, dims, 16, rng)
-    models = [_make_model(base, dims) for _ in range(3)]
-
-    res = register_sessions(models, align="none",
-                            max_distance_px=6, dist_thr_px=3, corr_thr=0.6)
-
-    assert res.n_global == 8
-    assert res.n_registered(3) == 8
-    # every row is fully populated and consistent
-    assert (res.cell_to_index_map >= 0).all()
-
-
-# ---------------------------------------------------------------------------
-# CellReg NN/NNN candidate distributions
-# ---------------------------------------------------------------------------
-
-def test_nn_nnn_distributions_separate_same_from_different():
-    # a dense field shared across two sessions (small jitter) => the NN of each
-    # cell is its true match (high corr / small dist); the NNN are neighbours.
-    dims = (120, 120)
-    rng = np.random.default_rng(11)
-    base = _sample_centers(40, dims, 9, rng)
-    m1 = _make_model(base, dims, rng=rng, amp_noise=0.02)
-    jit = [(cy + rng.normal(0, 0.4), cx + rng.normal(0, 0.4)) for cy, cx in base]
-    m2 = _make_model(jit, dims, rng=rng, amp_noise=0.02)
-
-    loaded = [_load_session(m1), _load_session(m2)]
-    fps, cents, _ = align_sessions(loaded, mode="none")
-    nd = compute_nn_nnn_distributions(fps, cents, max_distance_px=10)
-
-    assert nd.nn_corr.size > 0 and nd.nnn_corr.size > 0
-    # same-cell candidates are more correlated and closer than different cells
-    assert nd.nn_corr.mean() > nd.nnn_corr.mean() + 0.3
-    assert nd.nn_dist.mean() < nd.nnn_dist.mean()
+    pts = random_centres(rng, 70)
+    center = (H / 2 - 1, W / 2 - 1)
+    rot = rotate_pts(pts, 4.0, center)
+    keep = np.all((rot > 3) & (rot < [H - 3, W - 3]), axis=1)
+    S = _sessions([pts, rot[keep]])
+    for fix in (False, True):
+        out, al = cr.align_sessions(S, reference=0, cell_px=7.0, rotations=True, maximal_rotation=8,
+                                    fix_upstream_slips=fix)
+        assert abs(al.rotations[1] + 4.0) < 0.3  # the correction undoes the +4 deg
+    # with one rotation centre (the fix) the cells land back on their positions; the
+    # source's swapped centre on this non-square field is absorbed only partly
+    np.testing.assert_allclose(out[1].centroids, pts[keep], atol=0.5)
 
 
-# ---------------------------------------------------------------------------
-# Probabilistic P_same model (Phase 2)
-# ---------------------------------------------------------------------------
+def _rotate_image_interp(img, theta, center):
+    """Literal rotate_image_interp.m + interpolate_pixel_value.m (1-based, no translation)."""
+    t = np.deg2rad(theta)
+    N, M = img.shape
+    Ti = np.linalg.inv(np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]]).T)
+    out = np.zeros(img.shape)
 
-def test_psame_model_separates_same_from_different():
-    pytest.importorskip("sklearn")
+    def at(r, c):
+        return img[r - 1, c - 1] if 1 <= r <= N and 1 <= c <= M else 0.0
+    for p in range(1, N + 1):
+        for q in range(1, M + 1):
+            w = Ti @ np.array([p - center[0], q - center[1]]) + np.array(center)
+            w[w < 0] = 0
+            y0, x0, y1, x1 = int(np.floor(w[0])), int(np.floor(w[1])), int(np.ceil(w[0])), int(np.ceil(w[1]))
+            a, b = w[1] - x0, w[0] - y0
+            out[p - 1, q - 1] = ((1 - a) * ((1 - b) * at(y0, x0) + b * at(y1, x0))
+                                 + a * ((1 - b) * at(y0, x1) + b * at(y1, x1)))
+    return out
+
+
+def test_rotation_centres_reproduce_the_source_on_a_non_square_field():
+    img = np.random.default_rng(7).random((30, 41))
+    c = (30 / 2, 41 / 2)                          # center_of_FOV = [Ny/2, Nx/2]
+    search, apply_src = cr.rotation_centers(img.shape, fix_upstream_slips=False)
+    # the search rotates the image as it is; the application rotates the transpose by -theta
+    np.testing.assert_allclose(cr.transform_image(img, 3.0, (0, 0), search),
+                               _rotate_image_interp(img, 3.0, c), atol=1e-12)
+    np.testing.assert_allclose(cr.transform_image(img, 3.0, (0, 0), apply_src),
+                               _rotate_image_interp(img.T, -3.0, c).T, atol=1e-12)
+    assert cr.rotation_centers(img.shape, fix_upstream_slips=True)[1] == search
+
+
+def test_unrelated_session_is_flagged():
     rng = np.random.default_rng(3)
-    n = 300
-    same_d = np.abs(rng.normal(1.0, 0.5, n))
-    same_c = np.clip(rng.normal(0.9, 0.04, n), 0, 1)
-    diff_d = rng.uniform(6, 10, n)
-    diff_c = np.clip(rng.normal(0.2, 0.1, n), 0, 1)
-
-    dist = np.concatenate([same_d, diff_d]).astype(np.float32)
-    corr = np.concatenate([same_c, diff_c]).astype(np.float32)
-    idx = np.zeros(len(dist), dtype=int)
-    metrics = _PairMetrics(i=idx, j=idx.copy(), dist=dist, corr=corr)
-
-    model = fit_psame_model([metrics], model="joint", max_distance_px=10)
-    assert model is not None
-    assert model.p_same(same_d, same_c).mean() > 0.8
-    assert model.p_same(diff_d, diff_c).mean() < 0.2
+    S = _sessions([random_centres(rng, 40), random_centres(np.random.default_rng(99), 40)])
+    _, al = cr.align_sessions(S, reference=0, cell_px=7.0, rotations=False)
+    assert al.bad_sessions == [1]
 
 
-def test_probabilistic_registration_end_to_end():
-    pytest.importorskip("sklearn")
-    # A dense field so the neighbour search captures both same-cell pairs and
-    # different-cell pairs — the P_same mixture needs both modes to fit.
-    dims = (120, 120)
-    rng = np.random.default_rng(7)
-    base = _sample_centers(40, dims, 9, rng)
-    n_keep = 34
+# --------------------------------------------------------------------------- all-pairs alignment
 
-    m1 = _make_model(base, dims, rng=rng, amp_noise=0.02)
-    kept = [(cy + rng.normal(0, 0.4), cx + rng.normal(0, 0.4))
-            for cy, cx in base[:n_keep]]
-    added = _sample_centers(4, dims, 9, rng, existing=base)
-    m2 = _make_model(kept + added, dims, rng=rng, amp_noise=0.02)
-
-    res = register_sessions([m1, m2], align="none",
-                            registration_approach="threshold", probabilistic=True,
-                            model="joint", max_distance_px=13, p_same_thr=0.5)
-
-    assert res.p_same_threshold == 0.5
-    cmap = res.cell_to_index_map
-    both = cmap[(cmap >= 0).all(axis=1)]
-    correct = sum(1 for i, j in both if i == j and i < n_keep)
-    wrong = sum(1 for i, j in both if not (i == j and i < n_keep))
-    assert correct >= 30
-    assert wrong == 0
+CENTER = (H / 2 - 1, W / 2 - 1)
 
 
-# ---------------------------------------------------------------------------
-# CellReg P_same models (lognormal+beta / lognormal+linear*sigmoid) + threshold
-# ---------------------------------------------------------------------------
+def _chain(n=5, per=50, step=18, seed=4):
+    """Sessions that see a sliding window of one cell population: neighbours share
+    (per - step) cells, sessions >= per/step apart share none. Session k's content is
+    the population rotated by angle[k] about CENTER and moved by shift[k]."""
+    rng = np.random.default_rng(seed)
+    pop = random_centres(rng, per + step * (n - 1), margin=18, min_sep=6.0)
+    angle = np.r_[0.0, rng.uniform(-3, 3, n - 1)]
+    shift = np.r_[[[0.0, 0.0]], rng.uniform(-6, 6, (n - 1, 2))]
+    pts = []
+    for k in range(n):
+        p = rotate_pts(pop[k * step:k * step + per], angle[k], CENTER) + shift[k]
+        pts.append(p[np.all((p > 4) & (p < [H - 4, W - 4]), axis=1)])
+    return pop, angle, shift, pts
 
-def test_spatial_correlation_model_threshold_between_clouds():
+
+def test_estimate_pair_equals_align_sessions():
+    rng = np.random.default_rng(2)
+    pts = random_centres(rng, 70)
+    rot = rotate_pts(pts, 4.0, CENTER) + [2.5, -3.0]
+    S = _sessions([pts, rot[np.all((rot > 3) & (rot < [H - 3, W - 3]), axis=1)]])
+    _, al = cr.align_sessions(S, reference=0, cell_px=7.0, maximal_rotation=8)
+    fp = [cr.footprints_projection(s) for s in S]
+    cp = [cr.centroids_projection(s.centroids, s.dims) for s in S]
+    e = cr.estimate_pair(fp[0], cp[0], fp[1], cp[1], S[1].centroids, S[0].dims, 7.0,
+                         maximal_rotation=8)
+    assert e.passed and al.bad_sessions == []
+    assert e.theta == al.rotations[1] and e.shift == tuple(al.shifts[1])
+
+
+def test_fit_recovers_transforms_and_drops_an_inconsistent_edge():
     rng = np.random.default_rng(5)
-    same = np.clip(rng.normal(0.85, 0.06, 600), -1, 1)      # same-cell: high corr
-    diff = np.clip(rng.normal(-0.6, 0.15, 6000), -1, 1)     # different: negative
-    model = fit_spatial_correlation_model(np.concatenate([same, diff]))
-    assert model is not None
-    # data-driven threshold sits between the two clouds
-    assert -0.6 < model.threshold < 0.85
-    # P_same is high for same-cell corr, low for different-cell corr
-    assert model.p_same_from_corr(same).mean() > 0.8
-    assert model.p_same_from_corr(diff).mean() < 0.2
+    n = 5
+    T = np.c_[np.r_[0.0, rng.uniform(-4, 4, n - 1)], np.r_[[[0.0, 0.0]], rng.uniform(-20, 20, (n - 1, 2))]]
+    pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    est = []
+    for i, j in pairs:                 # exact edges: T_j = compose(T_i, e)
+        t = T[j, 0] - T[i, 0]
+        est.append(np.r_[t, np.linalg.solve(cr._Q(T[i, 0]), T[j, 1:] - T[i, 1:])])
+    est = np.array(est)
+    bad = pairs.index((1, 4))
+    est[bad, 1] += 8.0
+    Tf, inlier, res, anchor = cr.fit_session_transforms(n, pairs, est, np.ones(len(pairs), bool),
+                                                        anchor=0)
+    assert anchor == 0 and not inlier[bad] and inlier.sum() == len(pairs) - 1
+    np.testing.assert_allclose(Tf, T, atol=1e-5)
 
 
-def test_centroid_distance_model_threshold_between_clouds():
-    rng = np.random.default_rng(6)
-    same = np.abs(rng.normal(0.0, 0.8, 600)) + 0.2          # same-cell: ~0-2 px
-    diff = rng.uniform(6, 12, 6000)                          # different: far
-    model = fit_centroid_distance_model(
-        np.concatenate([same, diff]), max_distance_px=12.0)
-    assert model is not None
-    assert 2.0 < model.threshold_px < 6.0
-    assert model.p_same_from_dist(same).mean() > 0.8
-    assert model.p_same_from_dist(diff).mean() < 0.2
+def test_all_pairs_places_sessions_that_fail_against_the_reference():
+    pop, angle, shift, pts = _chain()
+    S = _sessions(pts)
+    _, al_ref = cr.align_sessions(S, reference=0, cell_px=7.0, maximal_rotation=8)
+    assert {3, 4} <= set(al_ref.bad_sessions)          # no cells shared with session 0
+    al = cr.align_all_pairs(S, cell_size_px=7.0, maximal_rotation=8)
+    assert al.anchor == 0 and al.unplaced == []
+    k = len(S) - 1                     # warp_image: a spot at one cell of session k lands where
+    c = S[k].centroids[0]              # that cell sits in session 0's frame
+    back = al.warp_image(k, blob(*c, sigma=2.0))
+    yy, xx = np.mgrid[:H, :W]
+    w = np.where(back > 0.5 * back.max(), back, 0)
+    got = np.array([(yy * w).sum(), (xx * w).sum()]) / w.sum()
+    truth = rotate_pts((c - shift[k])[None], -angle[k], CENTER)[0]
+    assert np.hypot(*(got - truth)) < 0.3
+    for k in range(1, len(S)):
+        back = cr._forward_points(S[k].centroids, al.transforms[k, 0], al.transforms[k, 1:], CENTER)
+        truth = rotate_pts(S[k].centroids - shift[k], -angle[k], CENTER)
+        assert np.median(np.hypot(*(back - truth).T)) < 0.3, k
 
 
-def test_choose_best_model_picks_lower_cost():
-    rng = np.random.default_rng(8)
-    # correlation barely separates (broad, overlapping); distance separates cleanly
-    same_c = np.clip(rng.normal(0.3, 0.25, 600), -1, 1)
-    diff_c = np.clip(rng.normal(0.0, 0.25, 4000), -1, 1)
-    same_d = np.abs(rng.normal(0.0, 0.6, 600)) + 0.2
-    diff_d = rng.uniform(7, 12, 4000)
-
-    sm = fit_spatial_correlation_model(np.concatenate([same_c, diff_c]))
-    cm = fit_centroid_distance_model(np.concatenate([same_d, diff_d]),
-                                     max_distance_px=12.0)
-    assert sm is not None and cm is not None
-    # the cleanly-separating distance model should win on FP+FN+MSE cost
-    assert choose_best_model(sm, cm) == "centroid"
-    assert choose_best_model(sm, None) == "spatial"
-    assert choose_best_model(None, cm) == "centroid"
-    assert choose_best_model(None, None) is None
+def test_unrelated_session_is_unplaced_and_anchor_follows_the_largest_block():
+    _, _, _, pts = _chain(n=4)
+    rng = np.random.default_rng(99)
+    other = random_centres(rng, 45)
+    S = _sessions([other] + pts)                       # session 0 shares nothing
+    al = cr.align_all_pairs(S, cell_size_px=7.0, maximal_rotation=8)
+    assert al.anchor == 1 and al.unplaced == [0]
+    assert np.isnan(al.transforms[0]).all() and (al.transforms[1] == 0).all()
 
 
-def test_auto_picks_the_more_separable_feature():
-    rng = np.random.default_rng(9)
-    n_same, n_diff = 600, 4000
-
-    # Case A: distance separates cleanly, correlation overlaps -> auto: centroid
-    dist_a = np.concatenate([np.abs(rng.normal(0, 0.6, n_same)) + 0.2,
-                             rng.uniform(7, 12, n_diff)])
-    corr_a = np.concatenate([np.clip(rng.normal(0.4, 0.3, n_same), -1, 1),
-                             np.clip(rng.normal(0.2, 0.3, n_diff), -1, 1)])
-    m_a = fit_cellreg_model(dist_a, corr_a, feature="auto", max_distance_px=12.0)
-    assert m_a is not None and m_a.feature == "centroid"
-
-    # Case B: correlation separates cleanly, distance overlaps -> auto: spatial
-    dist_b = np.concatenate([rng.uniform(0, 6, n_same), rng.uniform(0, 6, n_diff)])
-    corr_b = np.concatenate([np.clip(rng.normal(0.85, 0.05, n_same), -1, 1),
-                             np.clip(rng.normal(-0.5, 0.1, n_diff), -1, 1)])
-    m_b = fit_cellreg_model(dist_b, corr_b, feature="auto", max_distance_px=12.0)
-    assert m_b is not None and m_b.feature == "spatial"
-
-
-def test_auto_registration_no_worse_than_fixed_features():
-    # end-to-end: auto should register at least as well as the worse fixed choice
-    dims = (120, 120)
-    rng = np.random.default_rng(7)
-    base = _sample_centers(40, dims, 9, rng)
-    n_keep = 34
-    m1 = _make_model(base, dims, rng=rng, amp_noise=0.02)
-    kept = [(cy + rng.normal(0, 0.4), cx + rng.normal(0, 0.4))
-            for cy, cx in base[:n_keep]]
-    added = _sample_centers(4, dims, 9, rng, existing=base)
-    m2 = _make_model(kept + added, dims, rng=rng, amp_noise=0.02)
-
-    def correct(feature):
-        res = register_sessions([m1, m2], align="none",
-                                registration_approach="probabilistic_model",
-                                psame_feature=feature, max_distance_px=13)
-        cmap = res.cell_to_index_map
-        both = cmap[(cmap >= 0).all(axis=1)]
-        c = sum(1 for i, j in both if i == j and i < n_keep)
-        w = sum(1 for i, j in both if not (i == j and i < n_keep))
-        return c, w, res.params["psame_feature"]
-
-    c_auto, w_auto, feat = correct("auto")
-    c_sp, _, _ = correct("spatial")
-    c_ce, _, _ = correct("centroid")
-    assert feat in ("spatial", "centroid")
-    assert w_auto == 0
-    assert c_auto >= min(c_sp, c_ce)        # never the worse choice
-    assert c_auto >= 30
+def test_register_with_all_pairs_alignment_groups_cells_by_identity():
+    rng = np.random.default_rng(11)
+    n, per, step = 5, 50, 15
+    pop = random_centres(rng, per + step * (n - 1), margin=18, min_sep=6.0)
+    angle = np.r_[0.0, rng.uniform(-2, 2, n - 1)]
+    shift = np.r_[[[0.0, 0.0]], rng.uniform(-5, 5, (n - 1, 2))]
+    models, truth = [], []
+    for k in range(n):
+        ids = np.arange(k * step, k * step + per)
+        p = rotate_pts(pop[ids], angle[k], CENTER) + shift[k] + rng.normal(0, 0.3, (per, 2))
+        ok = np.all((p > 4) & (p < [H - 4, W - 4]), axis=1)
+        models.append(model_from(p[ok]))
+        truth.append(ids[ok])
+    res = cr.register_sessions(models, cell_size_px=7.0, alignment="all_pairs", maximal_rotation=8)
+    assert res.bad_sessions == []
+    correct = _pairs(res.cell_to_index_map, truth)          # one entry per registered pair
+    n_true = sum(len(set(truth[a]) & set(truth[b])) for a in range(n) for b in range(a + 1, n))
+    assert correct.mean() >= 0.95 and correct.sum() >= 0.8 * n_true
+    # every cell of every session has exactly one global row
+    for s in range(n):
+        col = res.cell_to_index_map[:, s]
+        assert sorted(col[col >= 0]) == list(range(len(truth[s])))
 
 
-def test_default_uses_probabilistic_model():
-    # the package default (no registration_approach) is now the CellReg model
-    dims = (120, 120)
-    rng = np.random.default_rng(7)
-    base = _sample_centers(40, dims, 9, rng)
-    models = [_make_model([(cy + rng.normal(0, 0.4), cx + rng.normal(0, 0.4))
-                           for cy, cx in base], dims, rng=rng, amp_noise=0.02)
-              for _ in range(2)]
-    res = register_sessions(models, align="none", max_distance_px=13)
-    assert res.params["registration_approach"] == "probabilistic_model"
-    assert res.params["psame_feature"] in ("spatial", "centroid")
-    assert res.cell_scores is not None
+# --------------------------------------------------------------------------- models
+
+def test_choose_best_model_source_uses_the_correlation_index_for_both():
+    c = np.linspace(0.05, 0.95, 10)
+    mk = lambda f, ps, same, diff: cr.Model(f, c, ps, same, diff, same, 0.0, 0.5)
+    spatial = mk("spatial", np.r_[np.zeros(7), 0.5, 1, 1], np.r_[np.zeros(7), np.ones(3)],
+                 np.r_[np.ones(7), np.zeros(3)])                # P_same = 0.5 at index 7
+    centroid = mk("centroid", np.r_[1, 0.5, np.zeros(8)], np.r_[np.ones(2), np.zeros(8)],
+                  np.r_[np.zeros(2), np.ones(8)])               # P_same = 0.5 at index 1
+    cr.choose_best_model(centroid, spatial, fix_upstream_slips=True)
+    fp_fixed = centroid.false_positive
+    cr.choose_best_model(centroid, spatial, fix_upstream_slips=False)
+    ic = int(np.argmin(np.abs(0.5 - spatial.p_same)))
+    assert centroid.false_positive == pytest.approx(centroid.different[:ic + 1].sum() / centroid.different.sum())
+    assert centroid.false_positive > fp_fixed
 
 
-def test_probabilistic_model_registration_end_to_end():
-    # same dense field as the GMM test, but using the CellReg data-driven model
-    # (registration_approach="probabilistic_model") with NO hand-set corr_thr.
-    dims = (120, 120)
-    rng = np.random.default_rng(7)
-    base = _sample_centers(40, dims, 9, rng)
-    n_keep = 34
-    m1 = _make_model(base, dims, rng=rng, amp_noise=0.02)
-    kept = [(cy + rng.normal(0, 0.4), cx + rng.normal(0, 0.4))
-            for cy, cx in base[:n_keep]]
-    added = _sample_centers(4, dims, 9, rng, existing=base)
-    m2 = _make_model(kept + added, dims, rng=rng, amp_noise=0.02)
+def test_default_reproduces_the_source():
+    import inspect
+    for f in (cr.register_sessions, cr.align_sessions, cr.estimate_pair, cr.compute_centroids,
+              cr.fit_spatial_correlation_model, cr.fit_centroid_distance_model, cr.choose_best_model):
+        assert inspect.signature(f).parameters["fix_upstream_slips"].default is False, f.__name__
 
-    for feature in ("spatial", "centroid"):
-        res = register_sessions([m1, m2], align="none",
-                                registration_approach="probabilistic_model",
-                                psame_feature=feature, max_distance_px=13)
-        assert res.params["registration_approach"] == "probabilistic_model"
-        assert res.params["data_driven_threshold"] is not None
-        cmap = res.cell_to_index_map
-        both = cmap[(cmap >= 0).all(axis=1)]
-        correct = sum(1 for i, j in both if i == j and i < n_keep)
-        wrong = sum(1 for i, j in both if not (i == j and i < n_keep))
-        assert correct >= 30, (feature, correct)
-        assert wrong == 0, (feature, wrong)
+def test_centroid_model_psame_not_zero_at_zero_distance():
+    rng = np.random.default_rng(4)
+    same = rng.lognormal(np.log(1.0), 0.5, 3000)
+    diff = rng.uniform(0, 8, 6000)
+    d = np.concatenate([same, diff])
+    d = d[d < 8.0]
+    _, dc, _ = cr.number_of_bins(200, 5, 8.0)
+    m = cr.fit_centroid_distance_model(d, dc, 7.0)
+    assert m.p_same[0] == m.p_same[1] and m.p_same[0] > 0.5
+    assert m.lookup([0.0])[0] > 0.5
 
 
-# ---------------------------------------------------------------------------
-# Iterative joint clustering (Step 4)
-# ---------------------------------------------------------------------------
-
-class _StubModel:
-    """Distance-only P_same: ~1 when close, ~0 when far."""
-    feature = "centroid"
-
-    def p_same(self, dist, corr):
-        return (np.asarray(dist, dtype=float) < 4.0).astype(float)
-
-
-def _aligned(models):
-    loaded = [_load_session(m) for m in models]
-    return align_sessions(loaded, mode="none")
+def test_spatial_model_suppresses_low_correlations():
+    rng = np.random.default_rng(5)
+    same = 1 - rng.lognormal(np.log(0.15), 0.5, 3000)
+    diff = rng.beta(1.2, 6.0, 6000)
+    c = np.clip(np.concatenate([same, diff]), 1e-6, 1 - 1e-6)
+    _, _, cc = cr.number_of_bins(200, 5, 8.0)
+    m = cr.fit_spatial_correlation_model(c, cc)
+    assert m.lookup([0.05])[0] < 0.05          # no spurious P_same ~ 1 at the left edge
+    assert m.lookup([0.95])[0] > 0.95
+    assert 0.3 < m.intersection < 0.9
 
 
-def test_iterative_clustering_merges_singletons():
-    dims = (96, 96)
-    rng = np.random.default_rng(2)
-    base = _sample_centers(8, dims, 16, rng)
-    models = [_make_model(base, dims) for _ in range(3)]
-    fps, cents, _ = _aligned(models)
+# --------------------------------------------------------------------------- end to end
 
-    # start from a fully fragmented map (every cell its own singleton row)
-    rows = []
-    for s in range(3):
-        for k in range(8):
-            row = [-1, -1, -1]
-            row[s] = k
-            rows.append(row)
-    broken = np.asarray(rows, dtype=int)
-
-    out = cluster_cells_iterative(broken, fps, cents, _StubModel(),
-                                  max_distance_px=6.0)
-    # the 24 singletons collapse to 8 clusters, each present in all 3 sessions
-    assert out.shape[0] == 8
-    assert (out >= 0).all()
+def _synthetic_days(seed, n_days=4, K=60, jitter=0.4, drop=0.15):
+    rng = np.random.default_rng(seed)
+    pts = random_centres(rng, K)
+    models, truth = [], []
+    for d in range(n_days):
+        g = np.zeros(2) if d == 0 else rng.uniform(-6, 6, 2)
+        ids = [k for k in range(K) if d == 0 or rng.random() > drop]
+        p = pts[ids] + g + rng.normal(0, jitter, (len(ids), 2))
+        ok = np.all((p > 4) & (p < [H - 4, W - 4]), axis=1)
+        models.append(model_from(p[ok]))
+        truth.append(np.asarray(ids)[ok])
+    return models, truth
 
 
-def test_iterative_clustering_keeps_clean_partition():
-    dims = (96, 96)
-    rng = np.random.default_rng(2)
-    base = _sample_centers(8, dims, 16, rng)
-    models = [_make_model(base, dims) for _ in range(3)]
-    fps, cents, _ = _aligned(models)
-    correct = np.tile(np.arange(8)[:, None], (1, 3))   # already-correct map
-    out = cluster_cells_iterative(correct, fps, cents, _StubModel(),
-                                  max_distance_px=6.0)
-    assert out.shape[0] == 8
-    assert (out >= 0).all()
+def _pairs(cmap, truth):
+    out = []
+    for row in cmap:
+        pres = [(s, int(k)) for s, k in enumerate(row) if k >= 0]
+        for a in range(len(pres)):
+            for b in range(a + 1, len(pres)):
+                (s1, k1), (s2, k2) = pres[a], pres[b]
+                out.append(truth[s1][k1] == truth[s2][k2])
+    return np.asarray(out)
 
 
-def test_three_session_clustering_model_path():
-    # the model + iterative-clustering path tracks a dense N=3 field (dense so the
-    # P_same mixture sees both same- and different-cell candidates and calibrates)
-    dims = (120, 120)
-    rng = np.random.default_rng(2)
-    base = _sample_centers(40, dims, 9, rng)
-    models = [_make_model([(cy + rng.normal(0, 0.4), cx + rng.normal(0, 0.4))
-                           for cy, cx in base], dims, rng=rng, amp_noise=0.02)
-              for _ in range(3)]
-    res = register_sessions(models, align="none",
-                            registration_approach="probabilistic_model",
-                            psame_feature="auto", max_distance_px=13)
-    assert res.params["clustering"] == "iterative"
-    # most of the 40 cells tracked across all 3 sessions, no gross over-merge
-    assert res.n_registered(3) >= 33
-    assert res.n_global <= 55
+def test_end_to_end_recovers_identities():
+    models, truth = _synthetic_days(6)
+    res = cr.register_sessions(models, cell_size_px=7.0, alignment="translations")
+    assert res.bad_sessions == []
+    ok = _pairs(res.cell_to_index_map, truth)
+    n_true = sum(len(set(truth[a]) & set(truth[b]))
+                 for a in range(len(truth)) for b in range(a + 1, len(truth)))
+    assert ok.mean() >= 0.97                  # precision
+    assert ok.sum() / n_true >= 0.95          # recall
 
-
-# ---------------------------------------------------------------------------
-# Registration-confidence outputs (Step 5)
-# ---------------------------------------------------------------------------
-
-def test_registration_confidence_outputs_populated():
-    dims = (120, 120)
-    rng = np.random.default_rng(7)
-    base = _sample_centers(40, dims, 9, rng)
-    n_keep = 34
-    m1 = _make_model(base, dims, rng=rng, amp_noise=0.02)
-    kept = [(cy + rng.normal(0, 0.4), cx + rng.normal(0, 0.4))
-            for cy, cx in base[:n_keep]]
-    added = _sample_centers(4, dims, 9, rng, existing=base)
-    m2 = _make_model(kept + added, dims, rng=rng, amp_noise=0.02)
-
-    res = register_sessions([m1, m2], align="none",
-                            registration_approach="probabilistic_model",
-                            psame_feature="auto", max_distance_px=13)
-    assert res.cell_scores is not None and res.cell_scores.shape[0] == res.n_global
-    # registered (multi-session) cells have a score; singletons are NaN
-    reg = (res.cell_to_index_map >= 0).sum(1) >= 2
-    assert np.all(np.isfinite(res.cell_scores[reg]))
-    assert np.all(np.isnan(res.cell_scores[~reg]))
-    # registered matches are confident; few are ambiguous
-    assert np.nanmean(res.cell_scores[reg]) > 0.7
-    assert res.p_same_registered_pairs.min() >= 0.5      # all >= p_same_thr
-    assert 0.0 <= res.uncertain_fraction <= 1.0
-    assert 0.0 <= res.model_false_positive <= 1.0
-    assert 0.0 <= res.model_false_negative <= 1.0
-
-
-def test_confidence_none_on_threshold_path():
-    dims = (60, 60)
-    base = [(20, 20), (20, 40), (40, 30)]
-    res = register_sessions([_make_model(base, dims), _make_model(base, dims)],
-                            align="none", registration_approach="threshold",
-                            max_distance_px=6, dist_thr_px=3, corr_thr=0.6)
-    assert res.cell_scores is None
-    assert res.uncertain_fraction is None
-    assert res.model_false_positive is None
-
-
-# ---------------------------------------------------------------------------
-# Save / load round-trip
-# ---------------------------------------------------------------------------
 
 def test_save_load_roundtrip(tmp_path):
-    dims = (60, 60)
-    base = [(20, 20), (20, 40), (40, 30)]
-    res = register_sessions([_make_model(base, dims), _make_model(base, dims)],
-                            align="none", max_distance_px=6, dist_thr_px=3, corr_thr=0.6)
-    res.save(tmp_path / "reg")
-    loaded = CellRegResult.load(tmp_path / "reg")
-
-    assert np.array_equal(loaded.cell_to_index_map, res.cell_to_index_map)
-    assert np.allclose(loaded.transforms, res.transforms)
-    assert loaded.n_sessions == res.n_sessions
-    assert loaded.dims == res.dims
-    for a, b in zip(loaded.aligned_centroids, res.aligned_centroids):
-        assert np.allclose(a, b)
-
-
-def test_save_load_roundtrip_with_confidence(tmp_path):
-    dims = (120, 120)
-    rng = np.random.default_rng(7)
-    base = _sample_centers(40, dims, 9, rng)
-    m1 = _make_model(base, dims, rng=rng, amp_noise=0.02)
-    m2 = _make_model([(cy + rng.normal(0, 0.4), cx + rng.normal(0, 0.4))
-                      for cy, cx in base], dims, rng=rng, amp_noise=0.02)
-    res = register_sessions([m1, m2], align="none",
-                            registration_approach="probabilistic_model",
-                            psame_feature="auto", max_distance_px=13)
-    res.save(tmp_path / "reg")
-    loaded = CellRegResult.load(tmp_path / "reg")
-    assert np.allclose(loaded.cell_scores, res.cell_scores, equal_nan=True)
-    assert np.allclose(loaded.p_same_registered_pairs, res.p_same_registered_pairs)
-    assert loaded.uncertain_fraction == res.uncertain_fraction
-    assert loaded.model_false_positive == res.model_false_positive
+    models, _ = _synthetic_days(7, n_days=3)
+    res = cr.register_sessions(models, cell_size_px=7.0, alignment="translations")
+    res.save(tmp_path)
+    back = cr.CellRegResult.load(tmp_path)
+    np.testing.assert_array_equal(back.cell_to_index_map, res.cell_to_index_map)
+    np.testing.assert_allclose(back.transforms, res.transforms)
+    assert back.model_feature == res.model_feature
 
 
 def test_register_requires_two_sessions():
-    dims = (40, 40)
     with pytest.raises(ValueError):
-        register_sessions([_make_model([(20, 20)], dims)])
+        cr.register_sessions([model_from([(30, 30)])])
 
 
-def test_mismatched_dims_raises():
-    with pytest.raises(ValueError):
-        register_sessions([_make_model([(20, 20)], (40, 40)),
-                           _make_model([(20, 20)], (50, 50))], align="none")
+def test_keep_mode_registers_a_flagged_session():
+    rng = np.random.default_rng(3)
+    pts = random_centres(rng, 40)
+    other = random_centres(np.random.default_rng(99), 40)
+    models = [model_from(pts), model_from(pts + 0.2), model_from(other)]
+    excl = cr.register_sessions(models, cell_size_px=7.0, alignment="translations")
+    keep = cr.register_sessions(models, cell_size_px=7.0, alignment="translations",
+                                on_bad_alignment="keep")
+    assert excl.bad_sessions == [2] and keep.bad_sessions == [2]
+    assert (excl.cell_to_index_map[:, 2] < 0).all()
+    assert (keep.cell_to_index_map[:, 2] >= 0).any()
 
 
-def test_spatial_cost_is_measured_at_the_decision_boundary():
-    """P_same is not monotonic in t: it is ~1 at the left edge (where the
-    "different" density vanishes faster than the "same" one), dips below 0.5,
-    then crosses back up at the real boundary. Scoring the fit at
-    argmin|P_same - 0.5| can therefore land on that spurious left-edge crossing
-    -- the two sit equally close to 0.5, to within ~1e-3 -- and report FP ~= 1
-    for a perfectly sound model. choose_best_model then discards it in favour of
-    a degenerate centroid model, and register_sessions silently falls back to
-    threshold matching. FP/FN must be measured at the model's own threshold.
-    """
-    rng = np.random.default_rng(5)
-    # heavy, compressed "different" population near the left edge -- the regime
-    # that produces the second crossing (matches real 1p footprint correlations,
-    # which sit around -0.5 because near-empty footprints anti-correlate)
-    corr = np.concatenate([
-        np.clip(rng.normal(0.35, 0.30, 2000), -1, 1),      # same-cell
-        np.clip(rng.normal(-0.52, 0.25, 60000), -1, 1),    # different-cell
-    ])
-    m = fit_spatial_correlation_model(corr)
-    assert m is not None
-
-    # the precondition: P_same really is non-monotonic here, so scoring by
-    # argmin|P_same - 0.5| has two crossings to choose between
-    above = m.grid_psame >= 0.5
-    n_crossings = int(np.count_nonzero(above[:-1] != above[1:]))
-    assert n_crossings >= 2, f"expected non-monotonic P_same, got {n_crossings} crossing(s)"
-
-    # FP must be the "different" mass on the same-cell side of the threshold.
-    # Recomputed here from the fitted parameters, at the model's own threshold.
-    t = m.grid_corr                       # the model grids over t = (corr+1)/2
-    ln_g, be_g = _lognpdf(t, m.mu, m.sigma), _betapdf(t, m.p, m.q)
-    same_g = m.pi_same * ln_g if m.same_is_lognormal else (1 - m.pi_same) * be_g
-    diff_g = (1 - m.pi_same) * be_g if m.same_is_lognormal else m.pi_same * ln_g
-    idx = int(np.searchsorted(t, 0.5 * (m.threshold + 1.0)))
-    expected_fp = float(diff_g[idx:].sum() / diff_g.sum())
-    expected_fn = float(same_g[:idx].sum() / same_g.sum())
-
-    assert m.false_positive == pytest.approx(expected_fp, abs=1e-3)
-    assert m.false_negative == pytest.approx(expected_fn, abs=1e-3)
-    # and concretely: scoring at the wrong crossing reported FP ~= 0.995 here
-    assert m.false_positive < 0.5, (
-        f"FP={m.false_positive:.3f} -- scored at the spurious crossing")
+def test_old_api_arguments_go_to_cellreg_legacy():
+    from minicnmfe import cellreg_legacy
+    models, _ = _synthetic_days(7, n_days=3)
+    old = dict(align="translation", accepted_only=False, max_distance_px=12.0, dist_thr_px=5.0)
+    with pytest.warns(FutureWarning, match="cellreg_legacy"):
+        res = cr.register_sessions(models, **old)
+    ref = cellreg_legacy.register_sessions(models, **old)
+    assert isinstance(res, cellreg_legacy.CellRegResult)
+    np.testing.assert_array_equal(res.cell_to_index_map, ref.cell_to_index_map)
