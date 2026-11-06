@@ -53,9 +53,11 @@ class CNMFeParams:
     init_patch_max_workers: int = 32           # upper bound on patch-init loky processes (caps process-count RAM on many-core boxes; results unchanged)
 
     # Background (ring model)
-    ring_size_factor: float = 1.5              # ring_radius = factor * (2*sigma + 1)
+    ring_size_factor: float = 1.5              # ring_radius = factor * (4*sigma + 1)
     ring_lambda: float = 1e-5                  # Ridge regularisation for ring regression
     ring_constrain_sum: bool = False           # Constrain ring weights to sum to 1 (see ring-constrain-sum)
+    ring_apply_to_raw: bool = False            # DEPRECATED: W(Y-b0) instead of CNMF-E's W(Y-AC-b0); warns, will be removed
+    ring_fit_once: bool = False                # Solve W once, refresh only b0; faster approximation, warns
     global_bg_rank: int = 0                    # Extra low-rank global background components (0 = ring only)
     bg_tsub: int = 5                           # Temporal subsample factor when fitting W / b0
 
@@ -734,7 +736,7 @@ def subtract_background(
 ) -> np.ndarray
 ```
 
-Subtract ring background: `Y_res = Y_flat - b0 - W @ (Y_flat - b0)`. **Returns** `(H·W, T)`.
+**Deprecated, flagged for removal.** Applies the ring to raw data, `Y_flat - b0 - W @ (Y_flat - b0)`, which is not the CNMF-E background (it warns). Use `BackgroundSubtractor` with `A` and `C`. **Returns** `(H·W, T)`.
 
 ---
 

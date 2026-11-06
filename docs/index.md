@@ -21,6 +21,7 @@
 | [Architecture](concepts/architecture.md) | Module map, dependency graph, data-flow |
 | [Ring background](concepts/ring-background.md) | The ring background model and the sum-to-one constraint |
 | [CaImAn comparison](concepts/caiman-comparison.md) | Benchmarking vs CaImAn's CNMF-E — methodology, results, caveats |
+| [CNMF-E deviations](concepts/cnmfe-deviations.md) | Every way this package differs from the published algorithm, and why |
 
 ## Implementation guides (per stage)
 

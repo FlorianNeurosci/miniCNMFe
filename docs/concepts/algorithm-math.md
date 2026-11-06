@@ -126,7 +126,9 @@ around every already-found centre, where $f$ is `seed_suppress_factor` (default 
 
 For pixel $i$, define its ring neighbourhood:
 
-$$\mathcal{R}_i = \{j : r \le d(i,j) \le r+1\}, \quad r = r_\text{factor} \cdot (2\sigma+1)$$
+$$\mathcal{R}_i = \{j : r \le d(i,j) \le r+1\}, \quad r = r_\text{factor} \cdot (4\sigma+1)$$
+
+The paper's filter has width $l/4$, so $4\sigma$ is its neuron size $l$. The ring has to clear the neuron, or a pixel's ring crosses its own cell.
 
 ### 5.2 Weight Estimation
 
@@ -140,11 +142,15 @@ $$\mathbf{w}_i = \arg\min_{\mathbf{w}} \|\mathbf{X}[i,:] - \mathbf{w}^\top\mathb
 
 Closed form: $\mathbf{w}_i = (\mathbf{X}[\mathcal{R}_i,:]\mathbf{X}[\mathcal{R}_i,:]^\top + \lambda\mathbf{I})^{-1}\mathbf{X}[\mathcal{R}_i,:]\mathbf{X}[i,:]^\top$
 
-Baseline: $b_{0,i} = \text{mean}_t(Y_{\text{flat},i} - \mathbf{w}_i^\top \mathbf{Y}_{\text{flat},\mathcal{R}_i})$
+Baseline: $b_{0,i} = \text{mean}_t\big(Y_{\text{flat},i} - (\mathbf{A}\mathbf{C})_i\big)$
+
+$\mathbf{W}$ and $\mathbf{b}_0$ are re-estimated from the current $\mathbf{A}, \mathbf{C}$ in every main iteration.
 
 ### 5.3 Background Subtraction
 
-$$\mathbf{Y}_\text{res} = \mathbf{Y}_\text{flat} - \mathbf{b}_0\mathbf{1}^\top - \mathbf{W}(\mathbf{Y}_\text{flat} - \mathbf{b}_0\mathbf{1}^\top)$$
+$$\mathbf{Y}_\text{res} = \mathbf{Y}_\text{flat} - \mathbf{b}_0\mathbf{1}^\top - \mathbf{W}(\mathbf{Y}_\text{flat} - \mathbf{A}\mathbf{C} - \mathbf{b}_0\mathbf{1}^\top)$$
+
+The ring reads neuron-free data here, as it does when $\mathbf{W}$ is fit (Zhou et al. 2018, Eq. 8 and 11). $\mathbf{A}, \mathbf{C}$ are the ones $\mathbf{W}$ was fit with, held fixed while the spatial and temporal updates run. Applying the ring to raw data instead gives $\mathbf{Y}_\text{res} \approx (\mathbf{I}-\mathbf{W})\mathbf{A}\mathbf{C}$, which fitted by $\mathbf{A}\mathbf{C}$ erodes footprints and subtracts each neuron from cells about a ring radius away.
 
 ---
 

@@ -143,7 +143,7 @@ movie_arr (T, H, W)  +  shifts (T, 2)
             ├──► merge_components() ────────► A, C, members_per_group
             ├──► _cache_after_merge()      ─► g_per_k, sn_per_k (inherit from members[0])
             ├──► [if merged] update_temporal()
-            └──► compute_W() ────────────────► W_mat, b0  (refresh)
+            └──► compute_W() ────────────────► W_mat, b0  (re-estimated)
     │
     ├──► update_temporal() (final pass) ────► C, S, g_per_k, sn_per_k
     └──► [compute residual projection]  ────► YrA (K, T) — model.C + model.YrA = noisy projection

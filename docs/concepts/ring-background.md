@@ -13,10 +13,11 @@ tags: [minicnmfe, math, algorithm, background, extension]
 
 ## Problem
 
-The standard CNMF-E ring model (Zhou et al. 2018) predicts the background at
-pixel $i$ from a ridge-regularised LS fit over its ring of neighbours:
+The standard CNMF-E ring model (Zhou et al. 2018, Eq. 8 and 11) predicts the
+background at pixel $i$ from a ridge-regularised LS fit over its ring of neighbours,
+reading neuron-free data $\mathbf{X} = \mathbf{Y} - \mathbf{A}\mathbf{C} - \mathbf{b}_0\mathbf{1}^\top$:
 
-$$\hat{b}_i(t) = b_{0,i} + \sum_{j \in \text{ring}(i)} W_{ij}\,\big(Y_j(t) - b_{0,j}\big)$$
+$$\hat{b}_i(t) = b_{0,i} + \sum_{j \in \text{ring}(i)} W_{ij}\,X_j(t)$$
 
 with `compute_W` solving the **unconstrained** problem
 
@@ -28,7 +29,7 @@ shifts, uniform photobleaching, motion-coupled illumination.
 
 If every pixel drops by a constant $D$ at frame $t$, the residual at pixel $i$ is
 
-$$r_i(t) = \big(Y_i(t) - b_{0,i}\big) - \sum_j W_{ij}\big(Y_j(t) - b_{0,j}\big)
+$$r_i(t) = X_i(t) - \sum_j W_{ij}\,X_j(t)
         = D \cdot \Big(1 - \textstyle\sum_j W_{ij}\Big)$$
 
 With ridge regularisation, $\sum_j W_{ij} < 1$, so a fraction of $D$ leaks
@@ -128,5 +129,5 @@ on the recording of interest.
 This is a **non-standard** extension. The original Zhou et al. 2018 algorithm uses
 unconstrained ridge LS. `CNMFeParams` tags every non-standard knob with
 `[NON-STANDARD]` in its inline comment so a reader can audit which defaults differ
-from the published algorithm. See the `CNMFeParams` docstring for the full
-convention.
+from the published algorithm. See [CNMF-E deviations](./cnmfe-deviations.md) for the
+full list.

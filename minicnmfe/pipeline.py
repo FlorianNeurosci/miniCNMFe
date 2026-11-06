@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import warnings
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -17,7 +18,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from minicnmfe._utils import StageTimer, make_2d
-from minicnmfe.background import BackgroundSubtractor, compute_W
+from minicnmfe.background import RAW_RING_WARNING, BackgroundSubtractor, compute_W
 from minicnmfe.evaluate import auto_evaluate_components
 from minicnmfe.initialization import (
     _resolve_patch_workers,
@@ -365,8 +366,9 @@ class CNMFeParams:
     """All CNMFe algorithm parameters.
 
     Deviations from standard CNMF-E (Zhou et al. 2018) are tagged
-    ``[NON-STANDARD]`` next to the field. With every ``[NON-STANDARD]``
-    *algorithm* flag at its default, the math matches the published CNMF-E.
+    ``[NON-STANDARD]`` next to the field. Several are on by default, so the
+    defaults are NOT the published algorithm end to end:
+    ``docs/concepts/cnmfe-deviations.md`` lists every deviation and why it exists.
     Fields tagged ``[NON-STANDARD speed]`` are speed/memory trade-offs
     (subsampling, parallelism, etc.) that converge to the standard
     algorithm at their slow-but-faithful settings (``tsub=1``,
@@ -406,8 +408,8 @@ class CNMFeParams:
     min_pixel: int = 3        # Minimum nonzero pixels in a valid footprint
     border_px: int = 5        # Ignore seeds within this many border pixels
     max_neurons: int | None = None  # Stop early (None = no limit)
-    init_min_corr_neuron: float = 0.8         # "Neuron pixel" threshold inside extract_spatial_temporal
-    init_max_corr_bg: float = 0.4             # "Background pixel" threshold inside extract_spatial_temporal
+    init_min_corr_neuron: float = 0.8         # [NON-STANDARD value; paper 0.7] "Neuron pixel" threshold inside extract_spatial_temporal
+    init_max_corr_bg: float = 0.4             # [NON-STANDARD value; paper 0.3] "Background pixel" threshold inside extract_spatial_temporal
     seed_suppress_factor: float = 2.0         # DEPRECATED no-op (kept for API stability). Greedy init now suppresses found neurons with an `ind_search` support mask (ai > ai.max()/2), not a disk; see initialization.greedy_corr_pnr.
     circular_max_dist_factor: float = 2.5     # circular_constraint cutoff = factor * estimated_radius
     # [NON-STANDARD speed] Temporal stride for greedy init (None = auto: max(1, T//5000)).
@@ -428,6 +430,7 @@ class CNMFeParams:
     # only -> no OOM), and nested parallelism (the tuning sweep sets this False
     # for its candidates, since loky can't nest and candidates already run in
     # parallel). Set False to force the bit-for-bit serial greedy.
+    # [NON-STANDARD] How seeds are chosen; the paper's greedy search is 'threshold'.
     # 'mixture' (default): local maxima of a smoothed CORR*PNR, split by a
     #   two-component fit -- self-calibrating, needs no thresholds.
     # 'threshold': DEPRECATED, kept only to reproduce pre-2026-08 results.
@@ -447,7 +450,9 @@ class CNMFeParams:
                                              # to disable). Results are unchanged.
 
     # --- Background (ring model) ---
-    ring_size_factor: float = 1.5  # ring radius = ring_size_factor * (2*sigma+1)
+    # Ring radius = ring_size_factor * (4*sigma+1). The paper's filter has width
+    # l/4, so 4*sigma is its neuron size l, and the ring must clear the neuron.
+    ring_size_factor: float = 1.5
     ring_lambda: float = 1e-5      # Ridge regularization for ring regression
     # [NON-STANDARD] Enforce Σ_j W[i, j] = 1 per row of the ring weight matrix
     # (Lagrangian-constrained ridge LS). Cancels spatially-uniform brightness
@@ -457,6 +462,16 @@ class CNMFeParams:
     # unconstrained ridge LS (i.e. False). Negligible cost (one extra RHS in
     # the same per-pixel solve).
     ring_constrain_sum: bool = False
+    # [NON-STANDARD] DEPRECATED, FLAGGED FOR REMOVAL. Apply the ring to raw data,
+    # W(Y - b0), instead of CNMF-E's W(Y - AC - b0). The ring then reads neurons,
+    # which erodes footprints and adds negative cross-talk between cells about
+    # one ring radius apart. Kept only to reproduce older extractions; warns.
+    ring_apply_to_raw: bool = False
+    # [NON-STANDARD speed] Solve W once from the initial traces and refresh only
+    # b0 afterwards, instead of re-estimating W in every BCD iteration. Saves the
+    # ring solves, but W then keeps whatever the init got wrong, which can bias
+    # the traces of nearby cells; warns.
+    ring_fit_once: bool = False
     # [NON-STANDARD] Add a rank-``r`` temporal background ``B_f · F`` on top of
     # the ring (CNMF-style ``nb=r``). Captures *spatially-non-uniform* slow
     # drift (vignetting-coupled photobleaching, scope warmup) that the ring
@@ -499,7 +514,7 @@ class CNMFeParams:
     # speeds convergence at the cost of LASSO tightness.
     spatial_max_iter: int = 1000
     spatial_tol: float = 1e-4
-    # [PERF/STABILITY] Elastic-net L2 fraction for the per-pixel solve. The
+    # [NON-STANDARD; PERF/STABILITY] Elastic-net L2 fraction for the per-pixel solve. The
     # solver's beta is set to `spatial_ridge * max(diag(Gram))`, bounding the
     # condition number of the per-pixel Gram (`C_active @ C_active.T`) to
     # ~`1/spatial_ridge`. This is what keeps the CD converging when active
@@ -557,6 +572,7 @@ class CNMFeParams:
     # "max" (corr(C,C+YrA) 0.850->0.871), optimum ~0.95 (live_runs/nrg_compare.py).
     # NOTE the threshold_footprint() *function* default stays "max" (only this
     # CNMFeParams field defaults to nrg) — direct callers/tests are unaffected.
+    # [NON-STANDARD] The paper cleans footprints by morphological opening only.
     spatial_thr_method: str = "nrg"
     # Energy fraction retained when spatial_thr_method="nrg". ``0.95`` (default) is
     # the validated sweet spot; higher (->0.9999, CaImAn's loose value) keeps more
@@ -574,7 +590,7 @@ class CNMFeParams:
 
     # --- Temporal update / deconvolution ---
     ar_order: int = 1
-    global_ar: bool = True  # True = one g estimated from pooled C_raw; False = per-neuron
+    global_ar: bool = True  # [NON-STANDARD] True = one g estimated from pooled C_raw; False = per-neuron
     n_iter_temporal: int = 2
     # [NON-STANDARD knob, standard *value*] Shrinkage on the Yule-Walker AR
     # estimate. 0.96 is the historical CNMF-E default (Friedrich 2017) and
@@ -731,7 +747,7 @@ class CNMFeParams:
         ``minicnmfe.downsample.downsample_movie``. Pixel-valued fields shrink with
         ``ssub`` (areas with ``ssub²``); the frame rate that feeds the AR-``g``
         prior shrinks with ``tsub``. Fields derived from these (e.g. the ring
-        radius = ``ring_size_factor·(2·sigma+1)``) follow automatically.
+        radius = ``ring_size_factor·(4·sigma+1)``) follow automatically.
 
         ``decay_time_ms`` is a physical time and is left unchanged — only
         ``frame_rate_hz`` changes, which correctly raises the per-frame decay.
@@ -1513,6 +1529,16 @@ class CNMFe:
         p = self.params
         timer = StageTimer()
 
+        if p.ring_apply_to_raw:
+            warnings.warn(RAW_RING_WARNING, FutureWarning, stacklevel=2)
+        if p.ring_fit_once:
+            warnings.warn(
+                "ring_fit_once=True: W is estimated once from the initial traces, "
+                "whereas CNMF-E re-estimates it inside the loop. This approximation "
+                "can bias the traces of nearby cells.",
+                UserWarning, stacklevel=2,
+            )
+
         # --- Auto-derive Y_flat_zarr from a zarr movie + output_dir -----------
         # Passing a zarr.Array `movie` without Y_flat_zarr used to silently
         # asarray() the whole thing into RAM (86 GB for 60k×600×600). When
@@ -1854,7 +1880,7 @@ class CNMFe:
         # directly.
         # Ring radius (used both for the init-projection bootstrap below and
         # for the first full ring background fit further down).
-        ring_radius = p.ring_size_factor * (2 * p.sigma + 1)
+        ring_radius = p.ring_size_factor * (4 * p.sigma + 1)
 
         AA_init = (A.T @ A).toarray()
         nA_init = np.maximum(np.diag(AA_init), 1e-10).astype(np.float32)
@@ -1877,6 +1903,9 @@ class CNMFe:
             # full-T init traces through it. This mirrors what the stride==1
             # path gets for free (its first ``compute_W`` sees clean traces),
             # so the first full ``compute_W`` below is no longer blinded.
+            # This is the one place the ring stays on raw data: Eq. 8 needs
+            # full-length traces, which are what is being computed here, and W is
+            # re-estimated from the result below.
             # Subsample time like the main ring fit (was tsub=1). This bootstrap
             # only needs a ROUGH W0/b0 to de-leak the strided-init projection, and
             # compute_W clamps actual_tsub to keep >=200 frames, so the per-pixel
@@ -1983,6 +2012,18 @@ class CNMFe:
             constrain_sum=p.ring_constrain_sum,
         )
         timer.add("compute_W", time.perf_counter() - _t)
+        # The (A, C) that W was fit with. They stay fixed until the next fit (the
+        # paper's B^f is held constant while A and C update; MATLAB's A_prev), and
+        # are taken here rather than where Y_bg is built because the iteration-0
+        # pre-merge changes A and C in between.
+        A_bg, C_bg = (None, None) if p.ring_apply_to_raw else (A, C)
+
+        def _global_bg_A(A_: "sp.csc_matrix", W_: "sp.csr_matrix") -> "sp.csc_matrix":
+            """``A`` as it enters the global-background residual. With the ring on
+            neuron-free data that residual is ``(I-W)(Y-b0-AC) - B_f F``, so the
+            fit must see ``(I-W)A``; handing it ``A`` leaks shared signal into
+            every trace."""
+            return A_ if p.ring_apply_to_raw else (A_ - W_ @ A_).tocsc()
 
         # --- Step 5b: Rank-r global background B_f · F (opt-in, NON-STANDARD) ---
         bf: np.ndarray | None = None
@@ -1992,7 +2033,7 @@ class CNMFe:
                   f"B_f · F (initial)...")
             _t_gbg = time.perf_counter()
             bf, f_bg = _fit_global_bg_rank(
-                Y_flat, A, C, W_mat, b0, p.global_bg_rank,
+                Y_flat, _global_bg_A(A, W_mat), C, W_mat, b0, p.global_bg_rank,
                 Bf=None, F=None, n_iter=2,
             )
             timer.add(f"global bg rank-{p.global_bg_rank}",
@@ -2041,7 +2082,9 @@ class CNMFe:
                 if n_pre_merged:
                     print(f"  {A.shape[1]} components ({n_pre_merged} pre-merged).")
 
-            Y_bg = BackgroundSubtractor(Y_flat, W_mat, b0, bf=bf, f=f_bg)  # lazy (H*W, T)
+            Y_bg = BackgroundSubtractor(                                  # lazy (H*W, T)
+                Y_flat, W_mat, b0, bf=bf, f=f_bg, A=A_bg, C=C_bg,
+            )
 
             print("  Updating spatial footprints...")
             _t = time.perf_counter()
@@ -2120,27 +2163,26 @@ class CNMFe:
                 timer.add("update_temporal", time.perf_counter() - _t)
             print(f"  {A.shape[1]} components ({n_merged} merged).")
 
-            # Refresh the per-pixel baseline b0 from the refined (A, C).
-            # Reuse the ring weight matrix W from the initial solve — the
-            # ring's spatial structure is a property of the data, not of A/C,
-            # so it remains valid across BCD iterations. Saves the expensive
-            # per-pixel BTB solve every iteration (speedup.md Change 2).
+            # Re-estimate the background from the refined (A, C): W is fit on
+            # Y - AC - b0, so it depends on them (the paper's step 2, repeated in
+            # the loop). ``ring_fit_once`` keeps the first W and refreshes only b0.
             _t = time.perf_counter()
             W_mat, b0 = compute_W(
                 Y_flat, A, C, dims, ring_radius,
                 lambda_reg=p.ring_lambda, n_jobs=p.n_jobs, device=p.device,
                 tsub=p.bg_tsub,
-                W_cached=W_mat,
+                W_cached=W_mat if p.ring_fit_once else None,
                 constrain_sum=p.ring_constrain_sum,
             )
-            timer.add("compute_W (b0 refresh)", time.perf_counter() - _t)
+            timer.add("compute_W (refit)", time.perf_counter() - _t)
+            A_bg, C_bg = (None, None) if p.ring_apply_to_raw else (A, C)
 
             # Refresh the global background warm-started from the previous
             # iteration's (B_f, F). Two alternating-LS sweeps converge fast
             # since A, C are nearly converged here.
             if p.global_bg_rank >= 1:
                 bf, f_bg = _fit_global_bg_rank(
-                    Y_flat, A, C, W_mat, b0, p.global_bg_rank,
+                    Y_flat, _global_bg_A(A, W_mat), C, W_mat, b0, p.global_bg_rank,
                     Bf=bf, F=f_bg, n_iter=2,
                 )
 
@@ -2164,7 +2206,7 @@ class CNMFe:
 
         # Final deconvolution pass to get spike trains
         print("Final temporal update...")
-        Y_bg = BackgroundSubtractor(Y_flat, W_mat, b0, bf=bf, f=f_bg)
+        Y_bg = BackgroundSubtractor(Y_flat, W_mat, b0, bf=bf, f=f_bg, A=A_bg, C=C_bg)
         _t = time.perf_counter()
         C, S, g_per_k, sn_per_k = update_temporal(
             Y_bg, A, C, sn_flat, p.ar_order, p.n_iter_temporal,

@@ -59,8 +59,8 @@ which performs every extraction step below.
      background-subtracted movie (`spatial.py:update_spatial`).
    - **[Temporal update](temporal-update.md)** — re-project each trace and
      deconvolve it with OASIS (`temporal.py:update_temporal`).
-   - Refresh the baseline `b0` (the ring weights `W` are reused across
-     iterations).
+   - Re-estimate the ring background `W` and baseline `b0` from the refined
+     `A`, `C`.
 6. **Final temporal pass + residual** — one more deconvolution, then the
    residual-at-footprint `YrA` so that `C + YrA` is the shape-faithful "noisy
    projected" trace.

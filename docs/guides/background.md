@@ -26,7 +26,9 @@ ring around pixel `i`.
 of the pixels at Euclidean distance in `(radius, radius+1]` (a one-pixel-thick
 annulus, built by subtracting an inner disk from an outer disk). Border pixels
 simply have fewer ring neighbours. The radius used by the pipeline is
-`ring_size_factor · (2·sigma + 1)` (default `ring_size_factor = 1.5`).
+`ring_size_factor · (4·sigma + 1)` (default `ring_size_factor = 1.5`). `4·sigma` is
+the paper's neuron size `l` (its filter has width `l/4`), and the ring has to clear
+the neuron.
 
 ## Solving for W and b0
 
@@ -51,11 +53,12 @@ with `λ = ring_lambda` (default `1e-5`, expressed as a fraction of
 `n_jobs`; `tsub` (`bg_tsub`, default 5) subsamples **time** for the expensive
 `B·Bᵀ` solve only — `b0` always uses the full `T`.
 
-Two performance options that don't change the math:
+`W` is fit on `Y − A·C − b0`, so it depends on `A` and `C`, and the BCD loop
+re-estimates it in every iteration. `ring_fit_once=True` (**non-standard**, warns)
+keeps the first `W` through the `W_cached` argument and refreshes only `b0`. That
+saves the extra solves, but it is an approximation that can bias the traces of
+nearby cells.
 
-- **`W_cached`** — reuse a previously solved `W` and only refresh `b0`. The
-  ring's spatial structure is a property of the data, not of `A`/`C`, so the BCD
-  loop solves `W` once and reuses it across iterations.
 - **Streaming path** — for a zarr-backed `Y_flat`, the residual rows for each
   pixel batch are pulled on demand (`_compute_w_streaming`) so the full
   `(H·W, T)` residual is never in RAM.
@@ -70,20 +73,22 @@ residual. Standard CNMF-E leaves it unconstrained (`False`).
 The background-free movie is
 
 ```
-Y_bg = (I − W)·(Y − b0)
+Y_bg = Y − b0 − W·(Y − A·C − b0)
 ```
 
-(`subtract_background`). Materializing that is `(H·W) × T` — too big for long
-recordings — so the BCD loop uses **`BackgroundSubtractor`** instead, which
-computes pixel-row slices on demand from the identity
+(Zhou et al. 2018, Eq. 8 and 11), with the `A`, `C` that `W` was fit with held fixed
+until the next fit. Materializing that is `(H·W) × T` — too big for long recordings —
+so the BCD loop uses **`BackgroundSubtractor`** instead, which computes pixel-row
+slices on demand from the identity
 
 ```
-Y_bg[s:e] = Y[s:e] − b0[s:e] − W[s:e]·Y + (W[s:e]·b0)
+Y_bg[s:e] = Y[s:e] − b0[s:e] − W[s:e]·Y + (W[s:e]·b0) + (W·A)[s:e]·C
 ```
 
-For a zarr `Y_flat` it reads only the ring-neighbour rows it needs. It also offers
+`W·A` is sparse and formed once, so the neuron term adds no reads of `Y`. For a zarr
+`Y_flat` the subtractor reads only the ring-neighbour rows it needs. It also offers
 `project_onto(A)` = `Y_bgᵀ·A → (T, K)` without ever forming `Y_bg`, via
-`Y_bgᵀ·A = Yᵀ·(I − Wᵀ)·A − b0·(...)`. Both spatial and temporal updates consume
+`Y_bgᵀ·A = Yᵀ·(I − Wᵀ)·A − b0·(...) + Cᵀ·(W·A)ᵀ·A`. Both spatial and temporal updates consume
 the subtractor through these two methods, which is how extraction stays
 RAM-bounded.
 
@@ -93,6 +98,6 @@ With `global_bg_rank=1` (non-standard), an extra term `b_f · f(t)` is fit on to
 of the ring (`_fit_global_bg_rank1`). It captures **spatially non-uniform** slow
 drift (vignetting-coupled photobleaching, scope warm-up) that the ring alone
 cannot. It is fit by a few alternating least-squares sweeps on the residual
-`R = (I − W)(Y − b0) − A·C`, both factors unconstrained (the drift is a signed
+`R = (I − W)(Y − b0 − A·C)`, both factors unconstrained (the drift is a signed
 deviation from `b0`), warm-started across BCD iterations. When present,
 `BackgroundSubtractor` also subtracts `b_f · f(t)`.

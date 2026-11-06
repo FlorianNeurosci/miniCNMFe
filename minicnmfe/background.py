@@ -9,18 +9,30 @@ around it. The ring model solves:
 
 where X = Y - A @ C - b0[:, None]  (data minus neural signal minus baseline).
 
-This produces a sparse weight matrix W and per-pixel baseline b0.
+This produces a sparse weight matrix W and per-pixel baseline b0. The fluctuating
+background is then ``B = W @ X`` (Zhou et al. 2018, Eq. 8 and 11): the ring reads
+neuron-free data both when ``W`` is fit and when it is applied.
 
 Reference (algorithmic only): CaImAn initialization.py:compute_W (line 1900).
 """
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import scipy.sparse as sp
 from skimage.morphology import disk as morpho_disk
 
 from minicnmfe._utils import get_xp, to_numpy
+
+# Shared by ``subtract_background`` and ``CNMFeParams.ring_apply_to_raw``.
+RAW_RING_WARNING = (
+    "Applying the ring to raw data is deprecated and will be removed: it computes "
+    "the background as W(Y - b0) instead of CNMF-E's W(Y - AC - b0), so the ring "
+    "reads neurons. This erodes footprints and adds negative cross-talk between "
+    "cells about one ring radius apart."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -572,13 +584,11 @@ def subtract_background(
     W: sp.csr_matrix,
     b0: np.ndarray,
 ) -> np.ndarray:
-    """Subtract ring-model background from the raw movie.
+    """Deprecated: apply the ring to the raw movie, ``(I - W) @ (Y - b0)``.
 
-    The model predicts background at pixel i as:
-        bg_i = b0[i] + sum_j W[i, j] * (Y[j] - b0[j])
-    So the background-free signal is:
-        Y_res = Y - b0[:,None] - W @ (Y - b0[:,None])
-              = (I - W) @ (Y - b0[:,None])
+    FLAGGED FOR REMOVAL, together with ``CNMFeParams.ring_apply_to_raw``. This is
+    not the CNMF-E background: the ring also reads neurons here (see
+    ``RAW_RING_WARNING``). Use ``BackgroundSubtractor`` with ``A`` and ``C``.
 
     Args:
         Y_flat: (H*W, T) raw movie.
@@ -593,6 +603,7 @@ def subtract_background(
         full-size temporaries. For large T use ``BackgroundSubtractor`` and
         request pixel-row slices on demand instead.
     """
+    warnings.warn(RAW_RING_WARNING, FutureWarning, stacklevel=2)
     X = Y_flat - b0[:, np.newaxis]
     return X - W.dot(X)
 
@@ -659,7 +670,11 @@ def _project_onto_batch(
 class BackgroundSubtractor:
     """Lazy ring-background subtractor — on-demand pixel-row slices.
 
-    Computes pixel-row slices of ``Y_bg = (I - W) @ (Y - b0[:, None])``
+    Computes pixel-row slices of the CNMF-E background-subtracted movie
+    (Zhou et al. 2018, Eq. 8 and 11)
+
+        Y_bg = Y - b0 - W @ (Y - A @ C - b0)
+
     without materialising the full ``(H*W, T)`` result. Used by extraction
     to bound peak RAM.
 
@@ -669,9 +684,12 @@ class BackgroundSubtractor:
                         - b0[start:end, None]
                         - W[start:end] @ Y
                         + (W[start:end] @ b0)[:, None]
+                        + (W @ A)[start:end] @ C
 
-    The two W matmuls are sparse-dense and sparse@vector — they never need
-    a materialised ``X = Y - b0`` intermediate.
+    The W matmuls are sparse-dense and sparse@vector — they never need a
+    materialised ``X = Y - b0`` intermediate. ``W @ A`` is sparse and formed
+    once, so the neuron term costs one small matmul per slice and no extra reads
+    of ``Y_flat``.
 
     Supports ``bg[start:end]`` (equivalent to ``bg.slice(start, end)``) and
     ``bg.project_onto(A)`` (streaming ``Y_bg.T @ A``) so existing call sites
@@ -689,6 +707,13 @@ class BackgroundSubtractor:
             appropriate projection) so downstream consumers see the residual
             with this global background also removed. Use with
             ``CNMFeParams.global_bg_rank >= 1``.
+        A, C: The footprints ``(H*W, K)`` and traces ``(K, T)`` that ``W`` and
+            ``b0`` were fit with. Pass both, or neither. They are held fixed for
+            the life of the object, so they need not match the ``A`` later given
+            to ``project_onto``. Without them the ring is applied to raw data,
+            ``(I - W)(Y - b0)``, which is correct only before full-length traces
+            exist (the strided-init bootstrap) or on the deprecated
+            ``ring_apply_to_raw`` path.
     """
 
     def __init__(
@@ -698,6 +723,8 @@ class BackgroundSubtractor:
         b0: np.ndarray,
         bf: "np.ndarray | None" = None,
         f: "np.ndarray | None" = None,
+        A: "sp.spmatrix | None" = None,
+        C: "np.ndarray | None" = None,
     ) -> None:
         self.Y_flat = Y_flat
         self.W = W if sp.isspmatrix_csr(W) else W.tocsr()
@@ -717,6 +744,10 @@ class BackgroundSubtractor:
             raise ValueError(
                 f"BackgroundSubtractor: bf rank {self.bf.shape[1]} != "
                 f"f rank {self.f.shape[0]}")
+        if (A is None) != (C is None):
+            raise ValueError("BackgroundSubtractor: pass both `A` and `C`, or neither")
+        self.WA = None if A is None else (self.W @ sp.csr_matrix(A)).tocsr()
+        self.C_bg = None if C is None else np.asarray(C, dtype=np.float32)
 
     def slice(self, start: int, end: int) -> np.ndarray:
         """Return ``Y_bg[start:end, :]`` as a fresh ``(end-start, T)`` array.
@@ -756,6 +787,8 @@ class BackgroundSubtractor:
         W_b0 = np.asarray(W_chunk @ self.b0, dtype=np.float32)
         out = Y_chunk - self.b0[start:end, None] - W_Y
         out += W_b0[:, None]
+        if self.WA is not None:
+            out += self.WA[start:end] @ self.C_bg
         if self.bf is not None:
             # Global temporal background: subtract B_f[start:end] @ F.
             out -= self.bf[start:end] @ self.f
@@ -775,7 +808,7 @@ class BackgroundSubtractor:
         rows = np.asarray(rows)
         W_chunk = self.W[rows]
         # spatial_tsub: read only every tsub-th time column. The identity
-        # ``(I-W)(Y-b0)`` is independent per time column, so this returns exactly
+        # ``Y_bg`` is independent per time column, so this returns exactly
         # ``slice_rows(rows)[:, ::tsub]`` — bit-identical to subsampling after. Use a
         # 2D advanced-index (np.ix_) so ONLY the T/tsub columns are read: chained
         # ``Y_flat[rows][:, ::tsub]`` would gather the full-T rows first (the
@@ -809,6 +842,8 @@ class BackgroundSubtractor:
         W_b0 = np.asarray(W_chunk @ self.b0, dtype=np.float32)
         out = Y_chunk - self.b0[rows, None] - W_Y
         out += W_b0[:, None]
+        if self.WA is not None:
+            out += self.WA[rows] @ (self.C_bg[:, ::tsub] if tsub > 1 else self.C_bg)
         if self.bf is not None:
             f_eff = self.f[:, ::tsub] if tsub > 1 else self.f
             out -= self.bf[rows] @ f_eff
@@ -860,6 +895,12 @@ class BackgroundSubtractor:
             # global BLAS thread cap; tiling over time fills all cores. Bit-exact.
             YA = _gemm_threaded(self.Y_flat, B, n_jobs)                 # (T, K)
             YA -= (self.b0 @ B).astype(np.float32)
+            if self.WA is not None:
+                # (W A C).T @ A_q = C.T @ ((W A).T @ A_q). Numpy branch only: the
+                # streaming branch below goes through ``slice``, which has it.
+                G = self.WA.T @ A_csr
+                G = G.toarray() if sp.issparse(G) else np.asarray(G)
+                YA += self.C_bg.T @ G.astype(np.float32)
             if self.bf is not None:
                 # (B_f F).T @ A = F.T @ (B_f.T @ A)  — rank r in (T, K).
                 # Use A (not B) here: the global term sits *outside* (I − W).

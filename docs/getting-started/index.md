@@ -76,10 +76,10 @@ The extraction path is streaming-aware:
   as a pixel-major `(H·W, T)` float32 array; downstream steps allocate
   only small per-batch buffers.
 - `BackgroundSubtractor` (used internally by the BCD loop) materialises
-  pixel-row slices of `(I - W) @ (Y - b0)` on demand — `Y_bg` is never
-  built in full.
-- `compute_W` computes `b0` via streaming reductions and reuses the ring
-  weight matrix `W` across BCD iterations (`W_cached` arg).
+  pixel-row slices of `Y - b0 - W @ (Y - A @ C - b0)` on demand — `Y_bg` is
+  never built in full.
+- `compute_W` computes `b0` via streaming reductions and is re-run in each BCD
+  iteration.
 - Greedy init runs on a strided sample of the movie
   (`CNMFeParams.init_stride`, auto = `max(1, T // 5000)`); full-T traces
   are recovered by projection after init.
@@ -460,7 +460,7 @@ The centre-distance fallback (default `merge_centre_dist_factor=2.0`, i.e. ~2σ 
 
 ### `ring_size_factor` — background model
 
-Ring radius = `ring_size_factor × (2σ + 1)`. Default `1.5` works for most 1p datasets.
+Ring radius = `ring_size_factor × (4σ + 1)`. Default `1.5` works for most 1p datasets.
 
 - Increase if background extends further than expected
 - Decrease if the ring overlaps nearby neurons

@@ -269,6 +269,103 @@ class TestSubtractBackground:
         np.testing.assert_allclose(Y_res, Y, rtol=1e-5)
 
 
+class TestBackgroundSubtractorNeuronTerm:
+    """With ``A, C`` given the subtractor implements CNMF-E Eq. 8 / 11 exactly:
+
+        Y_bg = Y - b0 - W (Y - A C - b0)
+
+    i.e. the ring reads neuron-free data. Every read path must agree with this
+    dense formula, on numpy and on a zarr-backed ``Y_flat``.
+    """
+
+    def _make(self, H=20, W=20, T=180, K=4, seed=5):
+        rng = np.random.default_rng(seed)
+        Y = rng.standard_normal((H * W, T)).astype(np.float32) * 1.5
+        A0 = sp.csc_matrix((H * W, 0), dtype=np.float32)
+        W_mat, b0 = compute_W(Y, A0, np.empty((0, T), np.float32), (H, W), radius=3)
+        A_dense = np.zeros((H * W, K), dtype=np.float32)
+        for k in range(K):
+            A_dense[rng.choice(H * W, size=12, replace=False), k] = rng.random(12) + 0.2
+        A = sp.csc_matrix(A_dense)
+        C = rng.random((K, T)).astype(np.float32)
+        dense = (Y - b0[:, None]
+                 - W_mat @ (Y - A_dense @ C - b0[:, None])).astype(np.float32)
+        return Y, W_mat, b0, A, C, dense
+
+    def _zarr(self, tmp_path, Y):
+        import zarr as _zarr
+        z = _zarr.open_array(str(tmp_path / "Y.zarr"), mode="w", shape=Y.shape,
+                             chunks=(64, Y.shape[1]), dtype="float32")
+        z[:] = Y
+        return z
+
+    def test_slice_matches_eq8(self):
+        Y, W_mat, b0, A, C, dense = self._make()
+        bg = BackgroundSubtractor(Y, W_mat, b0, A=A, C=C)
+        np.testing.assert_allclose(bg[:], dense, atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(bg.slice(32, 96), dense[32:96], atol=1e-4, rtol=1e-4)
+
+    @pytest.mark.parametrize("tsub", [1, 3])
+    def test_slice_rows_matches_eq8(self, tsub):
+        Y, W_mat, b0, A, C, dense = self._make()
+        rows = np.array([1, 7, 40, 41, 399])
+        bg = BackgroundSubtractor(Y, W_mat, b0, A=A, C=C)
+        np.testing.assert_allclose(
+            bg.slice_rows(rows, tsub), dense[rows][:, ::tsub], atol=1e-4, rtol=1e-4)
+
+    def test_project_onto_matches_eq8(self):
+        Y, W_mat, b0, A, C, dense = self._make()
+        bg = BackgroundSubtractor(Y, W_mat, b0, A=A, C=C)
+        np.testing.assert_allclose(
+            bg.project_onto(A), dense.T @ A.toarray(), atol=1e-3, rtol=1e-3)
+
+    @pytest.mark.parametrize("n_jobs", [1, 2])
+    def test_zarr_does_not_double_count(self, tmp_path, n_jobs):
+        """The zarr ``project_onto`` branch goes through ``slice``, which already
+        carries the neuron term; adding it again there would double it."""
+        Y, W_mat, b0, A, C, dense = self._make()
+        bg = BackgroundSubtractor(self._zarr(tmp_path, Y), W_mat, b0, A=A, C=C)
+        np.testing.assert_allclose(bg.slice(0, Y.shape[0]), dense, atol=1e-4, rtol=1e-4)
+        np.testing.assert_allclose(
+            bg.project_onto(A, batch_size=64, n_jobs=n_jobs),
+            dense.T @ A.toarray(), atol=1e-3, rtol=1e-3)
+
+    def test_projection_footprints_may_differ_from_the_term(self):
+        """``A`` in the term is the one ``W`` was fit with; ``project_onto`` may
+        be handed a later ``A`` with a different number of components."""
+        Y, W_mat, b0, A, C, dense = self._make(K=4)
+        A_later = sp.csc_matrix(A.toarray()[:, :2])
+        bg = BackgroundSubtractor(Y, W_mat, b0, A=A, C=C)
+        np.testing.assert_allclose(
+            bg.project_onto(A_later), dense.T @ A_later.toarray(), atol=1e-3, rtol=1e-3)
+
+    def test_global_term_still_subtracted(self):
+        Y, W_mat, b0, A, C, dense = self._make()
+        rng = np.random.default_rng(9)
+        bf = rng.standard_normal(Y.shape[0]).astype(np.float32)
+        f = rng.standard_normal(Y.shape[1]).astype(np.float32)
+        bg = BackgroundSubtractor(Y, W_mat, b0, bf=bf, f=f, A=A, C=C)
+        np.testing.assert_allclose(bg[:], dense - np.outer(bf, f), atol=1e-3, rtol=1e-3)
+
+    def test_requires_both_A_and_C(self):
+        Y, W_mat, b0, A, C, _ = self._make()
+        with pytest.raises(ValueError):
+            BackgroundSubtractor(Y, W_mat, b0, A=A)
+        with pytest.raises(ValueError):
+            BackgroundSubtractor(Y, W_mat, b0, C=C)
+
+    def test_without_A_C_is_the_raw_form(self):
+        Y, W_mat, b0, _, _, _ = self._make()
+        raw = (Y - b0[:, None]) - W_mat @ (Y - b0[:, None])
+        np.testing.assert_allclose(
+            BackgroundSubtractor(Y, W_mat, b0)[:], raw, atol=1e-4, rtol=1e-4)
+
+    def test_subtract_background_is_deprecated(self):
+        Y, W_mat, b0, _, _, _ = self._make()
+        with pytest.warns(FutureWarning, match="deprecated"):
+            subtract_background(Y, W_mat, b0)
+
+
 class TestBackgroundSubtractor:
     """Streaming subtractor must agree with dense subtract_background.
 

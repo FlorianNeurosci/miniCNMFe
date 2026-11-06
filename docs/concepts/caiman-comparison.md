@@ -7,6 +7,12 @@ artifacts**, and the one real edge is partly a **home-field effect**.
 
 Reproduce: `demo_notebooks/tutorial_caiman_compare_patches.ipynb` (the
 orientation-correct, per-pipeline-tuned, patch-based comparison).
+Stage-by-stage checks against CaImAn live in `validation/caiman_swap/`.
+
+> **Superseded numbers.** The results below predate the November 2026 ring-background
+> fix (see [CNMF-E deviations](./cnmfe-deviations.md)), which changed every extraction.
+> Treat them as history. The fairness issues still apply, and the "home-field" reasoning
+> about the background now needs re-testing.
 
 ---
 
@@ -19,10 +25,10 @@ orientation-correct, per-pipeline-tuned, patch-based comparison).
 - **Realistic simulator (`make_miniscope_movie`):** we are *modestly* ahead on
   the temporal trace — but ablations show this is **largely because the
   simulator's background suits our model**, not a general CaImAn deficiency.
-- **Real recordings:** unknown. This implementation has **only** been tested on
-  synthetic data; CaImAn is validated on hundreds of real 1p recordings
-  (some with paired electrophysiology). Do **not** generalise the synthetic
-  results to real data.
+- **Real recordings:** agreement with CaImAn has since been measured on real PICAST
+  sessions (see [CNMF-E deviations](./cnmfe-deviations.md)), but there is no external
+  ground truth here. CaImAn is validated on hundreds of real 1p recordings (some with
+  paired electrophysiology); this implementation is not.
 
 ---
 
@@ -127,7 +133,7 @@ shifts it can pick a too-high `min_pnr` and hurt CaImAn's recall.)
 
 | aspect | this CNMFe | CaImAn CNMF-E |
 |---|---|---|
-| Background | ring + per-iteration `b0` refresh (+ optional rank-1 `b_f·f`) | ring (`compute_W`), refined in the patch path |
+| Background | ring, `W` re-estimated each iteration (+ optional rank-1 `b_f·f`) | ring (`compute_W`), refined in the patch path |
 | Deconvolution | OASIS via `oasis-deconv`; pure-Python PAVA fallback | OASIS (`constrained_foopsi`) |
 | AR `g` | estimated **once** from `C_raw`, cached (global or per-neuron); optional Bayesian `decay_time`/`fps` prior | per-neuron, per-iteration |
 | Spatial solve | per-pixel non-neg LASSO on **raw** traces | LASSO on `StandardScaler`-normalised traces |
@@ -145,8 +151,8 @@ patches, so the gap narrows with more processes.
 Defensible statement: *"On synthetic benchmarks with a matched,
 orientation-corrected, per-pipeline-tuned setup, this reimplementation achieves
 recovery comparable to CaImAn's raw CNMF-E output (and is faster on small
-movies). It has not been validated on real recordings or against CaImAn's full
-evaluation pipeline."*
+movies). It has not been validated against external ground truth on real recordings, or
+against CaImAn's full evaluation pipeline."*
 
 What would justify a stronger claim: real 1p recordings **not** produced by our
 own simulator, with external ground truth (paired ephys or expert ROIs), running

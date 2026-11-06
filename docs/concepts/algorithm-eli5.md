@@ -143,15 +143,17 @@ diffuse fluorescence from out-of-focus cells, neuropil, and vasculature that dri
 slowly across the whole field. Ordinary NMF has no defence against this and ends up
 describing the background as if it were extra "neurons."
 
-CNMFe's answer: predict each pixel's background from a **ring of pixels about one
-neuron-radius away** from it. The logic has two halves. Because the background is
+CNMFe's answer: predict each pixel's background from a **ring of pixels about one and
+a half neuron diameters away** from it. The logic has two halves. Because the background is
 spatially smooth, a pixel's neighbours share almost the same background value — so a
 weighted combination of them is an excellent predictor. And because the *ring*
 deliberately skips the pixels immediately around the target (the ones that would belong
 to the pixel's own neuron), the background estimate captures the shared glow *without*
-soaking up genuine neural signal. The ring weights are fit once, as a straightforward
-best-linear-predictor regression, then used to subtract a background estimate from
-every frame.
+soaking up genuine neural signal. Other neurons can still sit on the ring, so the
+known neurons are removed from the data first and the ring only ever reads what is
+left. The ring weights are a straightforward best-linear-predictor regression, fit
+again each round as the neuron estimates improve, then used to subtract a background
+estimate from every frame.
 
 > If every window on your street brightens and dims together, you can predict your own
 > window's brightness from your neighbours' — while ignoring your own lamp.
